@@ -67,7 +67,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 enum ConnState {
     Connected {
-        writer: NetWriter,
+        writer: Box<NetWriter>,
     },
     Disconnected {
         next_attempt: tokio::time::Instant,
@@ -117,7 +117,9 @@ impl ArrowIpcSink {
         log::info!("arrow_ipc sink connected: tcp://{addr}");
 
         Ok(Self {
-            conn: ConnState::Connected { writer },
+            conn: ConnState::Connected {
+                writer: Box::new(writer),
+            },
             host: host.to_string(),
             port,
             rate_limit_rps,
@@ -139,7 +141,9 @@ impl ArrowIpcSink {
         let addr = format!("{}:{}", self.host, self.port);
         match Self::connect_writer(&addr, self.rate_limit_rps).await {
             Ok(writer) => {
-                self.conn = ConnState::Connected { writer };
+                self.conn = ConnState::Connected {
+                    writer: Box::new(writer),
+                };
                 log::info!("arrow_ipc sink reconnected: tcp://{addr}");
             }
             Err(e) => {
