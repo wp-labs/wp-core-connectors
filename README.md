@@ -31,7 +31,8 @@ Duplicate registrations are ignored and logged with caller location metadata.
 Builtin sink definitions:
 
 - `arrow-ipc`
-- `arrow-file`
+- `arrow-file` (custom length-prefixed framed Arrow IPC payloads)
+- `arrow-file-std` (standard Arrow IPC file format)
 - `blackhole`
 - `file`
 - `syslog`
@@ -51,7 +52,8 @@ Note: this crate currently includes concrete sink factory/runtime implementation
 The `src/sinks/` module currently includes:
 
 - `arrow_ipc` for streaming `DataRecord` batches over TCP as Arrow IPC frames
-- `arrow_file` for appending Arrow IPC payloads to files
+- `arrow_file` for appending custom framed Arrow IPC payloads to files
+- `arrow_file_std` for writing standard Arrow IPC files readable by Arrow `FileReader`
 - `blackhole` for discard/testing sinks
 - `file` for formatted text output (`json`, `csv`, `show`, `kv`, `raw`, `proto-text`)
 - `syslog` for RFC3164-style UDP/TCP syslog emission
@@ -67,6 +69,7 @@ Supporting transport and protocol helpers live in:
 ```rust
 use wp_core_connectors::registry;
 use wp_core_connectors::sinks::arrow_file::ArrowFileFactory;
+use wp_core_connectors::sinks::arrow_file_std::ArrowFileStdFactory;
 use wp_core_connectors::sinks::arrow_ipc::ArrowIpcFactory;
 use wp_core_connectors::sinks::blackhole_factory::BlackHoleFactory;
 use wp_core_connectors::sinks::file_factory::FileFactory;
@@ -77,6 +80,7 @@ use wp_core_connectors::startup;
 fn register_sinks() {
     registry::register_sink_factory(ArrowIpcFactory);
     registry::register_sink_factory(ArrowFileFactory);
+    registry::register_sink_factory(ArrowFileStdFactory);
     registry::register_sink_factory(BlackHoleFactory);
     registry::register_sink_factory(FileFactory);
     registry::register_sink_factory(SyslogFactory);
@@ -97,6 +101,77 @@ fn init() {
 ```
 
 If you only need the builtin catalog, use `wp_core_connectors::builtin::{builtin_sink_defs, builtin_source_defs}`.
+
+## Configuration Examples
+
+Use `arrow-file` when you want an append-friendly internal runtime format. Use `arrow-file-std` when you want a standard Arrow file that other Arrow tools can read directly.
+
+### Framed Arrow IPC file
+
+```toml
+version = "2.0"
+
+[sink_group]
+name = "/sink/arrow_frames"
+oml = ["logs"]
+
+[[sink_group.sinks]]
+name = "arrow_frames"
+connect = "arrow_file_sink"
+params = { 
+  base = "./data/out_dat",
+  file = "events.arrow",
+  tag = "default",
+  fields = [
+    { name = "name", type = "chars" },
+    { name = "count", type = "digit" }
+  ]
+}
+```
+
+This writes the current custom on-disk format:
+
+- 4-byte big-endian frame length
+- framed payload produced by `wp_arrow::ipc::encode_ipc`
+
+This format is good for:
+
+- append-heavy runtime output
+- internal replay/diagnostics
+- consumers that already understand the framed protocol
+
+### Standard Arrow file
+
+```toml
+version = "2.0"
+
+[sink_group]
+name = "/sink/arrow_std"
+oml = ["logs"]
+
+[[sink_group.sinks]]
+name = "arrow_std"
+connect = "arrow_file_std_sink"
+params = {
+  base = "./data/out_dat",
+  file = "events.arrow",
+  fields = [
+    { name = "name", type = "chars" },
+    { name = "count", type = "digit" }
+  ]
+}
+```
+
+This writes a standard Arrow IPC file and is the better choice for:
+
+- interchange with external Arrow tooling
+- consumers using Arrow `FileReader`
+- offline analysis and export workflows
+
+### Recommendation
+
+- Prefer `arrow_file_std_sink` for external file exchange.
+- Keep `arrow_file_sink` for internal streaming/debug artifacts where append-friendly framing matters.
 
 ## Project Layout
 
@@ -133,11 +208,67 @@ Licensed under [Apache License 2.0](./LICENSE).
 ## 当前能力
 
 - 注册表：统一注册和查询 `SinkFactory` / `SourceFactory`
-- 内置 Sink 实现：`arrow-ipc`、`arrow-file`、`blackhole`、`file`、`syslog`、`tcp`
+- 内置 Sink 实现：`arrow-ipc`、`arrow-file`、`arrow-file-std`、`blackhole`、`file`、`syslog`、`tcp`
 - 内置 Source 定义：`file`、`syslog`、`tcp`
 - 文本文件输出格式：`json`、`csv`、`show`、`kv`、`raw`、`proto-text`
 
 需要注意的是：当前仓库里已经实现的是 sink runtime/factory；source 侧在这里主要提供 builtin 定义，具体 runtime 工厂可以通过同一套注册表接口由外部注册。
+
+## 配置示例
+
+建议把两种格式分开使用：
+
+- `arrow_file_sink`：内部流式落盘、诊断、回放
+- `arrow_file_std_sink`：标准 Arrow 文件交换、离线分析、跨工具消费
+
+### 1. Framed Arrow IPC 文件
+
+```toml
+version = "2.0"
+
+[sink_group]
+name = "/sink/arrow_frames"
+oml = ["logs"]
+
+[[sink_group.sinks]]
+name = "arrow_frames"
+connect = "arrow_file_sink"
+params = {
+  base = "./data/out_dat",
+  file = "events.arrow",
+  tag = "default",
+  fields = [
+    { name = "name", type = "chars" },
+    { name = "count", type = "digit" }
+  ]
+}
+```
+
+这会写出当前自定义格式：每帧前有 4 字节长度头，后面跟 `encode_ipc()` 产出的 Arrow IPC payload。
+
+### 2. 标准 Arrow 文件
+
+```toml
+version = "2.0"
+
+[sink_group]
+name = "/sink/arrow_std"
+oml = ["logs"]
+
+[[sink_group.sinks]]
+name = "arrow_std"
+connect = "arrow_file_std_sink"
+params = {
+  base = "./data/out_dat",
+  file = "events.arrow",
+  fields = [
+    { name = "name", type = "chars" },
+    { name = "count", type = "digit" }
+  ]
+}
+```
+
+这会写出标准 Arrow IPC file，适合 `FileReader` 和其它 Arrow 生态工具直接读取。
 
 ## 许可证
 

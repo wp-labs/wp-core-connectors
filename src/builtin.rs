@@ -60,6 +60,23 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
         });
     }
 
+    // arrow-file-std
+    {
+        let mut params = ParamMap::new();
+        params.insert("base".into(), json!("./data/out_dat"));
+        params.insert("file".into(), json!("default.arrow"));
+        params.insert("fields".into(), json!([]));
+        params.insert("sync".into(), json!(false));
+        defs.push(ConnectorDef {
+            id: "arrow_file_std_sink".into(),
+            kind: "arrow-file-std".into(),
+            scope: ConnectorScope::Sink,
+            allow_override: vec!["base".into(), "file".into(), "fields".into(), "sync".into()],
+            default_params: params,
+            origin: Some("builtin:arrow_file_std_sink".into()),
+        });
+    }
+
     // blackhole
     {
         let mut params = ParamMap::new();

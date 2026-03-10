@@ -1,6 +1,6 @@
 [package]
 name = "wp-core-connectors"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["WarpParse Dev Team"]
@@ -17,6 +17,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1.0"
+arrow = { version = "54", default-features = false, features = ["ipc"] }
 async-trait = "0.1"
 bytes = "1.11"
 chrono = "0.4"
