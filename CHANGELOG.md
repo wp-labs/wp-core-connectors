@@ -7,6 +7,16 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Added
+
+- Add built-in `file`, `syslog`, and `tcp` source connector implementations under `src/sources`
+- Add source-side unit coverage for file wildcard ordering, syslog header handling, and TCP source lifecycle/framing behavior
+
+### Changed
+
+- Expand the crate boundary from sink-only runtimes to core connector runtimes for both sources and sinks
+- Keep builtin source definitions and source factory registration in the same crate as the concrete source implementations
+
 ## [0.1.1] - 2026-03-10
 
 ### Added
