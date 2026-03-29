@@ -17,6 +17,17 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Expand the crate boundary from sink-only runtimes to core connector runtimes for both sources and sinks
 - Keep builtin source definitions and source factory registration in the same crate as the concrete source implementations
 
+## [0.1.3] - 2026-03-29
+
+### Changed
+
+- Lower the default TCP reader batch queue capacity from `64` to `32` so reader-side backpressure is applied earlier under sustained input load
+
+### Fixed
+
+- Bound per-connection TCP pending backlog by bytes to stop reader-side buffered messages from growing without limit under downstream backpressure
+- Add TCP regression coverage for pending-byte capped draining behavior
+
 ## [0.1.1] - 2026-03-10
 
 ### Added

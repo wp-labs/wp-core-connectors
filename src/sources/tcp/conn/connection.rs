@@ -11,6 +11,7 @@ use wp_model_core::raw::RawData;
 
 const DEFAULT_BATCH_CAPACITY: usize = 128;
 const MAX_BATCH_BYTES: usize = 64 * 1024; // soft cap; single payload may exceed but only single event allowed
+const MAX_PENDING_BYTES: usize = 256 * 1024;
 // When idle and buffer is large, shrink capacity to reduce RSS footprint.
 // Balanced shrink thresholds：空闲时将过大的缓冲收缩到较小基线
 const SHRINK_HIGH_WATER_BYTES: usize = 1024 * 1024; // 若 capacity 超过 1MiB 且 len==0 则收缩
@@ -61,7 +62,9 @@ struct BatchBuilder {
     batch_capacity: usize,
     source_key: String,
     pending_events: VecDeque<SourceEvent>,
+    pending_bytes: usize,
     max_batch_bytes: usize,
+    max_pending_bytes: usize,
 }
 
 impl TcpConnection {
@@ -84,6 +87,7 @@ impl TcpConnection {
                 source_key,
                 DEFAULT_BATCH_CAPACITY,
                 MAX_BATCH_BYTES,
+                MAX_PENDING_BYTES,
             ),
         };
         debug_data!(
@@ -235,6 +239,7 @@ impl BatchBuilder {
         source_key: String,
         batch_capacity: usize,
         max_batch_bytes: usize,
+        max_pending_bytes: usize,
     ) -> Self {
         Self {
             buffer,
@@ -242,7 +247,9 @@ impl BatchBuilder {
             batch_capacity,
             source_key,
             pending_events: VecDeque::new(),
+            pending_bytes: 0,
             max_batch_bytes,
+            max_pending_bytes,
         }
     }
 
@@ -261,9 +268,10 @@ impl BatchBuilder {
     fn fill_batch_from_pending(&mut self, batch: &mut SourceBatch, produced_bytes: &mut usize) {
         while let Some(event) = self.pending_events.pop_front() {
             let event_size = event_payload_len(&event);
+            self.pending_bytes = self.pending_bytes.saturating_sub(event_size);
             let would_exceed = *produced_bytes + event_size > self.max_batch_bytes;
             if batch.len() >= self.batch_capacity {
-                self.pending_events.push_front(event);
+                self.push_pending_front(event, event_size);
                 break;
             }
             if would_exceed && !batch.is_empty() {
@@ -275,7 +283,7 @@ impl BatchBuilder {
                     self.max_batch_bytes,
                     self.pending_events.len() + 1
                 );
-                self.pending_events.push_front(event);
+                self.push_pending_front(event, event_size);
                 break;
             }
             *produced_bytes = produced_bytes.saturating_add(event_size);
@@ -293,12 +301,31 @@ impl BatchBuilder {
         batch: &mut SourceBatch,
         produced_bytes: &mut usize,
     ) {
+        if self.pending_bytes >= self.max_pending_bytes {
+            debug_data!(
+                "TCP source '{}' stop draining buffer on pending byte cap: pending_events={} pending_bytes={} cap={}",
+                self.source_key,
+                self.pending_events.len(),
+                self.pending_bytes,
+                self.max_pending_bytes
+            );
+            return;
+        }
         while let Some(payload) = extract_message(framing, &mut self.buffer) {
             let event = self.build_event(payload, peer_ip);
             let event_size = event_payload_len(&event);
             let would_exceed = *produced_bytes + event_size > self.max_batch_bytes;
             if batch.len() >= self.batch_capacity {
-                self.pending_events.push_back(event);
+                self.push_pending_back(event, event_size);
+                if self.pending_bytes >= self.max_pending_bytes {
+                    debug_data!(
+                        "TCP source '{}' pending byte cap reached after batch spill: pending_events={} pending_bytes={} cap={}",
+                        self.source_key,
+                        self.pending_events.len(),
+                        self.pending_bytes,
+                        self.max_pending_bytes
+                    );
+                }
                 break;
             }
             if would_exceed && !batch.is_empty() {
@@ -310,7 +337,16 @@ impl BatchBuilder {
                     self.max_batch_bytes,
                     self.pending_events.len()
                 );
-                self.pending_events.push_back(event);
+                self.push_pending_back(event, event_size);
+                if self.pending_bytes >= self.max_pending_bytes {
+                    debug_data!(
+                        "TCP source '{}' pending byte cap reached after byte-budget spill: pending_events={} pending_bytes={} cap={}",
+                        self.source_key,
+                        self.pending_events.len(),
+                        self.pending_bytes,
+                        self.max_pending_bytes
+                    );
+                }
                 break;
             }
             *produced_bytes = produced_bytes.saturating_add(event_size);
@@ -326,6 +362,9 @@ impl BatchBuilder {
                 );
                 break;
             }
+            if self.pending_bytes >= self.max_pending_bytes {
+                break;
+            }
         }
     }
 
@@ -334,7 +373,17 @@ impl BatchBuilder {
     }
 
     fn pending_bytes(&self) -> usize {
-        self.pending_events.iter().map(event_payload_len).sum()
+        self.pending_bytes
+    }
+
+    fn push_pending_back(&mut self, event: SourceEvent, event_size: usize) {
+        self.pending_bytes = self.pending_bytes.saturating_add(event_size);
+        self.pending_events.push_back(event);
+    }
+
+    fn push_pending_front(&mut self, event: SourceEvent, event_size: usize) {
+        self.pending_bytes = self.pending_bytes.saturating_add(event_size);
+        self.pending_events.push_front(event);
     }
 
     fn build_event(&self, payload: Bytes, peer_ip: IpAddr) -> SourceEvent {
@@ -546,6 +595,7 @@ mod tests {
             "test".into(),
             10,
             64 * 1024,
+            MAX_PENDING_BYTES,
         );
 
         // Fill buffer with data
@@ -564,6 +614,7 @@ mod tests {
             "test".into(),
             10,
             64 * 1024,
+            MAX_PENDING_BYTES,
         );
 
         batcher2.buffer.clear();
@@ -580,6 +631,7 @@ mod tests {
             "test".into(),
             10,
             100, // Small byte limit for testing
+            MAX_PENDING_BYTES,
         );
 
         // Create pending events that exceed byte limit
@@ -588,9 +640,9 @@ mod tests {
         let event2 = batcher.build_event(Bytes::from(vec![0u8; 60]), peer_ip);
         let event3 = batcher.build_event(Bytes::from(vec![0u8; 20]), peer_ip);
 
-        batcher.pending_events.push_back(event1);
-        batcher.pending_events.push_back(event2);
-        batcher.pending_events.push_back(event3);
+        batcher.push_pending_back(event1, 60);
+        batcher.push_pending_back(event2, 60);
+        batcher.push_pending_back(event3, 20);
 
         let mut batch = SourceBatch::new();
         let mut produced_bytes = 0;
@@ -601,6 +653,32 @@ mod tests {
         assert_eq!(batch.len(), 1);
         assert_eq!(produced_bytes, 60);
         assert_eq!(batcher.pending_events.len(), 2); // Two events remain
+        assert_eq!(batcher.pending_bytes(), 80);
+    }
+
+    #[test]
+    fn test_drain_messages_stops_when_pending_bytes_hit_cap() {
+        let mut batcher = BatchBuilder::new(
+            BytesMut::from(&b"line1\nline2\nline3\nline4\n"[..]),
+            Tags::new(),
+            "test".into(),
+            1,
+            MAX_BATCH_BYTES,
+            10,
+        );
+        let mut batch = SourceBatch::new();
+        let mut produced_bytes = 0;
+        let peer_ip = "127.0.0.1".parse().unwrap();
+
+        batcher.drain_messages(FramingMode::Line, peer_ip, &mut batch, &mut produced_bytes);
+
+        assert_eq!(batch.len(), 1, "首条消息应先进入当前 batch");
+        assert_eq!(batcher.pending_len(), 1, "溢出的下一条消息应进入 pending");
+        assert_eq!(batcher.pending_bytes(), 5);
+        assert!(
+            !batcher.buffer.is_empty(),
+            "达到 pending byte cap 后应停止继续抽取消息，剩余数据保留在 buffer"
+        );
     }
 
     #[test]
