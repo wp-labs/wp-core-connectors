@@ -159,6 +159,23 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
         });
     }
 
+    // file_raw
+    {
+        let mut params = ParamMap::new();
+        params.insert("fmt".into(), json!("raw"));
+        params.insert("base".into(), json!("./data/out_dat"));
+        params.insert("file".into(), json!("default.raw"));
+        params.insert("sync".into(), json!(false));
+        defs.push(ConnectorDef {
+            id: "file_raw_sink".into(),
+            kind: "file".into(),
+            scope: ConnectorScope::Sink,
+            allow_override: vec!["base".into(), "file".into(), "sync".into()],
+            default_params: params,
+            origin: Some("builtin:file".into()),
+        });
+    }
+
     // syslog
     {
         let mut params = ParamMap::new();
@@ -305,4 +322,41 @@ pub fn sink_defs_by_kind(kind: &str) -> Vec<ConnectorDef> {
         .into_iter()
         .filter(|d| d.kind.as_str() == kind)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_file_sink_defs_include_raw_variant() {
+        let raw = sink_def("file_raw_sink").expect("file_raw_sink builtin def");
+        assert_eq!(raw.kind, "file");
+        assert_eq!(raw.scope, ConnectorScope::Sink);
+        assert_eq!(
+            raw.default_params
+                .get("fmt")
+                .and_then(|value| value.as_str()),
+            Some("raw")
+        );
+        assert_eq!(
+            raw.default_params
+                .get("file")
+                .and_then(|value| value.as_str()),
+            Some("default.raw")
+        );
+        assert!(raw.allow_override.iter().any(|key| key == "base"));
+        assert!(raw.allow_override.iter().any(|key| key == "file"));
+        assert!(raw.allow_override.iter().any(|key| key == "sync"));
+    }
+
+    #[test]
+    fn file_factory_def_provider_exposes_raw_variant() {
+        let ids: Vec<_> = sink_defs_by_kind("file")
+            .into_iter()
+            .map(|def| def.id)
+            .collect();
+        assert!(ids.iter().any(|id| id == "file_json_sink"));
+        assert!(ids.iter().any(|id| id == "file_raw_sink"));
+    }
 }
