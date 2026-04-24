@@ -33,7 +33,7 @@ memchr = "2.7"
 socket2 = "0.6"
 toml = "1.0"
 orion_conf = "0.5"
-orion-error = "0.6"
+orion-error = "0.7"
 thiserror = "2"
 tokio = { version = "1.48", features = ["full"] }
 wp-connector-api = "0.8"
