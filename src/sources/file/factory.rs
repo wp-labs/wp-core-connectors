@@ -1,8 +1,9 @@
 use super::source::{FileEncoding, FileSource, MultiFileSource, compute_file_ranges};
 use async_trait::async_trait;
 use glob::glob;
-use orion_conf::{ErrorWith, UvsFrom};
-use orion_error::ErrorOweBase;
+use orion_conf::ErrorWith;
+use orion_error::UvsReason;
+use orion_error::compat_traits::ErrorOweBase;
 use std::path::Path;
 use wp_conf_base::ConfParser;
 use wp_connector_api::{
@@ -113,9 +114,9 @@ impl SourceFactory for FileSourceFactory {
             FileSourceSpec::from_resolved(resolved)?;
             Ok(())
         })();
-        res.owe(SourceReason::from_conf())
-            .with(resolved.name.as_str())
-            .want("validate file source spec")
+        res.owe(SourceReason::from(UvsReason::core_conf()))
+            .with_context(resolved.name.as_str())
+            .doing("validate file source spec")
     }
 
     async fn build(
@@ -150,9 +151,7 @@ impl SourceFactory for FileSourceFactory {
                 .next()
                 .expect("single file path should exist");
             let ranges = compute_file_ranges(Path::new(&source_path), spec.instances)
-                .owe(SourceReason::from_data())
-                .with(source_path.as_str())
-                .want("open source file")?;
+                .map_err(|e| anyhow::anyhow!("open {source_path}: {e}"))?;
             let mut handles = Vec::with_capacity(ranges.len());
             let multi = ranges.len() > 1;
             for (idx, (start, end)) in ranges.into_iter().enumerate() {
@@ -169,7 +168,8 @@ impl SourceFactory for FileSourceFactory {
                     start,
                     end,
                 )
-                .await?;
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
                 let mut source_meta = if !multi {
                     meta.clone()
                 } else {
@@ -186,9 +186,9 @@ impl SourceFactory for FileSourceFactory {
         };
 
         let fut: anyhow::Result<SourceSvcIns> = fut.await;
-        fut.owe(SourceReason::from_conf())
-            .with(resolved.name.as_str())
-            .want("build file source service")
+        fut.owe(SourceReason::from(UvsReason::core_conf()))
+            .with_context(resolved.name.as_str())
+            .doing("build file source service")
     }
 }
 

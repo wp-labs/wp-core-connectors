@@ -16,6 +16,9 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 - Expand the crate boundary from sink-only runtimes to core connector runtimes for both sources and sinks
 - Keep builtin source definitions and source factory registration in the same crate as the concrete source implementations
+- Migrate from deprecated `orion_conf::ErrorOwe` to `ErrorOweBase` with explicit
+  reason types; replace `ErrorWith::with()`/`want()` with `with_context()`/`doing()`
+- Fix `ErrorOweBase` and `ToStructError` import paths for orion-error 0.7.2
 
 ## [0.1.3] - 2026-03-29
 

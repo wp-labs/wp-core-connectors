@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use arrow::ipc::writer::FileWriter;
 use async_trait::async_trait;
-use orion_conf::ErrorOwe;
+use orion_error::UvsReason;
+use orion_error::compat_traits::ErrorOweBase;
 #[cfg(test)]
 use serde_json::json;
 use wp_arrow::convert::records_to_batch;
@@ -152,7 +153,7 @@ impl ArrowFileStdSink {
     async fn send_batch(&mut self, records: &[DataRecord]) -> SinkResult<()> {
         let batch = records_to_batch(records, &self.field_defs)
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .owe_res()?;
+            .owe(SinkReason::from(UvsReason::resource_error()))?;
         let sync = self.sync;
 
         {
@@ -255,12 +256,12 @@ impl SinkFactory for ArrowFileStdFactory {
     }
 
     fn validate_spec(&self, spec: &ResolvedSinkSpec) -> SinkResult<()> {
-        ArrowFileStdSpec::from_resolved(spec).owe_conf()?;
+        ArrowFileStdSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
         Ok(())
     }
 
     async fn build(&self, spec: &ResolvedSinkSpec, ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let resolved = ArrowFileStdSpec::from_resolved(spec).owe_conf()?;
+        let resolved = ArrowFileStdSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
         let path = resolved.resolve_path(ctx);
         let sink = ArrowFileStdSink::new(&path, resolved.field_defs, resolved.sync)
             .map_err(|e| sink_err("arrow_file_std open fail", e))?;

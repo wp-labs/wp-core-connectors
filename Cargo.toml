@@ -1,6 +1,6 @@
 [package]
 name = "wp-core-connectors"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["WarpParse Dev Team"]
@@ -32,16 +32,16 @@ log = "0.4"
 memchr = "2.7"
 socket2 = "0.6"
 toml = "1.0"
-orion_conf = "0.5"
-orion-error = "0.6"
+orion_conf = "0.6"
+orion-error = "0.7"
 thiserror = "2"
-tokio = { version = "1.48", features = ["full"] }
-wp-connector-api = "0.8"
+tokio = { version = "1.51", features = ["full"] }
+wp-connector-api = "0.9"
 wp-model-core = "0.8"
 wp-arrow = "0.1"
-wp-conf-base = "0.2"
+wp-conf-base = "0.3"
 wp-data-fmt = "0.2"
-wp-log = "0.2"
+wp-log = "0.3"
 
 [features]
 dev-tools = []

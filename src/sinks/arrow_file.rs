@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use orion_conf::ErrorOwe;
+use orion_error::UvsReason;
+use orion_error::compat_traits::ErrorOweBase;
 #[cfg(test)]
 use serde_json::json;
 use tokio::fs::OpenOptions;
@@ -12,7 +13,7 @@ use wp_arrow::schema::{FieldDef, parse_wp_type};
 use wp_connector_api::SinkResult;
 use wp_connector_api::{
     AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, ConnectorDef, ParamMap, SinkBuildCtx,
-    SinkDefProvider, SinkErrorOwe, SinkFactory, SinkHandle, SinkSpec as ResolvedSinkSpec,
+    SinkDefProvider, SinkErrorOwe, SinkFactory, SinkHandle, SinkReason, SinkSpec as ResolvedSinkSpec,
 };
 use wp_model_core::model::DataRecord;
 
@@ -135,10 +136,10 @@ impl ArrowFileSink {
     async fn send_batch(&mut self, records: &[DataRecord]) -> SinkResult<()> {
         let batch = records_to_batch(records, &self.field_defs)
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .owe_res()?;
+            .owe(SinkReason::from(UvsReason::resource_error()))?;
         let payload = encode_ipc(&self.tag, &batch)
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .owe_res()?;
+            .owe(SinkReason::from(UvsReason::resource_error()))?;
 
         self.out_io
             .write_all(&(payload.len() as u32).to_be_bytes())
@@ -238,16 +239,16 @@ impl SinkFactory for ArrowFileFactory {
     }
 
     fn validate_spec(&self, spec: &ResolvedSinkSpec) -> SinkResult<()> {
-        ArrowFileSpec::from_resolved(spec).owe_conf()?;
+        ArrowFileSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
         Ok(())
     }
 
     async fn build(&self, spec: &ResolvedSinkSpec, ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let resolved = ArrowFileSpec::from_resolved(spec).owe_conf()?;
+        let resolved = ArrowFileSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
         let path = resolved.resolve_path(ctx);
         let sink = ArrowFileSink::new(&path, resolved.tag, resolved.field_defs, resolved.sync)
             .await
-            .owe_res()?;
+            .owe(SinkReason::from(UvsReason::resource_error()))?;
         Ok(SinkHandle::new(Box::new(sink)))
     }
 }

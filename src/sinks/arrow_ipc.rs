@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use orion_conf::ErrorOwe;
+use orion_error::UvsReason;
+use orion_error::compat_traits::ErrorOweBase;
 #[cfg(test)]
 use serde_json::json;
 use wp_arrow::convert::records_to_batch;
@@ -176,11 +177,11 @@ impl ArrowIpcSink {
     async fn send_batch(&mut self, records: &[DataRecord]) -> SinkResult<()> {
         let batch = records_to_batch(records, &self.field_defs)
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .owe_res()?;
+            .owe(SinkReason::from(UvsReason::resource_error()))?;
 
         let payload = encode_ipc(&self.tag, &batch)
             .map_err(|e| anyhow::anyhow!("{e}"))
-            .owe_res()?;
+            .owe(SinkReason::from(UvsReason::resource_error()))?;
 
         let send_result = match self.conn {
             ConnState::Connected { .. } => {
@@ -306,16 +307,16 @@ impl SinkFactory for ArrowIpcFactory {
             .get("target")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing required param: target"))
-            .owe_conf()?;
-        parse_target(target_str).owe_conf()?;
+            .owe(SinkReason::from(UvsReason::core_conf()))?;
+        parse_target(target_str).owe(SinkReason::from(UvsReason::core_conf()))?;
 
         spec.params
             .get("tag")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing required param: tag"))
-            .owe_conf()?;
+            .owe(SinkReason::from(UvsReason::core_conf()))?;
 
-        parse_fields_from_params(&spec.params).owe_conf()?;
+        parse_fields_from_params(&spec.params).owe(SinkReason::from(UvsReason::core_conf()))?;
         Ok(())
     }
 
@@ -325,22 +326,22 @@ impl SinkFactory for ArrowIpcFactory {
             .get("target")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing required param: target"))
-            .owe_conf()?;
-        let (host, port) = parse_target(target_str).owe_conf()?;
+            .owe(SinkReason::from(UvsReason::core_conf()))?;
+        let (host, port) = parse_target(target_str).owe(SinkReason::from(UvsReason::core_conf()))?;
 
         let tag = spec
             .params
             .get("tag")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing required param: tag"))
-            .owe_conf()?
+            .owe(SinkReason::from(UvsReason::core_conf()))?
             .to_string();
 
-        let field_defs = parse_fields_from_params(&spec.params).owe_conf()?;
+        let field_defs = parse_fields_from_params(&spec.params).owe(SinkReason::from(UvsReason::core_conf()))?;
 
         let sink = ArrowIpcSink::connect(&host, port, ctx.rate_limit_rps, tag, field_defs)
             .await
-            .owe_res()?;
+            .owe(SinkReason::from(UvsReason::resource_error()))?;
         Ok(SinkHandle::new(Box::new(sink)))
     }
 }

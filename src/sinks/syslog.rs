@@ -1,6 +1,8 @@
 use crate::{builtin, registry};
 use async_trait::async_trait;
-use orion_conf::ErrorOwe;
+use orion_error::UvsReason;
+use orion_error::compat_traits::ErrorOweBase;
+use wp_connector_api::SinkReason;
 use wp_connector_api::SinkResult;
 use wp_connector_api::{
     AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, ConnectorDef, SinkBuildCtx, SinkDefProvider,
@@ -316,11 +318,11 @@ impl SinkFactory for SyslogFactory {
         "syslog"
     }
     fn validate_spec(&self, spec: &ResolvedSinkSpec) -> SinkResult<()> {
-        syslog_conf_from_spec(spec).owe_conf()?;
+        syslog_conf_from_spec(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
         Ok(())
     }
     async fn build(&self, spec: &ResolvedSinkSpec, _ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let conf = syslog_conf_from_spec(spec).owe_conf()?;
+        let conf = syslog_conf_from_spec(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
         let proto = conf.protocol;
         let target = conf.target_addr();
         // Log resolved target to aid diagnosing mismatched params
@@ -335,11 +337,11 @@ impl SinkFactory for SyslogFactory {
         let runtime = match proto {
             SyslogProtocol::Udp => SyslogSink::udp(target.as_str(), Some(app_name.clone()))
                 .await
-                .owe_res()?,
+                .owe(SinkReason::from(UvsReason::resource_error()))?,
             SyslogProtocol::Tcp => {
                 SyslogSink::tcp(target.as_str(), Some(app_name.clone()), _ctx.rate_limit_rps)
                     .await
-                    .owe_res()?
+                    .owe(SinkReason::from(UvsReason::resource_error()))?
             }
         };
         Ok(SinkHandle::new(Box::new(runtime)))

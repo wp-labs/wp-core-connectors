@@ -7,8 +7,9 @@ use super::config::{Protocol, SyslogSourceSpec};
 use super::tcp_source::TcpSyslogSource;
 use super::udp_source::UdpSyslogSource;
 use crate::sources::tcp::{FramingMode, TcpAcceptor, TcpSource, tcp_reader_batch_channel_cap};
-use orion_conf::{ErrorWith, UvsFrom};
-use orion_error::ErrorOweBase;
+use orion_conf::ErrorWith;
+use orion_error::UvsReason;
+use orion_error::compat_traits::ErrorOweBase;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -97,7 +98,8 @@ impl SourceFactory for SyslogSourceFactory {
                         framing,
                         pool.clone(),
                         reg_rx,
-                    )?;
+                    )
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
                     let acceptor = TcpAcceptor::new(
                         spec.name.clone(),
                         config.address(),
@@ -115,7 +117,8 @@ impl SourceFactory for SyslogSourceFactory {
                         config.fast_strip,
                         inner,
                     )
-                    .await?;
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
                     SourceSvcIns::new()
                         .with_sources(vec![SourceHandle::new(Box::new(syslog), meta)])
@@ -127,9 +130,9 @@ impl SourceFactory for SyslogSourceFactory {
         };
 
         let fut: anyhow::Result<SourceSvcIns> = fut.await;
-        fut.owe(SourceReason::from_conf())
-            .with(spec.name.as_str())
-            .want("build syslog source service")
+        fut.owe(SourceReason::from(UvsReason::core_conf()))
+            .with_context(spec.name.as_str())
+            .doing("build syslog source service")
     }
 }
 

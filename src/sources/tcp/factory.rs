@@ -1,5 +1,6 @@
-use orion_conf::{ErrorWith, UvsFrom};
-use orion_error::ErrorOweBase;
+use orion_conf::ErrorWith;
+use orion_error::UvsReason;
+use orion_error::compat_traits::ErrorOweBase;
 use wp_conf_base::ConfParser;
 use wp_connector_api::SourceDefProvider;
 use wp_connector_api::{
@@ -32,9 +33,9 @@ impl SourceFactory for TcpSourceFactory {
             TcpSourceSpec::from_params(&spec.params)?;
             Ok(())
         })();
-        res.owe(SourceReason::from_conf())
-            .with(spec.name.as_str())
-            .want("validate tcp source spec")
+        res.owe(SourceReason::from(UvsReason::core_conf()))
+            .with_context(spec.name.as_str())
+            .doing("validate tcp source spec")
     }
 
     async fn build(
@@ -67,7 +68,8 @@ impl SourceFactory for TcpSourceFactory {
                     conf.framing,
                     connection_registry.clone(),
                     reader_reg_rx,
-                )?;
+                )
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
 
                 let mut meta = SourceMeta::new(key.clone(), spec.kind.clone());
                 for (k, v) in tags.iter() {
@@ -96,9 +98,9 @@ impl SourceFactory for TcpSourceFactory {
         };
 
         let fut: anyhow::Result<SourceSvcIns> = fut.await;
-        fut.owe(SourceReason::from_conf())
-            .with(spec.name.as_str())
-            .want("build tcp source service")
+        fut.owe(SourceReason::from(UvsReason::core_conf()))
+            .with_context(spec.name.as_str())
+            .doing("build tcp source service")
     }
 }
 

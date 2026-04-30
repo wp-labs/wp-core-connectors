@@ -1,6 +1,8 @@
 use crate::builtin;
 use async_trait::async_trait;
-use orion_conf::ErrorOwe;
+use orion_error::UvsReason;
+use orion_error::compat_traits::ErrorOweBase;
+use wp_connector_api::SinkReason;
 use wp_connector_api::SinkResult;
 use wp_connector_api::{
     AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, ConnectorDef, SinkBuildCtx, SinkDefProvider,
@@ -282,16 +284,16 @@ impl SinkFactory for TcpFactory {
         "tcp"
     }
     fn validate_spec(&self, spec: &ResolvedSinkSpec) -> SinkResult<()> {
-        TcpSinkSpec::from_resolved(spec).owe_conf()?;
+        TcpSinkSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
         Ok(())
     }
     async fn build(&self, spec: &ResolvedSinkSpec, ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let resolved = TcpSinkSpec::from_resolved(spec).owe_conf()?;
+        let resolved = TcpSinkSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
         // Internal defaults: no ACK; auto-drain at shutdown.
         // 限速目标：由 SinkBuildCtx 统一传入，TcpSink 内部据此构建 SendPolicy。
         let runtime = TcpSink::connect(&resolved, ctx.rate_limit_rps)
             .await
-            .owe_res()?;
+            .owe(SinkReason::from(UvsReason::resource_error()))?;
         Ok(SinkHandle::new(Box::new(runtime)))
     }
 }
@@ -365,8 +367,8 @@ mod tests {
             filter: None,
         };
         let ctx = wp_connector_api::SinkBuildCtx::new(std::env::current_dir().unwrap());
-        let mut h = fac.build(&spec, &ctx).await?;
-        AsyncRawDataSink::sink_str(h.sink.as_mut(), "abc").await?;
+        let mut h = fac.build(&spec, &ctx).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncRawDataSink::sink_str(h.sink.as_mut(), "abc").await.map_err(|e| anyhow::anyhow!("{e}"))?;
         let body = srv.await.unwrap();
         assert_eq!(body, "abc\n");
         Ok(())
@@ -407,8 +409,8 @@ mod tests {
             filter: None,
         };
         let ctx = wp_connector_api::SinkBuildCtx::new(std::env::current_dir().unwrap());
-        let mut h = fac.build(&spec, &ctx).await?;
-        AsyncRawDataSink::sink_str(h.sink.as_mut(), "hello").await?;
+        let mut h = fac.build(&spec, &ctx).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncRawDataSink::sink_str(h.sink.as_mut(), "hello").await.map_err(|e| anyhow::anyhow!("{e}"))?;
         let body = srv.await.unwrap();
         assert_eq!(body, b"5 hello");
         Ok(())

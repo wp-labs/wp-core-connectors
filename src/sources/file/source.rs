@@ -5,7 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose;
 use bytes::Bytes;
 use orion_conf::{ErrorWith, UvsFrom};
-use orion_error::ToStructError;
+use orion_error::conversion::ToStructError;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
@@ -55,15 +55,15 @@ impl FileSource {
         let mut file = tokio::fs::File::open(file_path)
             .await
             .map_err(|e| SourceError::from(SourceReason::Disconnect(e.to_string())))
-            .with(file_path)
-            .want("open source file")?;
+            .with_context(file_path)
+            .doing("open source file")?;
         use std::io::SeekFrom;
         use tokio::io::AsyncSeekExt;
         file.seek(SeekFrom::Start(range_start))
             .await
             .map_err(|e| SourceError::from(SourceReason::Disconnect(e.to_string())))
-            .with(file_path)
-            .want("seek to posion")?;
+            .with_context(file_path)
+            .doing("seek to posion")?;
         tags.set("access_source", path.to_string());
         let batch_lines = DEFAULT_BATCH_LINES;
         let batch_bytes_budget = DEFAULT_BATCH_BYTES;
@@ -161,8 +161,8 @@ impl MultiFileSource {
         };
         let ranges = compute_file_ranges(Path::new(&path), self.instances)
             .map_err(|e| SourceError::from(SourceReason::Disconnect(e.to_string())))
-            .with(path.as_str())
-            .want("open source file")?;
+            .with_context(path.as_str())
+            .doing("open source file")?;
         let (tx, rx) = unbounded_channel();
         let shard_total = ranges.len();
         let mut tasks = Vec::with_capacity(shard_total);

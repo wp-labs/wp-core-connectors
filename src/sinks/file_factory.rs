@@ -1,7 +1,9 @@
 use async_trait::async_trait;
-use orion_conf::ErrorOwe;
+use orion_error::UvsReason;
+use orion_error::compat_traits::ErrorOweBase;
 use wp_connector_api::{
-    ConnectorDef, SinkBuildCtx, SinkDefProvider, SinkFactory, SinkHandle, SinkResult, SinkSpec,
+    ConnectorDef, SinkBuildCtx, SinkDefProvider, SinkFactory, SinkHandle, SinkReason, SinkResult,
+    SinkSpec,
 };
 
 use super::file::{AsyncFileSink, FileSinkSpec, FormattedFileSink};
@@ -15,16 +17,16 @@ impl SinkFactory for FileFactory {
     }
 
     fn validate_spec(&self, spec: &SinkSpec) -> SinkResult<()> {
-        FileSinkSpec::from_resolved("file", spec).owe_conf()?;
+        FileSinkSpec::from_resolved("file", spec).owe(SinkReason::from(UvsReason::core_conf()))?;
         Ok(())
     }
 
     async fn build(&self, spec: &SinkSpec, ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let resolved = FileSinkSpec::from_resolved("file", spec).owe_conf()?;
+        let resolved = FileSinkSpec::from_resolved("file", spec).owe(SinkReason::from(UvsReason::core_conf()))?;
         let path = resolved.resolve_path(ctx);
         let fmt = resolved.text_fmt();
         let sync = resolved.sync();
-        let sink = AsyncFileSink::with_sync(&path, sync).await.owe_res()?;
+        let sink = AsyncFileSink::with_sync(&path, sync).await.owe(SinkReason::from(UvsReason::resource_error()))?;
         Ok(SinkHandle::new(Box::new(FormattedFileSink::new(fmt, sink))))
     }
 }
