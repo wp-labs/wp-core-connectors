@@ -7,6 +7,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-30
+
 ### Added
 
 - Add built-in `file`, `syslog`, and `tcp` source connector implementations under `src/sources`
@@ -19,6 +21,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Migrate from deprecated `orion_conf::ErrorOwe` to `ErrorOweBase` with explicit
   reason types; replace `ErrorWith::with()`/`want()` with `with_context()`/`doing()`
 - Fix `ErrorOweBase` and `ToStructError` import paths for orion-error 0.7.2
+- Bump orion-error to 0.7, orion_conf to 0.6, wp-connector-api to 0.9
 
 ## [0.1.3] - 2026-03-29
 
@@ -73,3 +76,9 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Resolve file and arrow-file output paths against `SinkBuildCtx.work_root` and shard filenames for multi-replica builds
 - Preserve the first registered factory for duplicate connector kinds and emit diagnostics instead of silently overriding
 - Handle raw byte payloads in TCP and syslog sinks consistently with string payload handling
+
+[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.2.0
+[0.1.3]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.1.3
+[0.1.1]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.1.1
+[0.1.0]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.1.0
