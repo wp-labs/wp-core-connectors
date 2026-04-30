@@ -261,7 +261,8 @@ impl SinkFactory for ArrowFileStdFactory {
     }
 
     async fn build(&self, spec: &ResolvedSinkSpec, ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let resolved = ArrowFileStdSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
+        let resolved =
+            ArrowFileStdSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
         let path = resolved.resolve_path(ctx);
         let sink = ArrowFileStdSink::new(&path, resolved.field_defs, resolved.sync)
             .map_err(|e| sink_err("arrow_file_std open fail", e))?;

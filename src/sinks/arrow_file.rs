@@ -13,7 +13,8 @@ use wp_arrow::schema::{FieldDef, parse_wp_type};
 use wp_connector_api::SinkResult;
 use wp_connector_api::{
     AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, ConnectorDef, ParamMap, SinkBuildCtx,
-    SinkDefProvider, SinkErrorOwe, SinkFactory, SinkHandle, SinkReason, SinkSpec as ResolvedSinkSpec,
+    SinkDefProvider, SinkErrorOwe, SinkFactory, SinkHandle, SinkReason,
+    SinkSpec as ResolvedSinkSpec,
 };
 use wp_model_core::model::DataRecord;
 
@@ -244,7 +245,8 @@ impl SinkFactory for ArrowFileFactory {
     }
 
     async fn build(&self, spec: &ResolvedSinkSpec, ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let resolved = ArrowFileSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
+        let resolved =
+            ArrowFileSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
         let path = resolved.resolve_path(ctx);
         let sink = ArrowFileSink::new(&path, resolved.tag, resolved.field_defs, resolved.sync)
             .await

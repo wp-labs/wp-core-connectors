@@ -327,7 +327,8 @@ impl SinkFactory for ArrowIpcFactory {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing required param: target"))
             .owe(SinkReason::from(UvsReason::core_conf()))?;
-        let (host, port) = parse_target(target_str).owe(SinkReason::from(UvsReason::core_conf()))?;
+        let (host, port) =
+            parse_target(target_str).owe(SinkReason::from(UvsReason::core_conf()))?;
 
         let tag = spec
             .params
@@ -337,7 +338,8 @@ impl SinkFactory for ArrowIpcFactory {
             .owe(SinkReason::from(UvsReason::core_conf()))?
             .to_string();
 
-        let field_defs = parse_fields_from_params(&spec.params).owe(SinkReason::from(UvsReason::core_conf()))?;
+        let field_defs =
+            parse_fields_from_params(&spec.params).owe(SinkReason::from(UvsReason::core_conf()))?;
 
         let sink = ArrowIpcSink::connect(&host, port, ctx.rate_limit_rps, tag, field_defs)
             .await

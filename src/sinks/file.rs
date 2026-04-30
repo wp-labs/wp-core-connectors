@@ -415,9 +415,13 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!("wp_file_sink_{}.json", ts));
-        let inner = AsyncFileSink::new(path.to_string_lossy().as_ref()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let inner = AsyncFileSink::new(path.to_string_lossy().as_ref())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut sink = FormattedFileSink::new(TextFmt::Json, inner);
-        sink.sink_record(&DataRecord::default()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        sink.sink_record(&DataRecord::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         sink.stop().await.map_err(|e| anyhow::anyhow!("{e}"))?;
         let body = fs::read_to_string(path)?;
         assert!(body.trim_start().starts_with('{'));
@@ -442,9 +446,15 @@ mod tests {
 
         fs::File::create(&other_lock)?.write_all(b"test")?;
 
-        let mut sink = AsyncFileSink::new(own_lock.to_string_lossy().as_ref()).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        AsyncRawDataSink::sink_str(&mut sink, "line1").await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        AsyncCtrl::stop(&mut sink).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut sink = AsyncFileSink::new(own_lock.to_string_lossy().as_ref())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncRawDataSink::sink_str(&mut sink, "line1")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncCtrl::stop(&mut sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         assert!(!Path::new(own_lock.to_string_lossy().as_ref()).exists());
         assert!(Path::new(base.join("group1/sinkA-001.dat").to_string_lossy().as_ref()).exists());
@@ -468,22 +478,37 @@ mod tests {
         fs::create_dir_all(&base)?;
 
         let sync_file = base.join("sync_true.dat.lock");
-        let mut sink_sync =
-            AsyncFileSink::with_sync(sync_file.to_string_lossy().as_ref(), true).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        AsyncRawDataSink::sink_str(&mut sink_sync, "line1").await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        AsyncRawDataSink::sink_str(&mut sink_sync, "line2").await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut sink_sync = AsyncFileSink::with_sync(sync_file.to_string_lossy().as_ref(), true)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncRawDataSink::sink_str(&mut sink_sync, "line1")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncRawDataSink::sink_str(&mut sink_sync, "line2")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let sync_calls = take_sync_all_count();
         assert_eq!(sync_calls, 2);
-        AsyncCtrl::stop(&mut sink_sync).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncCtrl::stop(&mut sink_sync)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let no_sync_file = base.join("sync_false.dat.lock");
         let mut sink_no_sync =
-            AsyncFileSink::with_sync(no_sync_file.to_string_lossy().as_ref(), false).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        AsyncRawDataSink::sink_str(&mut sink_no_sync, "line1").await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        AsyncRawDataSink::sink_str(&mut sink_no_sync, "line2").await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            AsyncFileSink::with_sync(no_sync_file.to_string_lossy().as_ref(), false)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncRawDataSink::sink_str(&mut sink_no_sync, "line1")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncRawDataSink::sink_str(&mut sink_no_sync, "line2")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let sync_calls = take_sync_all_count();
         assert_eq!(sync_calls, 0);
-        AsyncCtrl::stop(&mut sink_no_sync).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncCtrl::stop(&mut sink_no_sync)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let _ = fs::remove_dir_all(&base);
         Ok(())

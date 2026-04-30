@@ -288,7 +288,8 @@ impl SinkFactory for TcpFactory {
         Ok(())
     }
     async fn build(&self, spec: &ResolvedSinkSpec, ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let resolved = TcpSinkSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
+        let resolved =
+            TcpSinkSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
         // Internal defaults: no ACK; auto-drain at shutdown.
         // 限速目标：由 SinkBuildCtx 统一传入，TcpSink 内部据此构建 SendPolicy。
         let runtime = TcpSink::connect(&resolved, ctx.rate_limit_rps)
@@ -367,8 +368,13 @@ mod tests {
             filter: None,
         };
         let ctx = wp_connector_api::SinkBuildCtx::new(std::env::current_dir().unwrap());
-        let mut h = fac.build(&spec, &ctx).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        AsyncRawDataSink::sink_str(h.sink.as_mut(), "abc").await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut h = fac
+            .build(&spec, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncRawDataSink::sink_str(h.sink.as_mut(), "abc")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let body = srv.await.unwrap();
         assert_eq!(body, "abc\n");
         Ok(())
@@ -409,8 +415,13 @@ mod tests {
             filter: None,
         };
         let ctx = wp_connector_api::SinkBuildCtx::new(std::env::current_dir().unwrap());
-        let mut h = fac.build(&spec, &ctx).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-        AsyncRawDataSink::sink_str(h.sink.as_mut(), "hello").await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut h = fac
+            .build(&spec, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncRawDataSink::sink_str(h.sink.as_mut(), "hello")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let body = srv.await.unwrap();
         assert_eq!(body, b"5 hello");
         Ok(())

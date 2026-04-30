@@ -22,11 +22,14 @@ impl SinkFactory for FileFactory {
     }
 
     async fn build(&self, spec: &SinkSpec, ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let resolved = FileSinkSpec::from_resolved("file", spec).owe(SinkReason::from(UvsReason::core_conf()))?;
+        let resolved = FileSinkSpec::from_resolved("file", spec)
+            .owe(SinkReason::from(UvsReason::core_conf()))?;
         let path = resolved.resolve_path(ctx);
         let fmt = resolved.text_fmt();
         let sync = resolved.sync();
-        let sink = AsyncFileSink::with_sync(&path, sync).await.owe(SinkReason::from(UvsReason::resource_error()))?;
+        let sink = AsyncFileSink::with_sync(&path, sync)
+            .await
+            .owe(SinkReason::from(UvsReason::resource_error()))?;
         Ok(SinkHandle::new(Box::new(FormattedFileSink::new(fmt, sink))))
     }
 }
