@@ -1,6 +1,10 @@
 use super::blackhole::BlackHoleSink;
 use async_trait::async_trait;
-use wp_connector_api::{ConnectorDef, ParamMap, SinkDefProvider, SinkFactory, SinkResult};
+use orion_error::conversion::ToStructError;
+use wp_connector_api::{
+    ConnectorDef, ParamMap, SinkBuildCtx, SinkDefProvider, SinkFactory, SinkHandle, SinkReason,
+    SinkResult,
+};
 
 pub struct BlackHoleFactory;
 
@@ -9,11 +13,13 @@ struct BlackHoleSpec {
 }
 
 impl BlackHoleSpec {
-    fn from_params(params: &ParamMap) -> anyhow::Result<Self> {
+    fn from_params(params: &ParamMap) -> SinkResult<Self> {
         if let Some(value) = params.get("sleep_ms")
             && value.as_u64().is_none()
         {
-            anyhow::bail!("blackhole.sleep_ms must be an unsigned integer");
+            return Err(SinkReason::core_conf()
+                .to_err()
+                .with_detail("blackhole.sleep_ms must be an unsigned integer"));
         }
         let sleep_ms = params.get("sleep_ms").and_then(|v| v.as_u64()).unwrap_or(0);
         Ok(Self { sleep_ms })
@@ -26,22 +32,18 @@ impl SinkFactory for BlackHoleFactory {
         "blackhole"
     }
     fn validate_spec(&self, spec: &wp_connector_api::SinkSpec) -> SinkResult<()> {
-        BlackHoleSpec::from_params(&spec.params).map_err(|e| {
-            wp_connector_api::SinkError::from(wp_connector_api::SinkReason::sink(e.to_string()))
-        })?;
+        BlackHoleSpec::from_params(&spec.params)?;
         Ok(())
     }
     async fn build(
         &self,
         spec: &wp_connector_api::SinkSpec,
-        _ctx: &wp_connector_api::SinkBuildCtx,
-    ) -> SinkResult<wp_connector_api::SinkHandle> {
-        let resolved = BlackHoleSpec::from_params(&spec.params).map_err(|e| {
-            wp_connector_api::SinkError::from(wp_connector_api::SinkReason::sink(e.to_string()))
-        })?;
-        Ok(wp_connector_api::SinkHandle::new(Box::new(
-            BlackHoleSink::new(resolved.sleep_ms),
-        )))
+        _ctx: &SinkBuildCtx,
+    ) -> SinkResult<SinkHandle> {
+        let resolved = BlackHoleSpec::from_params(&spec.params)?;
+        Ok(SinkHandle::new(Box::new(BlackHoleSink::new(
+            resolved.sleep_ms,
+        ))))
     }
 }
 

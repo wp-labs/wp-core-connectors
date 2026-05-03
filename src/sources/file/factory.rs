@@ -1,11 +1,8 @@
 use super::source::{FileEncoding, FileSource, MultiFileSource, compute_file_ranges};
 use async_trait::async_trait;
 use glob::glob;
-use orion_conf::ErrorWith;
-use orion_error::UvsReason;
-use orion_error::compat_traits::ErrorOweBase;
+use orion_conf::{ErrorWith, ToStructError};
 use std::path::Path;
-use wp_conf_base::ConfParser;
 use wp_connector_api::{
     ConnectorDef, SourceBuildCtx, SourceDefProvider, SourceFactory, SourceHandle, SourceMeta,
     SourceReason, SourceResult, SourceSpec as ResolvedSourceSpec, SourceSvcIns, Tags,
@@ -108,15 +105,16 @@ impl SourceFactory for FileSourceFactory {
 
     fn validate_spec(&self, resolved: &ResolvedSourceSpec) -> SourceResult<()> {
         let res: anyhow::Result<()> = (|| {
-            if let Err(e) = Tags::validate(&resolved.tags) {
-                anyhow::bail!("Invalid tags: {}", e);
-            }
             FileSourceSpec::from_resolved(resolved)?;
             Ok(())
         })();
-        res.owe(SourceReason::from(UvsReason::core_conf()))
-            .with_context(resolved.name.as_str())
-            .doing("validate file source spec")
+        res.map_err(|e| {
+            SourceReason::core_conf()
+                .to_err()
+                .with_detail(e.to_string())
+        })
+        .with_context(resolved.name.as_str())
+        .doing("validate file source spec")
     }
 
     async fn build(
@@ -126,7 +124,15 @@ impl SourceFactory for FileSourceFactory {
     ) -> SourceResult<SourceSvcIns> {
         let fut = async {
             let spec = FileSourceSpec::from_resolved(resolved)?;
-            let tagset = Tags::from_parse(&resolved.tags);
+            let tagset = {
+                let mut tags = Tags::new();
+                for item in &resolved.tags {
+                    if let Some((k, v)) = item.split_once("=").or_else(|| item.split_once(":")) {
+                        tags.set(k, v);
+                    }
+                }
+                tags
+            };
             let matched_paths = spec.expand_paths()?;
 
             let mut meta = SourceMeta::new(resolved.name.clone(), resolved.kind.clone());
@@ -186,9 +192,13 @@ impl SourceFactory for FileSourceFactory {
         };
 
         let fut: anyhow::Result<SourceSvcIns> = fut.await;
-        fut.owe(SourceReason::from(UvsReason::core_conf()))
-            .with_context(resolved.name.as_str())
-            .doing("build file source service")
+        fut.map_err(|e| {
+            SourceReason::core_conf()
+                .to_err()
+                .with_detail(e.to_string())
+        })
+        .with_context(resolved.name.as_str())
+        .doing("build file source service")
     }
 }
 

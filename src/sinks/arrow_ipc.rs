@@ -1,9 +1,8 @@
+use orion_error::conversion::{SourceErr, SourceRawErr, ToStructError};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use orion_error::UvsReason;
-use orion_error::compat_traits::ErrorOweBase;
 #[cfg(test)]
 use serde_json::json;
 use wp_arrow::convert::records_to_batch;
@@ -18,46 +17,63 @@ use wp_model_core::model::DataRecord;
 
 use crate::net::transport::{BackoffMode, NetSendPolicy, NetWriter, net_backoff_adaptive};
 
-fn parse_target(s: &str) -> anyhow::Result<(String, u16)> {
-    let addr = s
-        .strip_prefix("tcp://")
-        .ok_or_else(|| anyhow::anyhow!("target must start with tcp://, got: {s}"))?;
-    let (host, port) = addr
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow::anyhow!("tcp:// target must be tcp://host:port"))?;
-    let port: u16 = port
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid port in tcp:// target"))?;
+fn parse_target(s: &str) -> SinkResult<(String, u16)> {
+    let addr = s.strip_prefix("tcp://").ok_or_else(|| {
+        SinkReason::core_conf()
+            .to_err()
+            .with_detail(format!("target must start with tcp://, got: {s}"))
+    })?;
+    let (host, port) = addr.rsplit_once(':').ok_or_else(|| {
+        SinkReason::core_conf()
+            .to_err()
+            .with_detail("tcp:// target must be tcp://host:port")
+    })?;
+    let port: u16 = port.parse().map_err(|_| {
+        SinkReason::core_conf()
+            .to_err()
+            .with_detail("invalid port in tcp:// target")
+    })?;
     if host.is_empty() {
-        anyhow::bail!("tcp:// target must include a host");
+        return Err(SinkReason::core_conf()
+            .to_err()
+            .with_detail("tcp:// target must include a host"));
     }
     Ok((host.to_string(), port))
 }
 
-fn parse_fields_from_params(params: &ParamMap) -> anyhow::Result<Vec<FieldDef>> {
-    let fields_val = params
-        .get("fields")
-        .ok_or_else(|| anyhow::anyhow!("missing required param: fields"))?;
-    let arr = fields_val
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("fields must be an array"))?;
+fn parse_fields_from_params(params: &ParamMap) -> SinkResult<Vec<FieldDef>> {
+    let fields_val = params.get("fields").ok_or_else(|| {
+        SinkReason::core_conf()
+            .to_err()
+            .with_detail("missing required param: fields")
+    })?;
+    let arr = fields_val.as_array().ok_or_else(|| {
+        SinkReason::core_conf()
+            .to_err()
+            .with_detail("fields must be an array")
+    })?;
 
     let mut defs = Vec::with_capacity(arr.len());
     for item in arr {
-        let name = item
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("each field must have a string 'name'"))?;
-        let type_str = item
-            .get("type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("each field must have a string 'type'"))?;
+        let name = item.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            SinkReason::core_conf()
+                .to_err()
+                .with_detail("each field must have a string 'name'")
+        })?;
+        let type_str = item.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
+            SinkReason::core_conf()
+                .to_err()
+                .with_detail("each field must have a string 'type'")
+        })?;
         let nullable = item
             .get("nullable")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        let wp_type = parse_wp_type(type_str)
-            .map_err(|e| anyhow::anyhow!("field '{}' has invalid type: {}", name, e))?;
+        let wp_type = parse_wp_type(type_str).map_err(|e| {
+            SinkReason::core_conf()
+                .to_err()
+                .with_detail(format!("field '{}' has invalid type: {}", name, e))
+        })?;
         defs.push(FieldDef::new(name, wp_type).with_nullable(nullable));
     }
     Ok(defs)
@@ -88,7 +104,7 @@ pub struct ArrowIpcSink {
 }
 
 impl ArrowIpcSink {
-    async fn connect_writer(addr: &str, rate_limit_rps: usize) -> anyhow::Result<NetWriter> {
+    async fn connect_writer(addr: &str, rate_limit_rps: usize) -> SinkResult<NetWriter> {
         let mode = if rate_limit_rps == 0 {
             BackoffMode::ForceOn
         } else {
@@ -103,6 +119,7 @@ impl ArrowIpcSink {
             },
         )
         .await
+        .source_err(SinkReason::Sink, "arrow_ipc connect tcp")
     }
 
     async fn connect(
@@ -111,7 +128,7 @@ impl ArrowIpcSink {
         rate_limit_rps: usize,
         tag: String,
         field_defs: Vec<FieldDef>,
-    ) -> anyhow::Result<Self> {
+    ) -> SinkResult<Self> {
         let addr = format!("{host}:{port}");
         let writer = Self::connect_writer(&addr, rate_limit_rps).await?;
 
@@ -176,12 +193,10 @@ impl ArrowIpcSink {
 
     async fn send_batch(&mut self, records: &[DataRecord]) -> SinkResult<()> {
         let batch = records_to_batch(records, &self.field_defs)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .owe(SinkReason::from(UvsReason::resource_error()))?;
+            .source_raw_err(SinkReason::Sink, "arrow_ipc encode records batch")?;
 
         let payload = encode_ipc(&self.tag, &batch)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .owe(SinkReason::from(UvsReason::resource_error()))?;
+            .source_raw_err(SinkReason::Sink, "arrow_ipc encode ipc payload")?;
 
         let send_result = match self.conn {
             ConnState::Connected { .. } => {
@@ -205,17 +220,17 @@ impl ArrowIpcSink {
                     } else if matches!(self.conn, ConnState::Connected { .. }) {
                         Ok(())
                     } else {
-                        Err(SinkError::from(SinkReason::sink(
+                        Err(SinkReason::sink(
                             "arrow_ipc sink reconnect did not restore connection",
-                        )))
+                        ))
                     }
                 } else {
-                    Err(SinkError::from(SinkReason::sink(
+                    Err(SinkReason::sink(
                         "arrow_ipc sink waiting for reconnect backoff",
-                    )))
+                    ))
                 }
             }
-            ConnState::Stopped => Err(SinkError::from(SinkReason::sink("arrow_ipc sink stopped"))),
+            ConnState::Stopped => Err(SinkReason::sink("arrow_ipc sink stopped")),
         };
 
         if send_result.is_ok() {
@@ -269,27 +284,19 @@ impl AsyncRecordSink for ArrowIpcSink {
 #[async_trait]
 impl AsyncRawDataSink for ArrowIpcSink {
     async fn sink_str(&mut self, _data: &str) -> SinkResult<()> {
-        Err(SinkError::from(SinkReason::sink(
-            "arrow_ipc sink only accepts records",
-        )))
+        Err(SinkReason::sink("arrow_ipc sink only accepts records"))
     }
 
     async fn sink_bytes(&mut self, _data: &[u8]) -> SinkResult<()> {
-        Err(SinkError::from(SinkReason::sink(
-            "arrow_ipc sink only accepts records",
-        )))
+        Err(SinkReason::sink("arrow_ipc sink only accepts records"))
     }
 
     async fn sink_str_batch(&mut self, _data: Vec<&str>) -> SinkResult<()> {
-        Err(SinkError::from(SinkReason::sink(
-            "arrow_ipc sink only accepts records",
-        )))
+        Err(SinkReason::sink("arrow_ipc sink only accepts records"))
     }
 
     async fn sink_bytes_batch(&mut self, _data: Vec<&[u8]>) -> SinkResult<()> {
-        Err(SinkError::from(SinkReason::sink(
-            "arrow_ipc sink only accepts records",
-        )))
+        Err(SinkReason::sink("arrow_ipc sink only accepts records"))
     }
 }
 
@@ -306,17 +313,23 @@ impl SinkFactory for ArrowIpcFactory {
             .params
             .get("target")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing required param: target"))
-            .owe(SinkReason::from(UvsReason::core_conf()))?;
-        parse_target(target_str).owe(SinkReason::from(UvsReason::core_conf()))?;
+            .ok_or_else(|| {
+                SinkReason::core_conf()
+                    .to_err()
+                    .with_detail("missing required param: target")
+            })?;
+        parse_target(target_str)?;
 
         spec.params
             .get("tag")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing required param: tag"))
-            .owe(SinkReason::from(UvsReason::core_conf()))?;
+            .ok_or_else(|| {
+                SinkReason::core_conf()
+                    .to_err()
+                    .with_detail("missing required param: tag")
+            })?;
 
-        parse_fields_from_params(&spec.params).owe(SinkReason::from(UvsReason::core_conf()))?;
+        parse_fields_from_params(&spec.params)?;
         Ok(())
     }
 
@@ -325,25 +338,27 @@ impl SinkFactory for ArrowIpcFactory {
             .params
             .get("target")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing required param: target"))
-            .owe(SinkReason::from(UvsReason::core_conf()))?;
-        let (host, port) =
-            parse_target(target_str).owe(SinkReason::from(UvsReason::core_conf()))?;
+            .ok_or_else(|| {
+                SinkReason::core_conf()
+                    .to_err()
+                    .with_detail("missing required param: target")
+            })?;
+        let (host, port) = parse_target(target_str)?;
 
         let tag = spec
             .params
             .get("tag")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing required param: tag"))
-            .owe(SinkReason::from(UvsReason::core_conf()))?
+            .ok_or_else(|| {
+                SinkReason::core_conf()
+                    .to_err()
+                    .with_detail("missing required param: tag")
+            })?
             .to_string();
 
-        let field_defs =
-            parse_fields_from_params(&spec.params).owe(SinkReason::from(UvsReason::core_conf()))?;
+        let field_defs = parse_fields_from_params(&spec.params)?;
 
-        let sink = ArrowIpcSink::connect(&host, port, ctx.rate_limit_rps, tag, field_defs)
-            .await
-            .owe(SinkReason::from(UvsReason::resource_error()))?;
+        let sink = ArrowIpcSink::connect(&host, port, ctx.rate_limit_rps, tag, field_defs).await?;
         Ok(SinkHandle::new(Box::new(sink)))
     }
 }

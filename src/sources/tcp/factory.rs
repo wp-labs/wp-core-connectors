@@ -1,7 +1,4 @@
-use orion_conf::ErrorWith;
-use orion_error::UvsReason;
-use orion_error::compat_traits::ErrorOweBase;
-use wp_conf_base::ConfParser;
+use orion_conf::{ErrorWith, ToStructError};
 use wp_connector_api::SourceDefProvider;
 use wp_connector_api::{
     AcceptorHandle, ConnectorDef, SourceBuildCtx, SourceFactory, SourceHandle, SourceMeta,
@@ -27,15 +24,16 @@ impl SourceFactory for TcpSourceFactory {
 
     fn validate_spec(&self, spec: &ResolvedSourceSpec) -> SourceResult<()> {
         let res: anyhow::Result<()> = (|| {
-            if let Err(e) = Tags::validate(&spec.tags) {
-                anyhow::bail!("Invalid tags: {}", e);
-            }
             TcpSourceSpec::from_params(&spec.params)?;
             Ok(())
         })();
-        res.owe(SourceReason::from(UvsReason::core_conf()))
-            .with_context(spec.name.as_str())
-            .doing("validate tcp source spec")
+        res.map_err(|e| {
+            SourceReason::core_conf()
+                .to_err()
+                .with_detail(e.to_string())
+        })
+        .with_context(spec.name.as_str())
+        .doing("validate tcp source spec")
     }
 
     async fn build(
@@ -45,7 +43,15 @@ impl SourceFactory for TcpSourceFactory {
     ) -> SourceResult<SourceSvcIns> {
         let fut = async {
             let conf = TcpSourceSpec::from_params(&spec.params)?;
-            let tags = Tags::from_parse(&spec.tags);
+            let tags = {
+                let mut tags = Tags::new();
+                for item in &spec.tags {
+                    if let Some((k, v)) = item.split_once("=").or_else(|| item.split_once(":")) {
+                        tags.set(k, v);
+                    }
+                }
+                tags
+            };
 
             let connection_registry = Arc::new(Mutex::new(HashSet::<u64>::new()));
             let mut instance_reg_txs = Vec::with_capacity(conf.instances);
@@ -98,9 +104,13 @@ impl SourceFactory for TcpSourceFactory {
         };
 
         let fut: anyhow::Result<SourceSvcIns> = fut.await;
-        fut.owe(SourceReason::from(UvsReason::core_conf()))
-            .with_context(spec.name.as_str())
-            .doing("build tcp source service")
+        fut.map_err(|e| {
+            SourceReason::core_conf()
+                .to_err()
+                .with_detail(e.to_string())
+        })
+        .with_context(spec.name.as_str())
+        .doing("build tcp source service")
     }
 }
 

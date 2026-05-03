@@ -1,7 +1,6 @@
 use crate::builtin;
 use async_trait::async_trait;
-use orion_error::UvsReason;
-use orion_error::compat_traits::ErrorOweBase;
+use orion_error::conversion::{SourceErr, ToStructError};
 use wp_connector_api::SinkReason;
 use wp_connector_api::SinkResult;
 use wp_connector_api::{
@@ -10,7 +9,6 @@ use wp_connector_api::{
 };
 use wp_data_fmt::RecordFormatter; // for fmt_record
 
-type AnyResult<T> = anyhow::Result<T>;
 use crate::net::transport::{BackoffMode, NetSendPolicy, NetWriter, net_backoff_adaptive};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,14 +25,22 @@ struct TcpSinkSpec {
 }
 
 impl TcpSinkSpec {
-    fn from_resolved(spec: &ResolvedSinkSpec) -> AnyResult<Self> {
+    fn from_resolved(spec: &ResolvedSinkSpec) -> SinkResult<Self> {
         let addr = match spec.params.get("addr").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
-            None => anyhow::bail!("tcp.addr must be a string"),
+            None => {
+                return Err(SinkReason::core_conf()
+                    .to_err()
+                    .with_detail("tcp.addr must be a string"));
+            }
         };
         let port = match spec.params.get("port").and_then(|v| v.as_i64()) {
             Some(p) if (1..=65535).contains(&p) => p as u16,
-            Some(_) => anyhow::bail!("tcp.port must be in 1..=65535"),
+            Some(_) => {
+                return Err(SinkReason::core_conf()
+                    .to_err()
+                    .with_detail("tcp.port must be in 1..=65535"));
+            }
             None => 9000,
         };
         let framing = spec
@@ -45,7 +51,11 @@ impl TcpSinkSpec {
         let framing = match framing.to_ascii_lowercase().as_str() {
             "len" | "length" => Framing::Len,
             "line" => Framing::Line,
-            _ => anyhow::bail!("tcp.framing must be 'line' or 'len'"),
+            _ => {
+                return Err(SinkReason::core_conf()
+                    .to_err()
+                    .with_detail("tcp.framing must be 'line' or 'len'"));
+            }
         };
         Self::ensure_bool(spec, "max_backoff")?;
         Self::ensure_bool(spec, "sendq_backpressure")?;
@@ -56,11 +66,13 @@ impl TcpSinkSpec {
         })
     }
 
-    fn ensure_bool(spec: &ResolvedSinkSpec, key: &str) -> AnyResult<()> {
+    fn ensure_bool(spec: &ResolvedSinkSpec, key: &str) -> SinkResult<()> {
         if let Some(v) = spec.params.get(key)
             && v.as_bool().is_none()
         {
-            anyhow::bail!("tcp.{key} must be a boolean");
+            return Err(SinkReason::core_conf()
+                .to_err()
+                .with_detail(format!("tcp.{key} must be a boolean")));
         }
         Ok(())
     }
@@ -80,7 +92,7 @@ pub struct TcpSink {
 }
 
 impl TcpSink {
-    async fn connect(spec: &TcpSinkSpec, rate_limit_rps: usize) -> AnyResult<Self> {
+    async fn connect(spec: &TcpSinkSpec, rate_limit_rps: usize) -> SinkResult<Self> {
         let target = spec.target_addr();
         // 根据限速目标决定策略：
         // - rate_limit_rps == 0（无限速）：启用背压能力（ForceOn）——仅在水位/包型需要时退让；
@@ -98,7 +110,8 @@ impl TcpSink {
                 adaptive: net_backoff_adaptive(),
             },
         )
-        .await?;
+        .await
+        .source_err(SinkReason::Sink, "tcp sink connect tcp")?;
         log::info!("tcp sink connected: target={}", target);
         Ok(Self {
             writer,
@@ -284,17 +297,14 @@ impl SinkFactory for TcpFactory {
         "tcp"
     }
     fn validate_spec(&self, spec: &ResolvedSinkSpec) -> SinkResult<()> {
-        TcpSinkSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
+        TcpSinkSpec::from_resolved(spec)?;
         Ok(())
     }
     async fn build(&self, spec: &ResolvedSinkSpec, ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let resolved =
-            TcpSinkSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
+        let resolved = TcpSinkSpec::from_resolved(spec)?;
         // Internal defaults: no ACK; auto-drain at shutdown.
         // 限速目标：由 SinkBuildCtx 统一传入，TcpSink 内部据此构建 SendPolicy。
-        let runtime = TcpSink::connect(&resolved, ctx.rate_limit_rps)
-            .await
-            .owe(SinkReason::from(UvsReason::resource_error()))?;
+        let runtime = TcpSink::connect(&resolved, ctx.rate_limit_rps).await?;
         Ok(SinkHandle::new(Box::new(runtime)))
     }
 }

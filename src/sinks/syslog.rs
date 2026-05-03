@@ -1,7 +1,6 @@
 use crate::{builtin, registry};
 use async_trait::async_trait;
-use orion_error::UvsReason;
-use orion_error::compat_traits::ErrorOweBase;
+use orion_error::conversion::{SourceErr, ToStructError};
 use wp_connector_api::SinkReason;
 use wp_connector_api::SinkResult;
 use wp_connector_api::{
@@ -11,7 +10,6 @@ use wp_connector_api::{
 use wp_data_fmt::RecordFormatter; // for fmt_record
 // no extra orion-error/conf helpers needed after route-builder removal
 
-type AnyResult<T> = anyhow::Result<T>;
 use crate::net::transport::{
     BackoffMode, NetSendPolicy, NetWriter, Transport, net_backoff_adaptive,
 };
@@ -55,27 +53,37 @@ impl SyslogSinkSpec {
     }
 }
 
-fn syslog_conf_from_spec(spec: &ResolvedSinkSpec) -> AnyResult<SyslogSinkSpec> {
+fn syslog_conf_from_spec(spec: &ResolvedSinkSpec) -> SinkResult<SyslogSinkSpec> {
     let addr = spec
         .params
         .get("addr")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("syslog.addr must be a string"))?;
+        .ok_or_else(|| {
+            SinkReason::core_conf()
+                .to_err()
+                .with_detail("syslog.addr must be a string")
+        })?;
     if let Some(i) = spec.params.get("port").and_then(|v| v.as_i64())
         && !(1..=65535).contains(&i)
     {
-        anyhow::bail!("syslog.port must be in 1..=65535");
+        return Err(SinkReason::core_conf()
+            .to_err()
+            .with_detail("syslog.port must be in 1..=65535"));
     }
     if let Some(p) = spec.params.get("protocol").and_then(|v| v.as_str()) {
         let v = p.to_ascii_lowercase();
         if v != "udp" && v != "tcp" {
-            anyhow::bail!("syslog.protocol must be 'udp' or 'tcp'");
+            return Err(SinkReason::core_conf()
+                .to_err()
+                .with_detail("syslog.protocol must be 'udp' or 'tcp'"));
         }
     }
     if let Some(v) = spec.params.get("app_name")
         && v.as_str().is_none()
     {
-        anyhow::bail!("syslog.app_name must be a string");
+        return Err(SinkReason::core_conf()
+            .to_err()
+            .with_detail("syslog.app_name must be a string"));
     }
     let port = spec
         .params
@@ -90,7 +98,11 @@ fn syslog_conf_from_spec(spec: &ResolvedSinkSpec) -> AnyResult<SyslogSinkSpec> {
     let protocol = match protocol.to_ascii_lowercase().as_str() {
         "udp" => SyslogProtocol::Udp,
         "tcp" => SyslogProtocol::Tcp,
-        _ => anyhow::bail!("syslog.protocol must be 'udp' or 'tcp'"),
+        _ => {
+            return Err(SinkReason::core_conf()
+                .to_err()
+                .with_detail("syslog.protocol must be 'udp' or 'tcp'"));
+        }
     };
     let app_name = spec
         .params
@@ -116,8 +128,10 @@ pub struct SyslogSink {
 }
 
 impl SyslogSink {
-    async fn udp(addr: &str, app_name: Option<String>) -> AnyResult<Self> {
-        let writer = NetWriter::connect_udp(addr).await?;
+    async fn udp(addr: &str, app_name: Option<String>) -> SinkResult<Self> {
+        let writer = NetWriter::connect_udp(addr)
+            .await
+            .source_err(SinkReason::Sink, "syslog udp connect")?;
         // Log effective endpoints once (target/local)
         if let Transport::Udp(sock) = &writer.transport {
             if let Ok(local_addr) = sock.local_addr() {
@@ -134,7 +148,7 @@ impl SyslogSink {
         }
         Ok(Self::with_writer(writer, app_name))
     }
-    async fn tcp(addr: &str, app_name: Option<String>, rate_limit_rps: usize) -> AnyResult<Self> {
+    async fn tcp(addr: &str, app_name: Option<String>, rate_limit_rps: usize) -> SinkResult<Self> {
         // Align to TcpSink: enable backpressure when unlimited
         let mode = if rate_limit_rps == 0 {
             BackoffMode::ForceOn
@@ -149,7 +163,8 @@ impl SyslogSink {
                 adaptive: net_backoff_adaptive(),
             },
         )
-        .await?;
+        .await
+        .source_err(SinkReason::Sink, "syslog tcp connect")?;
         log::info!("syslog tcp sink connected: target={}", addr);
         Ok(Self::with_writer(writer, app_name))
     }
@@ -318,11 +333,11 @@ impl SinkFactory for SyslogFactory {
         "syslog"
     }
     fn validate_spec(&self, spec: &ResolvedSinkSpec) -> SinkResult<()> {
-        syslog_conf_from_spec(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
+        syslog_conf_from_spec(spec)?;
         Ok(())
     }
     async fn build(&self, spec: &ResolvedSinkSpec, _ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let conf = syslog_conf_from_spec(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
+        let conf = syslog_conf_from_spec(spec)?;
         let proto = conf.protocol;
         let target = conf.target_addr();
         // Log resolved target to aid diagnosing mismatched params
@@ -335,13 +350,10 @@ impl SinkFactory for SyslogFactory {
 
         // Build runtime sink directly; pass rate_limit_rps to TCP writer
         let runtime = match proto {
-            SyslogProtocol::Udp => SyslogSink::udp(target.as_str(), Some(app_name.clone()))
-                .await
-                .owe(SinkReason::from(UvsReason::resource_error()))?,
+            SyslogProtocol::Udp => SyslogSink::udp(target.as_str(), Some(app_name.clone())).await?,
             SyslogProtocol::Tcp => {
                 SyslogSink::tcp(target.as_str(), Some(app_name.clone()), _ctx.rate_limit_rps)
-                    .await
-                    .owe(SinkReason::from(UvsReason::resource_error()))?
+                    .await?
             }
         };
         Ok(SinkHandle::new(Box::new(runtime)))

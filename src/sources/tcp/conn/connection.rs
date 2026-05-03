@@ -145,11 +145,10 @@ impl TcpConnection {
                     }
                 }
                 Err(e) => {
-                    return Err(SourceReason::Disconnect(format!(
+                    return Err(SourceReason::disconnect(format!(
                         "tcp read error ({}): {}",
                         self.client_addr, e
-                    ))
-                    .into());
+                    )));
                 }
             }
         }
@@ -165,11 +164,10 @@ impl TcpConnection {
         }
         loop {
             if let Err(e) = self.stream.readable().await {
-                return Err(SourceReason::Disconnect(format!(
+                return Err(SourceReason::disconnect(format!(
                     "tcp readable error ({}): {}",
                     self.client_addr, e
-                ))
-                .into());
+                )));
             }
             match self.stream.try_read_buf(self.batcher.buffer_mut()) {
                 Ok(0) => {
@@ -205,11 +203,10 @@ impl TcpConnection {
                     continue;
                 }
                 Err(e) => {
-                    return Err(SourceReason::Disconnect(format!(
+                    return Err(SourceReason::disconnect(format!(
                         "tcp read error ({}): {}",
                         self.client_addr, e
-                    ))
-                    .into());
+                    )));
                 }
             }
         }

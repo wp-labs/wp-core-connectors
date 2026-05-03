@@ -18,7 +18,7 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use tokio::net::UdpSocket;
 use wp_connector_api::{DataSource, EventPreHook, SourceBatch, SourceEvent, Tags};
-use wp_connector_api::{SourceError, SourceReason, SourceResult};
+use wp_connector_api::{SourceReason, SourceResult};
 use wp_model_core::raw::RawData;
 
 use super::normalize;
@@ -575,7 +575,7 @@ impl UdpSyslogSource {
                 }
                 Err(e) => {
                     error_data!("UDP syslog '{}' recv_from error: {}", self.key, e);
-                    return Err(SourceError::from(SourceReason::Disconnect(e.to_string())));
+                    return Err(SourceReason::disconnect(e.to_string()));
                 }
             }
         }

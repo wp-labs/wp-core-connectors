@@ -7,6 +7,31 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-03
+
+### Changed
+
+- Migrate all sink constructor and config-parsing functions from `anyhow::Result` to
+  `SinkResult` (`StructError<SinkReason>`), eliminating `anyhow::Error` from sink
+  production code paths
+- Enable `orion-error`'s `anyhow` feature so `anyhow::Error` implements
+  `UnstructuredSource`, allowing `.source_err()` on `anyhow::Result<T>` directly
+- Replace `SinkReason::resource_error().to_err().with_detail(e.to_string())` with
+  `.source_err(SinkReason::Sink, "...")` (for `anyhow`/`io` errors) or
+  `.source_raw_err(SinkReason::Sink, "...")` (for third-party `StdError` types),
+  preserving original error sources instead of stringifying them
+- Replace `anyhow::bail!`/`anyhow::anyhow!` in config validation functions
+  (`from_resolved`, `parse_fields_from_params`, `parse_target`,
+  `syslog_conf_from_spec`) with `SinkReason::core_conf().to_err().with_detail(...)`,
+  returning structured config errors directly
+- Remove redundant `.map_err(|e| SinkReason::core_conf().to_err().with_detail(...))`
+  wrappers from factory `validate_spec`/`build` methods now that parsing functions
+  return `SinkResult` natively
+
+### Removed
+
+- Remove `type AnyResult<T> = anyhow::Result<T>` type aliases from all sink modules
+
 ## [0.2.0] - 2026-04-30
 
 ### Added
@@ -77,7 +102,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Preserve the first registered factory for duplicate connector kinds and emit diagnostics instead of silently overriding
 - Handle raw byte payloads in TCP and syslog sinks consistently with string payload handling
 
-[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.2.0
 [0.1.3]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.1.3
 [0.1.1]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.1.1

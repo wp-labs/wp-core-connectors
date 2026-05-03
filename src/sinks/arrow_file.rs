@@ -1,8 +1,7 @@
+use orion_error::conversion::{SourceErr, SourceRawErr, ToStructError};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use orion_error::UvsReason;
-use orion_error::compat_traits::ErrorOweBase;
 #[cfg(test)]
 use serde_json::json;
 use tokio::fs::OpenOptions;
@@ -30,7 +29,7 @@ struct ArrowFileSpec {
 }
 
 impl ArrowFileSpec {
-    fn from_resolved(spec: &ResolvedSinkSpec) -> anyhow::Result<Self> {
+    fn from_resolved(spec: &ResolvedSinkSpec) -> SinkResult<Self> {
         let base = spec
             .params
             .get("base")
@@ -47,7 +46,11 @@ impl ArrowFileSpec {
             .params
             .get("tag")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing required param: tag"))?
+            .ok_or_else(|| {
+                SinkReason::core_conf()
+                    .to_err()
+                    .with_detail("missing required param: tag")
+            })?
             .to_string();
         let sync = spec
             .params
@@ -71,30 +74,39 @@ impl ArrowFileSpec {
     }
 }
 
-fn parse_fields_from_params(params: &ParamMap) -> anyhow::Result<Vec<FieldDef>> {
-    let fields_val = params
-        .get("fields")
-        .ok_or_else(|| anyhow::anyhow!("missing required param: fields"))?;
-    let arr = fields_val
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("fields must be an array"))?;
+fn parse_fields_from_params(params: &ParamMap) -> SinkResult<Vec<FieldDef>> {
+    let fields_val = params.get("fields").ok_or_else(|| {
+        SinkReason::core_conf()
+            .to_err()
+            .with_detail("missing required param: fields")
+    })?;
+    let arr = fields_val.as_array().ok_or_else(|| {
+        SinkReason::core_conf()
+            .to_err()
+            .with_detail("fields must be an array")
+    })?;
 
     let mut defs = Vec::with_capacity(arr.len());
     for item in arr {
-        let name = item
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("each field must have a string 'name'"))?;
-        let type_str = item
-            .get("type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("each field must have a string 'type'"))?;
+        let name = item.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            SinkReason::core_conf()
+                .to_err()
+                .with_detail("each field must have a string 'name'")
+        })?;
+        let type_str = item.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
+            SinkReason::core_conf()
+                .to_err()
+                .with_detail("each field must have a string 'type'")
+        })?;
         let nullable = item
             .get("nullable")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        let wp_type = parse_wp_type(type_str)
-            .map_err(|e| anyhow::anyhow!("field '{}' has invalid type: {}", name, e))?;
+        let wp_type = parse_wp_type(type_str).map_err(|e| {
+            SinkReason::core_conf()
+                .to_err()
+                .with_detail(format!("field '{}' has invalid type: {}", name, e))
+        })?;
         defs.push(FieldDef::new(name, wp_type).with_nullable(nullable));
     }
     Ok(defs)
@@ -114,17 +126,18 @@ impl ArrowFileSink {
         tag: String,
         field_defs: Vec<FieldDef>,
         sync: bool,
-    ) -> anyhow::Result<Self> {
+    ) -> SinkResult<Self> {
         if let Some(parent) = std::path::Path::new(path).parent()
             && !parent.exists()
         {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).source_err(SinkReason::Sink, "create output dir")?;
         }
         let out_io = OpenOptions::new()
             .append(true)
             .create(true)
             .open(path)
-            .await?;
+            .await
+            .source_err(SinkReason::Sink, "open output file")?;
         Ok(Self {
             out_io,
             tag,
@@ -136,11 +149,9 @@ impl ArrowFileSink {
 
     async fn send_batch(&mut self, records: &[DataRecord]) -> SinkResult<()> {
         let batch = records_to_batch(records, &self.field_defs)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .owe(SinkReason::from(UvsReason::resource_error()))?;
+            .source_raw_err(SinkReason::Sink, "arrow_file encode records batch")?;
         let payload = encode_ipc(&self.tag, &batch)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .owe(SinkReason::from(UvsReason::resource_error()))?;
+            .source_raw_err(SinkReason::Sink, "arrow_file encode ipc payload")?;
 
         self.out_io
             .write_all(&(payload.len() as u32).to_be_bytes())
@@ -240,17 +251,15 @@ impl SinkFactory for ArrowFileFactory {
     }
 
     fn validate_spec(&self, spec: &ResolvedSinkSpec) -> SinkResult<()> {
-        ArrowFileSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
+        ArrowFileSpec::from_resolved(spec)?;
         Ok(())
     }
 
     async fn build(&self, spec: &ResolvedSinkSpec, ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let resolved =
-            ArrowFileSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
+        let resolved = ArrowFileSpec::from_resolved(spec)?;
         let path = resolved.resolve_path(ctx);
-        let sink = ArrowFileSink::new(&path, resolved.tag, resolved.field_defs, resolved.sync)
-            .await
-            .owe(SinkReason::from(UvsReason::resource_error()))?;
+        let sink =
+            ArrowFileSink::new(&path, resolved.tag, resolved.field_defs, resolved.sync).await?;
         Ok(SinkHandle::new(Box::new(sink)))
     }
 }

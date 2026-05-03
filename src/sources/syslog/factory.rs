@@ -7,13 +7,10 @@ use super::config::{Protocol, SyslogSourceSpec};
 use super::tcp_source::TcpSyslogSource;
 use super::udp_source::UdpSyslogSource;
 use crate::sources::tcp::{FramingMode, TcpAcceptor, TcpSource, tcp_reader_batch_channel_cap};
-use orion_conf::ErrorWith;
-use orion_error::UvsReason;
-use orion_error::compat_traits::ErrorOweBase;
+use orion_conf::{ErrorWith, ToStructError};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use wp_conf_base::ConfParser;
 use wp_connector_api::{
     AcceptorHandle, ConnectorDef, SourceBuildCtx, SourceDefProvider, SourceFactory, SourceHandle,
     SourceMeta, SourceReason, SourceResult, SourceSvcIns, Tags,
@@ -48,7 +45,15 @@ impl SourceFactory for SyslogSourceFactory {
     ) -> SourceResult<SourceSvcIns> {
         let fut = async {
             let config = SyslogSourceSpec::from_params(&spec.params)?;
-            let mut base_tags = Tags::from_parse(&spec.tags);
+            let mut base_tags = {
+                let mut tags = Tags::new();
+                for item in &spec.tags {
+                    if let Some((k, v)) = item.split_once("=").or_else(|| item.split_once(":")) {
+                        tags.set(k, v);
+                    }
+                }
+                tags
+            };
             base_tags.set("access_source", "syslog".to_string());
             base_tags.set("syslog_protocol", format!("{:?}", config.protocol));
 
@@ -130,9 +135,13 @@ impl SourceFactory for SyslogSourceFactory {
         };
 
         let fut: anyhow::Result<SourceSvcIns> = fut.await;
-        fut.owe(SourceReason::from(UvsReason::core_conf()))
-            .with_context(spec.name.as_str())
-            .doing("build syslog source service")
+        fut.map_err(|e| {
+            SourceReason::core_conf()
+                .to_err()
+                .with_detail(e.to_string())
+        })
+        .with_context(spec.name.as_str())
+        .doing("build syslog source service")
     }
 }
 

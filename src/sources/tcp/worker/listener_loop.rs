@@ -2,7 +2,7 @@ use crate::sources::tcp::ConnectionRegistry;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
-use wp_connector_api::{SourceError, SourceReason, SourceResult};
+use wp_connector_api::{SourceReason, SourceResult};
 
 use std::net::SocketAddr;
 
@@ -45,10 +45,10 @@ impl TcpListenerLoop {
 
     pub async fn run(&mut self) -> SourceResult<()> {
         let listener = TcpListener::bind(&self.address).await.map_err(|e| {
-            SourceError::from(SourceReason::Disconnect(format!(
+            SourceReason::disconnect(format!(
                 "failed to bind TCP socket to {}: {}",
                 self.address, e
-            )))
+            ))
         })?;
 
         let local = listener

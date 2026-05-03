@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose;
 use bytes::Bytes;
-use orion_conf::{ErrorWith, UvsFrom};
+use orion_conf::ErrorWith;
 use orion_error::conversion::ToStructError;
 use std::collections::VecDeque;
 use std::path::Path;
@@ -50,18 +50,18 @@ impl FileSource {
         use std::path::Path;
         let file_path = Path::new(path);
         if !file_path.exists() {
-            return Err(SourceReason::from_conf().to_err());
+            return Err(SourceReason::core_conf().to_err());
         }
         let mut file = tokio::fs::File::open(file_path)
             .await
-            .map_err(|e| SourceError::from(SourceReason::Disconnect(e.to_string())))
+            .map_err(|e| SourceReason::disconnect(e.to_string()))
             .with_context(file_path)
             .doing("open source file")?;
         use std::io::SeekFrom;
         use tokio::io::AsyncSeekExt;
         file.seek(SeekFrom::Start(range_start))
             .await
-            .map_err(|e| SourceError::from(SourceReason::Disconnect(e.to_string())))
+            .map_err(|e| SourceReason::disconnect(e.to_string()))
             .with_context(file_path)
             .doing("seek to posion")?;
         tags.set("access_source", path.to_string());
@@ -84,27 +84,18 @@ impl FileSource {
         match encode {
             FileEncoding::Text => Ok(RawData::Bytes(Bytes::from(line))),
             FileEncoding::Base64 => {
-                let s = std::str::from_utf8(&line).map_err(|_| {
-                    SourceError::from(SourceReason::SupplierError(
-                        "invalid utf8 in base64 text".to_string(),
-                    ))
-                })?;
-                let val = general_purpose::STANDARD.decode(s.trim()).map_err(|_| {
-                    SourceError::from(SourceReason::SupplierError(
-                        "base64 decode error".to_string(),
-                    ))
-                })?;
+                let s = std::str::from_utf8(&line)
+                    .map_err(|_| SourceReason::supplier_error("invalid utf8 in base64 text"))?;
+                let val = general_purpose::STANDARD
+                    .decode(s.trim())
+                    .map_err(|_| SourceReason::supplier_error("base64 decode error"))?;
                 Ok(RawData::Bytes(Bytes::from(val)))
             }
             FileEncoding::Hex => {
-                let s = std::str::from_utf8(&line).map_err(|_| {
-                    SourceError::from(SourceReason::SupplierError(
-                        "invalid utf8 in hex text".to_string(),
-                    ))
-                })?;
-                let val = hex::decode(s.trim()).map_err(|_| {
-                    SourceError::from(SourceReason::SupplierError("hex decode error".to_string()))
-                })?;
+                let s = std::str::from_utf8(&line)
+                    .map_err(|_| SourceReason::supplier_error("invalid utf8 in hex text"))?;
+                let val = hex::decode(s.trim())
+                    .map_err(|_| SourceReason::supplier_error("hex decode error"))?;
                 Ok(RawData::Bytes(Bytes::from(val)))
             }
         }
@@ -160,7 +151,7 @@ impl MultiFileSource {
             return Ok(false);
         };
         let ranges = compute_file_ranges(Path::new(&path), self.instances)
-            .map_err(|e| SourceError::from(SourceReason::Disconnect(e.to_string())))
+            .map_err(|e| SourceReason::disconnect(e.to_string()))
             .with_context(path.as_str())
             .doing("open source file")?;
         let (tx, rx) = unbounded_channel();
@@ -304,9 +295,9 @@ impl DataSource for MultiFileSource {
                         continue;
                     }
                     self.abort_current_group().await;
-                    return Err(SourceError::from(SourceReason::Disconnect(
+                    return Err(SourceReason::disconnect(
                         "file source worker channel closed unexpectedly".to_string(),
-                    )));
+                    ));
                 }
             }
         }

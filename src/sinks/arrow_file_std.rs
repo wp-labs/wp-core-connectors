@@ -1,10 +1,9 @@
+use orion_error::conversion::{SourceErr, SourceRawErr, ToStructError};
 use std::io::BufWriter;
 use std::sync::Arc;
 
 use arrow::ipc::writer::FileWriter;
 use async_trait::async_trait;
-use orion_error::UvsReason;
-use orion_error::compat_traits::ErrorOweBase;
 #[cfg(test)]
 use serde_json::json;
 use wp_arrow::convert::records_to_batch;
@@ -24,7 +23,9 @@ fn sink_err<E>(msg: &'static str, err: E) -> wp_connector_api::SinkError
 where
     E: std::fmt::Display,
 {
-    wp_connector_api::SinkError::from(SinkReason::sink(msg)).with_detail(err.to_string())
+    wp_connector_api::SinkReason::Sink
+        .to_err()
+        .with_detail(format!("{msg}: {err}"))
 }
 
 #[derive(Clone, Debug)]
@@ -36,7 +37,7 @@ struct ArrowFileStdSpec {
 }
 
 impl ArrowFileStdSpec {
-    fn from_resolved(spec: &ResolvedSinkSpec) -> anyhow::Result<Self> {
+    fn from_resolved(spec: &ResolvedSinkSpec) -> SinkResult<Self> {
         let base = spec
             .params
             .get("base")
@@ -70,30 +71,39 @@ impl ArrowFileStdSpec {
     }
 }
 
-fn parse_fields_from_params(params: &ParamMap) -> anyhow::Result<Vec<FieldDef>> {
-    let fields_val = params
-        .get("fields")
-        .ok_or_else(|| anyhow::anyhow!("missing required param: fields"))?;
-    let arr = fields_val
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("fields must be an array"))?;
+fn parse_fields_from_params(params: &ParamMap) -> SinkResult<Vec<FieldDef>> {
+    let fields_val = params.get("fields").ok_or_else(|| {
+        SinkReason::core_conf()
+            .to_err()
+            .with_detail("missing required param: fields")
+    })?;
+    let arr = fields_val.as_array().ok_or_else(|| {
+        SinkReason::core_conf()
+            .to_err()
+            .with_detail("fields must be an array")
+    })?;
 
     let mut defs = Vec::with_capacity(arr.len());
     for item in arr {
-        let name = item
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("each field must have a string 'name'"))?;
-        let type_str = item
-            .get("type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("each field must have a string 'type'"))?;
+        let name = item.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            SinkReason::core_conf()
+                .to_err()
+                .with_detail("each field must have a string 'name'")
+        })?;
+        let type_str = item.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
+            SinkReason::core_conf()
+                .to_err()
+                .with_detail("each field must have a string 'type'")
+        })?;
         let nullable = item
             .get("nullable")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        let wp_type = parse_wp_type(type_str)
-            .map_err(|e| anyhow::anyhow!("field '{}' has invalid type: {}", name, e))?;
+        let wp_type = parse_wp_type(type_str).map_err(|e| {
+            SinkReason::core_conf()
+                .to_err()
+                .with_detail(format!("field '{}' has invalid type: {}", name, e))
+        })?;
         defs.push(FieldDef::new(name, wp_type).with_nullable(nullable));
     }
     Ok(defs)
@@ -119,21 +129,23 @@ impl Drop for ArrowFileStdSink {
 }
 
 impl ArrowFileStdSink {
-    fn new(path: &str, field_defs: Vec<FieldDef>, sync: bool) -> anyhow::Result<Self> {
+    fn new(path: &str, field_defs: Vec<FieldDef>, sync: bool) -> SinkResult<Self> {
         if let Some(parent) = std::path::Path::new(path).parent()
             && !parent.exists()
         {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).source_err(SinkReason::Sink, "create output dir")?;
         }
 
-        let schema = to_arrow_schema(&field_defs).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let schema =
+            to_arrow_schema(&field_defs).source_raw_err(SinkReason::Sink, "create arrow schema")?;
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(path)?;
-        let writer =
-            FileWriter::try_new_buffered(file, &schema).map_err(|e| anyhow::anyhow!("{e}"))?;
+            .open(path)
+            .source_err(SinkReason::Sink, "open output file")?;
+        let writer = FileWriter::try_new_buffered(file, &schema)
+            .source_raw_err(SinkReason::Sink, "create arrow writer")?;
 
         Ok(Self {
             path: path.to_string(),
@@ -145,15 +157,14 @@ impl ArrowFileStdSink {
     }
 
     fn writer_mut(&mut self) -> SinkResult<&mut StdArrowWriter> {
-        self.writer.as_mut().ok_or_else(|| {
-            wp_connector_api::SinkError::from(SinkReason::sink("arrow_file_std sink stopped"))
-        })
+        self.writer
+            .as_mut()
+            .ok_or_else(|| wp_connector_api::SinkReason::sink("arrow_file_std sink stopped"))
     }
 
     async fn send_batch(&mut self, records: &[DataRecord]) -> SinkResult<()> {
         let batch = records_to_batch(records, &self.field_defs)
-            .map_err(|e| anyhow::anyhow!("{e}"))
-            .owe(SinkReason::from(UvsReason::resource_error()))?;
+            .source_raw_err(SinkReason::Sink, "arrow_file_std encode records batch")?;
         let sync = self.sync;
 
         {
@@ -223,27 +234,27 @@ impl AsyncRecordSink for ArrowFileStdSink {
 #[async_trait]
 impl AsyncRawDataSink for ArrowFileStdSink {
     async fn sink_str(&mut self, _data: &str) -> SinkResult<()> {
-        Err(wp_connector_api::SinkError::from(SinkReason::sink(
+        Err(wp_connector_api::SinkReason::sink(
             "arrow_file_std sink only accepts records",
-        )))
+        ))
     }
 
     async fn sink_bytes(&mut self, _data: &[u8]) -> SinkResult<()> {
-        Err(wp_connector_api::SinkError::from(SinkReason::sink(
+        Err(wp_connector_api::SinkReason::sink(
             "arrow_file_std sink only accepts records",
-        )))
+        ))
     }
 
     async fn sink_str_batch(&mut self, _data: Vec<&str>) -> SinkResult<()> {
-        Err(wp_connector_api::SinkError::from(SinkReason::sink(
+        Err(wp_connector_api::SinkReason::sink(
             "arrow_file_std sink only accepts records",
-        )))
+        ))
     }
 
     async fn sink_bytes_batch(&mut self, _data: Vec<&[u8]>) -> SinkResult<()> {
-        Err(wp_connector_api::SinkError::from(SinkReason::sink(
+        Err(wp_connector_api::SinkReason::sink(
             "arrow_file_std sink only accepts records",
-        )))
+        ))
     }
 }
 
@@ -256,16 +267,14 @@ impl SinkFactory for ArrowFileStdFactory {
     }
 
     fn validate_spec(&self, spec: &ResolvedSinkSpec) -> SinkResult<()> {
-        ArrowFileStdSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
+        let _ = ArrowFileStdSpec::from_resolved(spec)?;
         Ok(())
     }
 
     async fn build(&self, spec: &ResolvedSinkSpec, ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let resolved =
-            ArrowFileStdSpec::from_resolved(spec).owe(SinkReason::from(UvsReason::core_conf()))?;
+        let resolved = ArrowFileStdSpec::from_resolved(spec)?;
         let path = resolved.resolve_path(ctx);
-        let sink = ArrowFileStdSink::new(&path, resolved.field_defs, resolved.sync)
-            .map_err(|e| sink_err("arrow_file_std open fail", e))?;
+        let sink = ArrowFileStdSink::new(&path, resolved.field_defs, resolved.sync)?;
         Ok(SinkHandle::new(Box::new(sink)))
     }
 }

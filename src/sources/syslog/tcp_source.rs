@@ -9,8 +9,7 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use tokio::sync::mpsc::Sender;
 use wp_connector_api::{
-    CtrlRx, DataSource, EventPreHook, SourceBatch, SourceError, SourceEvent, SourceReason,
-    SourceResult, Tags,
+    CtrlRx, DataSource, EventPreHook, SourceBatch, SourceEvent, SourceReason, SourceResult, Tags,
 };
 use wp_model_core::raw::RawData;
 
@@ -356,10 +355,7 @@ impl TcpSyslogSource {
         let client_ip = Arc::<str>::from(client_ip);
         while let Some(pending) = framing::drain_auto_all(buffer, &client_ip, sender).await? {
             sender.send(pending).await.map_err(|e| {
-                SourceError::from(SourceReason::Disconnect(format!(
-                    "syslog framing channel closed: {}",
-                    e
-                )))
+                SourceReason::disconnect(format!("syslog framing channel closed: {}", e))
             })?;
         }
         Ok(())

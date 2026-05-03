@@ -3,7 +3,7 @@
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
-use wp_connector_api::{SourceError, SourceReason, SourceResult};
+use wp_connector_api::{SourceReason, SourceResult};
 
 // 默认配置：与 syslog 源保持一致的接收缓存与通道容量
 pub const DEFAULT_TCP_RECV_BYTES: usize = 10_485_760; // 10 MiB
@@ -181,9 +181,7 @@ pub async fn drain_auto_all(
             );
             // 与 syslog 对齐：清空并返回错误，避免 OOM
             buf.clear();
-            return Err(SourceError::from(SourceReason::SupplierError(
-                "buffer overflow".to_string(),
-            )));
+            return Err(SourceReason::supplier_error("buffer overflow"));
         }
         break;
     }
@@ -256,9 +254,7 @@ pub fn collect_auto_all(
                 preview
             );
             buf.clear();
-            return Err(SourceError::from(SourceReason::SupplierError(
-                "buffer overflow".to_string(),
-            )));
+            return Err(SourceReason::supplier_error("buffer overflow"));
         }
         break;
     }

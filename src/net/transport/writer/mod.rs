@@ -1,8 +1,9 @@
+use orion_error::conversion::{SourceErr, ToStructError};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
-use wp_connector_api::{SinkError, SinkReason, SinkResult};
+use wp_connector_api::{SinkReason, SinkResult};
 
 use super::config::*; // reuse constants/policy/adaptive toggles
 
@@ -171,9 +172,9 @@ impl NetWriter {
         }
         match &mut self.transport {
             Transport::Udp(sock) => {
-                sock.send(bytes).await.map_err(|e| {
-                    SinkError::from(SinkReason::Sink(format!("udp send error: {}", e)))
-                })?;
+                sock.send(bytes)
+                    .await
+                    .source_err(SinkReason::Sink, "udp send error")?;
                 self.sent_cnt = self.sent_cnt.saturating_add(1);
                 Ok(())
             }
@@ -181,10 +182,10 @@ impl NetWriter {
                 if let Err(e) = stream.write_all(bytes).await {
                     // 发送失败时，记录策略与水位的快照，便于定位“发送过快”或对端复位等问题
                     self.log_tcp_send_error(&e, bytes.len());
-                    return Err(SinkError::from(SinkReason::Sink(format!(
-                        "tcp send error: {}",
-                        e
-                    ))));
+                    return Err(SinkReason::Sink
+                        .to_err()
+                        .with_detail("tcp send error")
+                        .with_source(e));
                 }
                 self.sent_cnt = self.sent_cnt.saturating_add(1);
                 Ok(())
@@ -202,9 +203,10 @@ impl NetWriter {
     /// 尝试优雅关闭 TCP 写端，促使对端尽快读取完所有已提交数据并收到 FIN。
     pub async fn shutdown(&mut self) -> SinkResult<()> {
         if let Transport::Tcp(stream) = &mut self.transport {
-            stream.shutdown().await.map_err(|e| {
-                SinkError::from(SinkReason::Sink(format!("tcp shutdown error: {}", e)))
-            })?;
+            stream
+                .shutdown()
+                .await
+                .source_err(SinkReason::Sink, "tcp shutdown error")?;
         }
         Ok(())
     }

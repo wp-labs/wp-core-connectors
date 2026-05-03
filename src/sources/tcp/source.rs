@@ -334,7 +334,7 @@ impl TcpSource {
 impl DataSource for TcpSource {
     async fn receive(&mut self) -> SourceResult<SourceBatch> {
         if !self.started {
-            return Err(SourceReason::SupplierError("TCP source not started".into()).into());
+            return Err(SourceReason::supplier_error("TCP source not started"));
         }
         loop {
             self.drain_new_connections();
@@ -345,11 +345,10 @@ impl DataSource for TcpSource {
                     self.awaiting_logged = true;
                 }
                 if !self.wait_for_connection().await? {
-                    return Err(SourceReason::Disconnect(format!(
+                    return Err(SourceReason::disconnect(format!(
                         "TCP source '{}' no active connections",
                         self.key
-                    ))
-                    .into());
+                    )));
                 }
                 continue;
             }
@@ -392,7 +391,7 @@ impl DataSource for TcpSource {
 
     async fn start(&mut self, _ctrl_rx: CtrlRx) -> SourceResult<()> {
         if self.started {
-            return Err(SourceReason::SupplierError("TCP source already started".into()).into());
+            return Err(SourceReason::supplier_error("TCP source already started"));
         }
         self.started = true;
         self.awaiting_logged = false;

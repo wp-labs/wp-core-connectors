@@ -1,17 +1,16 @@
 use async_trait::async_trait;
+use orion_error::conversion::{SourceErr, ToStructError};
 use std::fs;
 use std::io::ErrorKind;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use wp_connector_api::{
-    AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, SinkBuildCtx, SinkError, SinkReason, SinkResult,
+    AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, SinkBuildCtx, SinkReason, SinkResult,
     SinkSpec as ResolvedSinkSpec,
 };
 use wp_data_fmt::{FormatType, RecordFormatter};
 use wp_model_core::model::DataRecord;
 use wp_model_core::model::fmt_def::TextFmt;
-
-type AnyResult<T> = anyhow::Result<T>;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,7 +37,9 @@ fn sink_err<E>(msg: &'static str, err: E) -> wp_connector_api::SinkError
 where
     E: std::fmt::Display,
 {
-    SinkError::from(SinkReason::sink(msg)).with_detail(err.to_string())
+    SinkReason::Sink
+        .to_err()
+        .with_detail(format!("{msg}: {err}"))
 }
 
 #[derive(Clone, Debug)]
@@ -50,14 +51,14 @@ pub struct FileSinkSpec {
 }
 
 impl FileSinkSpec {
-    pub fn from_resolved(_kind: &str, spec: &ResolvedSinkSpec) -> AnyResult<Self> {
+    pub fn from_resolved(_kind: &str, spec: &ResolvedSinkSpec) -> SinkResult<Self> {
         if let Some(s) = spec.params.get("fmt").and_then(|v| v.as_str()) {
             let ok = matches!(s, "json" | "csv" | "show" | "kv" | "raw" | "proto-text");
             if !ok {
-                anyhow::bail!(
+                return Err(SinkReason::core_conf().to_err().with_detail(format!(
                     "invalid fmt: '{}'; allowed: json,csv,show,kv,raw,proto-text",
                     s
-                );
+                )));
             }
         }
         let fmt = spec
@@ -165,21 +166,22 @@ impl Drop for AsyncFileSink {
 }
 
 impl AsyncFileSink {
-    pub async fn new(out_path: &str) -> AnyResult<Self> {
+    pub async fn new(out_path: &str) -> SinkResult<Self> {
         Self::with_sync(out_path, false).await
     }
 
-    pub async fn with_sync(out_path: &str, sync: bool) -> AnyResult<Self> {
+    pub async fn with_sync(out_path: &str, sync: bool) -> SinkResult<Self> {
         if let Some(parent) = std::path::Path::new(out_path).parent()
             && !parent.exists()
         {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).source_err(SinkReason::Sink, "create output dir")?;
         }
         let out_io = OpenOptions::new()
             .append(true)
             .create(true)
             .open(out_path)
-            .await?;
+            .await
+            .source_err(SinkReason::Sink, "open output file")?;
         Ok(Self {
             path: out_path.to_string(),
             out_io,
@@ -409,7 +411,7 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn formatted_file_sink_writes_json_record() -> AnyResult<()> {
+    async fn formatted_file_sink_writes_json_record() -> anyhow::Result<()> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -429,7 +431,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn stop_unlocks_only_own_lock() -> AnyResult<()> {
+    async fn stop_unlocks_only_own_lock() -> anyhow::Result<()> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -465,7 +467,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn sync_parameter_controls_fsync_calls() -> AnyResult<()> {
+    async fn sync_parameter_controls_fsync_calls() -> anyhow::Result<()> {
         use wp_connector_api::{AsyncCtrl, AsyncRawDataSink};
 
         take_sync_all_count();

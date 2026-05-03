@@ -1,5 +1,5 @@
 use tokio::io::{self, AsyncBufReadExt};
-use wp_connector_api::{SourceError, SourceReason, SourceResult};
+use wp_connector_api::{SourceReason, SourceResult};
 
 pub struct ChunkedLineReader {
     reader: io::BufReader<tokio::fs::File>,
@@ -26,7 +26,7 @@ impl ChunkedLineReader {
             .reader
             .read_until(b'\n', &mut self.buf)
             .await
-            .map_err(|e| SourceError::from(SourceReason::Disconnect(e.to_string())))?;
+            .map_err(|e| SourceReason::disconnect(e.to_string()))?;
         if read == 0 {
             return Ok(None);
         }
