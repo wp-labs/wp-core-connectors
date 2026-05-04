@@ -1,6 +1,6 @@
 [package]
 name = "wp-core-connectors"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["WarpParse Dev Team"]
@@ -39,7 +39,7 @@ tokio = { version = "1.51", features = ["full"] }
 wp-connector-api = "0.10"
 wp-model-core = "0.8"
 wp-arrow = "0.1"
-wp-conf-base = "0.3"
+wp-conf-base = "0.4"
 wp-data-fmt = "0.2"
 wp-log = "0.4"
 
