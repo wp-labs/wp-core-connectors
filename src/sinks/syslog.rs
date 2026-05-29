@@ -36,6 +36,7 @@ struct SyslogSinkSpec {
     port: u16,
     protocol: SyslogProtocol,
     app_name: Option<String>,
+    add_header: bool,
 }
 
 impl SyslogSinkSpec {
@@ -109,11 +110,27 @@ fn syslog_conf_from_spec(spec: &ResolvedSinkSpec) -> SinkResult<SyslogSinkSpec> 
         .get("app_name")
         .and_then(|v| v.as_str())
         .map(|v| v.to_string());
+    let header_mode = spec
+        .params
+        .get("header_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("wrap")
+        .to_ascii_lowercase();
+    let add_header = match header_mode.as_str() {
+        "raw" | "keep" => false,
+        "wrap" => true,
+        _other => {
+            return Err(SinkReason::core_conf()
+                .to_err()
+                .with_detail("syslog.header_mode must be 'raw', 'keep', or 'wrap'"));
+        }
+    };
     Ok(SyslogSinkSpec {
         addr: addr.to_string(),
         port,
         protocol,
         app_name,
+        add_header,
     })
 }
 
@@ -125,10 +142,11 @@ pub struct SyslogSink {
     encoder: SyslogEncoder,
     hostname: String,
     app_name: String,
+    add_header: bool,
 }
 
 impl SyslogSink {
-    async fn udp(addr: &str, app_name: Option<String>) -> SinkResult<Self> {
+    async fn udp(addr: &str, app_name: Option<String>, add_header: bool) -> SinkResult<Self> {
         let writer = NetWriter::connect_udp(addr)
             .await
             .source_err(SinkReason::Sink, "syslog udp connect")?;
@@ -146,9 +164,14 @@ impl SyslogSink {
         } else {
             log::info!("syslog udp sink connected: target={}", addr);
         }
-        Ok(Self::with_writer(writer, app_name))
+        Ok(Self::with_writer(writer, app_name, add_header))
     }
-    async fn tcp(addr: &str, app_name: Option<String>, rate_limit_rps: usize) -> SinkResult<Self> {
+    async fn tcp(
+        addr: &str,
+        app_name: Option<String>,
+        rate_limit_rps: usize,
+        add_header: bool,
+    ) -> SinkResult<Self> {
         // Align to TcpSink: enable backpressure when unlimited
         let mode = if rate_limit_rps == 0 {
             BackoffMode::ForceOn
@@ -166,7 +189,7 @@ impl SyslogSink {
         .await
         .source_err(SinkReason::Sink, "syslog tcp connect")?;
         log::info!("syslog tcp sink connected: target={}", addr);
-        Ok(Self::with_writer(writer, app_name))
+        Ok(Self::with_writer(writer, app_name, add_header))
     }
 
     fn current_process_name() -> String {
@@ -177,7 +200,7 @@ impl SyslogSink {
             .unwrap_or_else(|| "wp-engine".to_string())
     }
 
-    fn with_writer(writer: NetWriter, app_name: Option<String>) -> Self {
+    fn with_writer(writer: NetWriter, app_name: Option<String>, add_header: bool) -> Self {
         let hostname = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
@@ -188,6 +211,7 @@ impl SyslogSink {
             encoder: SyslogEncoder::new(),
             hostname,
             app_name: app_name.unwrap_or_else(Self::current_process_name),
+            add_header,
         }
     }
 }
@@ -231,6 +255,15 @@ impl AsyncRecordSink for SyslogSink {
 #[async_trait]
 impl AsyncRawDataSink for SyslogSink {
     async fn sink_str(&mut self, data: &str) -> SinkResult<()> {
+        if !self.add_header {
+            let mut payload = data.to_string();
+            if matches!(self.writer.transport, Transport::Tcp(_)) && !payload.ends_with('\n') {
+                payload.push('\n');
+            }
+            self.writer.write(payload.as_bytes()).await?;
+            self.sent_cnt = self.sent_cnt.saturating_add(1);
+            return Ok(());
+        }
         // Format as RFC3164 syslog message
         let mut emit = EmitMessage::new(data);
         emit.priority = 13;
@@ -270,12 +303,34 @@ impl AsyncRawDataSink for SyslogSink {
         Ok(())
     }
     async fn sink_bytes(&mut self, _data: &[u8]) -> SinkResult<()> {
+        if !self.add_header {
+            let mut payload = _data.to_vec();
+            if matches!(self.writer.transport, Transport::Tcp(_)) && !payload.ends_with(&[b'\n']) {
+                payload.push(b'\n');
+            }
+            self.writer.write(&payload).await?;
+            self.sent_cnt = self.sent_cnt.saturating_add(1);
+            return Ok(());
+        }
         let text = String::from_utf8_lossy(_data);
         self.sink_str(text.as_ref()).await
     }
 
     async fn sink_str_batch(&mut self, data: Vec<&str>) -> SinkResult<()> {
         if data.is_empty() {
+            return Ok(());
+        }
+        if !self.add_header {
+            let is_tcp = matches!(self.writer.transport, Transport::Tcp(_));
+            let mut buf: Vec<u8> = Vec::new();
+            for s in &data {
+                buf.extend_from_slice(s.as_bytes());
+                if is_tcp && !s.ends_with('\n') {
+                    buf.push(b'\n');
+                }
+            }
+            self.writer.write(&buf).await?;
+            self.sent_cnt = self.sent_cnt.saturating_add(1);
             return Ok(());
         }
         let is_tcp = matches!(self.writer.transport, Transport::Tcp(_));
@@ -310,6 +365,19 @@ impl AsyncRawDataSink for SyslogSink {
         if data.is_empty() {
             return Ok(());
         }
+        if !self.add_header {
+            let is_tcp = matches!(self.writer.transport, Transport::Tcp(_));
+            let mut buf: Vec<u8> = Vec::new();
+            for bytes in &data {
+                buf.extend_from_slice(bytes);
+                if is_tcp && !bytes.ends_with(&[b'\n']) {
+                    buf.push(b'\n');
+                }
+            }
+            self.writer.write(&buf).await?;
+            self.sent_cnt = self.sent_cnt.saturating_add(1);
+            return Ok(());
+        }
         let texts: Vec<String> = data
             .into_iter()
             .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
@@ -340,20 +408,29 @@ impl SinkFactory for SyslogFactory {
         let conf = syslog_conf_from_spec(spec)?;
         let proto = conf.protocol;
         let target = conf.target_addr();
+        let mode_label = if conf.add_header { "wrap" } else { "raw" };
         // Log resolved target to aid diagnosing mismatched params
         log::info!(
-            "syslog sink build: target={} protocol={}",
+            "syslog sink build: target={} protocol={} header_mode={}",
             target,
-            proto.as_str()
+            proto.as_str(),
+            mode_label
         );
         let app_name = conf.resolved_app_name(&spec.name);
 
         // Build runtime sink directly; pass rate_limit_rps to TCP writer
         let runtime = match proto {
-            SyslogProtocol::Udp => SyslogSink::udp(target.as_str(), Some(app_name.clone())).await?,
+            SyslogProtocol::Udp => {
+                SyslogSink::udp(target.as_str(), Some(app_name.clone()), conf.add_header).await?
+            }
             SyslogProtocol::Tcp => {
-                SyslogSink::tcp(target.as_str(), Some(app_name.clone()), _ctx.rate_limit_rps)
-                    .await?
+                SyslogSink::tcp(
+                    target.as_str(),
+                    Some(app_name.clone()),
+                    _ctx.rate_limit_rps,
+                    conf.add_header,
+                )
+                .await?
             }
         };
         Ok(SinkHandle::new(Box::new(runtime)))
@@ -440,16 +517,49 @@ mod tests {
         assert!(err.to_string().contains("syslog.app_name"));
     }
 
-    #[tokio::test]
-    async fn syslog_sink_tcp_emits_rfc3164_message() {
+    #[test]
+    fn syslog_conf_header_mode() {
+        // default: add_header=true
+        let conf = syslog_conf_from_spec(&mk_spec(&[("addr", json!("127.0.0.1"))])).unwrap();
+        assert!(conf.add_header);
+
+        // raw / keep: add_header=false
+        for mode in &["raw", "keep"] {
+            let spec = mk_spec(&[("addr", json!("127.0.0.1")), ("header_mode", json!(*mode))]);
+            assert!(!syslog_conf_from_spec(&spec).unwrap().add_header);
+        }
+    }
+
+    #[test]
+    fn syslog_conf_rejects_invalid_header_mode() {
+        let spec = mk_spec(&[
+            ("addr", json!("127.0.0.1")),
+            ("header_mode", json!("nested")),
+        ]);
+        let err = syslog_conf_from_spec(&spec).expect_err("header_mode should be rejected");
+        assert!(err.to_string().contains("syslog.header_mode"));
+    }
+
+    #[test]
+    fn syslog_factory_sink_def_exposes_header_mode() {
+        let def = builtin::sink_def("syslog_sink").expect("syslog_sink builtin def");
+        assert_eq!(
+            def.default_params
+                .get("header_mode")
+                .and_then(|v| v.as_str()),
+            Some("wrap")
+        );
+        assert!(def.allow_override.iter().any(|k| k == "header_mode"));
+    }
+
+    async fn recv_tcp(add_header: bool, input: &str) -> String {
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(lst) => lst,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return String::new(),
             Err(e) => panic!("bind test listener: {}", e),
         };
         let addr = listener.local_addr().expect("addr");
-
-        let mut sink = SyslogSink::tcp(addr.to_string().as_str(), Some("wpgen".into()), 0)
+        let mut sink = SyslogSink::tcp(addr.to_string().as_str(), Some("wpgen".into()), 0, add_header)
             .await
             .expect("build tcp sink");
 
@@ -461,22 +571,27 @@ mod tests {
             buf
         });
 
-        sink.sink_str("syslog body").await.expect("sink str");
+        sink.sink_str(input).await.expect("sink str");
         sink.stop().await.expect("stop");
-
         let bytes = accept_task.await.expect("join");
-        let text = String::from_utf8(bytes).expect("utf8");
-        assert!(
-            text.starts_with("<13>"),
-            "missing priority header: {}",
-            text
-        );
-        assert!(text.contains("wpgen"), "app name missing");
-        assert!(text.ends_with('\n'), "tcp syslog should end with newline");
-        assert!(
-            text.trim_end().ends_with("syslog body"),
-            "body mismatch: {}",
-            text
-        );
+        String::from_utf8(bytes).expect("utf8")
+    }
+
+    #[tokio::test]
+    async fn syslog_sink_tcp_header_mode() {
+        // wrap mode: RFC3164 encoding
+        let text = recv_tcp(true, "syslog body").await;
+        if text.is_empty() { return; } // permission denied
+        assert!(text.starts_with("<13>"), "wrap mode: {}", text);
+        assert!(text.contains("wpgen"), "wrap mode: {}", text);
+        assert!(text.trim_end().ends_with("syslog body"), "wrap mode: {}", text);
+        assert!(text.ends_with('\n'), "wrap mode: {}", text);
+
+        // raw mode: original preserved
+        let original = "<14>Nov 28 10:15:00 host app: hello";
+        let text = recv_tcp(false, original).await;
+        if text.is_empty() { return; }
+        assert!(text.trim_end() == original, "raw mode: {}", text);
+        assert!(text.ends_with('\n'), "raw mode: {}", text);
     }
 }
