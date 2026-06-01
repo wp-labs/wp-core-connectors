@@ -305,7 +305,7 @@ impl AsyncRawDataSink for SyslogSink {
     async fn sink_bytes(&mut self, _data: &[u8]) -> SinkResult<()> {
         if !self.add_header {
             let mut payload = _data.to_vec();
-            if matches!(self.writer.transport, Transport::Tcp(_)) && !payload.ends_with(&[b'\n']) {
+            if matches!(self.writer.transport, Transport::Tcp(_)) && !payload.ends_with(b"\n") {
                 payload.push(b'\n');
             }
             self.writer.write(&payload).await?;
@@ -370,7 +370,7 @@ impl AsyncRawDataSink for SyslogSink {
             let mut buf: Vec<u8> = Vec::new();
             for bytes in &data {
                 buf.extend_from_slice(bytes);
-                if is_tcp && !bytes.ends_with(&[b'\n']) {
+                if is_tcp && !bytes.ends_with(b"\n") {
                     buf.push(b'\n');
                 }
             }
@@ -559,9 +559,14 @@ mod tests {
             Err(e) => panic!("bind test listener: {}", e),
         };
         let addr = listener.local_addr().expect("addr");
-        let mut sink = SyslogSink::tcp(addr.to_string().as_str(), Some("wpgen".into()), 0, add_header)
-            .await
-            .expect("build tcp sink");
+        let mut sink = SyslogSink::tcp(
+            addr.to_string().as_str(),
+            Some("wpgen".into()),
+            0,
+            add_header,
+        )
+        .await
+        .expect("build tcp sink");
 
         let accept_task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
@@ -581,16 +586,24 @@ mod tests {
     async fn syslog_sink_tcp_header_mode() {
         // wrap mode: RFC3164 encoding
         let text = recv_tcp(true, "syslog body").await;
-        if text.is_empty() { return; } // permission denied
+        if text.is_empty() {
+            return;
+        } // permission denied
         assert!(text.starts_with("<13>"), "wrap mode: {}", text);
         assert!(text.contains("wpgen"), "wrap mode: {}", text);
-        assert!(text.trim_end().ends_with("syslog body"), "wrap mode: {}", text);
+        assert!(
+            text.trim_end().ends_with("syslog body"),
+            "wrap mode: {}",
+            text
+        );
         assert!(text.ends_with('\n'), "wrap mode: {}", text);
 
         // raw mode: original preserved
         let original = "<14>Nov 28 10:15:00 host app: hello";
         let text = recv_tcp(false, original).await;
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
         assert!(text.trim_end() == original, "raw mode: {}", text);
         assert!(text.ends_with('\n'), "raw mode: {}", text);
     }
