@@ -4,6 +4,7 @@
 //! and convert their `SourceEvent { payload: RawData }` output into
 //! Arrow `RecordBatch`es suitable for CEP engines like warp-fusion.
 
+pub mod error;
 pub mod file;
 pub mod ndjson;
 pub mod payload;

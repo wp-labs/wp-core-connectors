@@ -56,13 +56,7 @@ impl FileBatchSource {
     }
 
     fn wp_error_to_wf(err: WpError) -> SourceError {
-        match err.reason() {
-            WpReason::EOF => SourceError::from(SourceReason::EOF),
-            WpReason::SupplierError | WpReason::Disconnect => {
-                SourceReason::Connect.err_detail(err.to_string())
-            }
-            _ => SourceReason::Decode.err_detail(err.to_string()),
-        }
+        super::error::wp_error_to_wf(err)
     }
 }
 

@@ -8,7 +8,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use std::sync::Arc;
 use wf_connector_api::{BatchSource, SourceError, SourceReason, SourceResult};
-use wp_connector_api::{DataSource, SourceBatch, SourceError as WpError, SourceReason as WpReason};
+use wp_connector_api::{DataSource, SourceBatch, SourceError as WpError};
 
 use super::ndjson::ndjson_to_record_batch;
 use super::payload::{payload_to_bytes, payload_to_string};
@@ -66,13 +66,7 @@ impl TcpBatchSource {
     }
 
     fn wp_error_to_wf(err: WpError) -> SourceError {
-        match err.reason() {
-            WpReason::EOF => SourceError::from(SourceReason::EOF),
-            WpReason::SupplierError | WpReason::Disconnect => {
-                SourceReason::Connect.err_detail(err.to_string())
-            }
-            _ => SourceReason::Decode.err_detail(err.to_string()),
-        }
+        super::error::wp_error_to_wf(err)
     }
 }
 
