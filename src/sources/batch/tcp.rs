@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use wf_connector_api::{BatchSource, SourceError, SourceReason, SourceResult};
 use wp_connector_api::{
-    DataSource, SourceBatch, SourceError as WpError, SourceReason as WpReason,
+    DataSource, SourceBatch, SourceReason as WpReason,
 };
 use wp_model_core::raw::RawData;
 

@@ -9,8 +9,15 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use std::sync::Arc;
 use wf_connector_api::{BatchSource, SourceError, SourceReason, SourceResult};
+
+#[cfg(test)]
+use std::{io, path::Path};
+#[cfg(test)]
+use tokio::io::{AsyncBufReadExt, BufReader};
+#[cfg(test)]
+use wp_connector_api::{SourceEvent, Tags};
 use wp_connector_api::{
-    DataSource, SourceBatch, SourceError as WpError, SourceReason as WpReason, SourceEvent, Tags,
+    DataSource, SourceBatch, SourceError as WpError, SourceReason as WpReason,
 };
 use wp_model_core::raw::RawData;
 
@@ -106,16 +113,14 @@ impl BatchSource for FileBatchSource {
 
 // -- Simple file source wrapper (when factory not available) -----------------
 
-use std::io;
-use std::path::Path;
-use tokio::io::{AsyncBufReadExt, BufReader};
-
+#[cfg(test)]
 struct SimpleFileSource {
     lines: tokio::io::Lines<BufReader<tokio::fs::File>>,
     key: String,
     eof: bool,
 }
 
+#[cfg(test)]
 impl SimpleFileSource {
     async fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let p = path.as_ref();
@@ -129,6 +134,7 @@ impl SimpleFileSource {
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl DataSource for SimpleFileSource {
     async fn receive(&mut self) -> Result<SourceBatch, WpError> {
