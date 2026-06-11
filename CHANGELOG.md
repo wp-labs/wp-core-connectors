@@ -7,6 +7,20 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-06-11
+
+### Added
+
+- Add `wf-connector-api` dependency for Arrow-native `BatchSource` trait support
+- Add `sources/batch/` module with `BatchSource` implementations for CEP engines:
+  - `FileBatchSource` — wraps any `wp_connector_api::DataSource` and converts NDJSON output to Arrow `RecordBatch`
+  - `TcpBatchSource` — supports both NDJSON and Arrow IPC wire formats
+  - `ndjson_to_record_batch()` — NDJSON → Arrow columnar conversion (Utf8 / Int64 / Float64 / Boolean / Timestamp)
+  - `decode_arrow_ipc()` — Arrow IPC stream decoder
+  - Shared `payload_to_string/bytes` extractors and `wp_error_to_wf` error mapping
+- Add `SimpleFileSource` — lightweight line-by-line file reader implementing `DataSource`
+- Add comprehensive tests (13 cases): NDJSON type handling, file lifecycle, TCP Arrow IPC round-trip, empty/null/missing/invalid inputs
+
 ## [0.3.0] - 2026-05-03
 
 ### Changed
@@ -102,7 +116,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Preserve the first registered factory for duplicate connector kinds and emit diagnostics instead of silently overriding
 - Handle raw byte payloads in TCP and syslog sinks consistently with string payload handling
 
-[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.0...v0.3.2
 [0.3.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.2.0
 [0.1.3]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.1.3
