@@ -1,3 +1,4 @@
+pub mod batch;
 pub mod event_id;
 pub mod file;
 pub mod syslog;
