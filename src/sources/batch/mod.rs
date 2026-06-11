@@ -6,4 +6,5 @@
 
 pub mod file;
 pub mod ndjson;
+pub mod payload;
 pub mod tcp;

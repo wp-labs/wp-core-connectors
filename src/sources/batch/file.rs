@@ -1,65 +1,53 @@
 //! `BatchSource` adapter for file-based sources.
 //!
-//! Wraps the existing `FileSource` (which implements
-//! `wp_connector_api::DataSource`) and converts its NDJSON output
-//! into Arrow `RecordBatch`es via [`super::ndjson::ndjson_to_record_batch`].
+//! `FileBatchSource` wraps any `wp_connector_api::DataSource` and converts
+//! its NDJSON output into Arrow `RecordBatch`es.
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use std::sync::Arc;
 use wf_connector_api::{BatchSource, SourceError, SourceReason, SourceResult};
-
-#[cfg(test)]
-use std::{io, path::Path};
-#[cfg(test)]
-use tokio::io::{AsyncBufReadExt, BufReader};
 use wp_connector_api::{DataSource, SourceBatch, SourceError as WpError, SourceReason as WpReason};
-#[cfg(test)]
-use wp_connector_api::{SourceEvent, Tags};
-use wp_model_core::raw::RawData;
 
 use super::ndjson::ndjson_to_record_batch;
+use super::payload::payload_to_string;
 
-/// A file source that produces Arrow `RecordBatch`es from NDJSON files.
+/// A file source that produces Arrow `RecordBatch`es from NDJSON input.
 ///
-/// Internally wraps a `wp_connector_api::DataSource` file source and
-/// converts each `SourceBatch` into one or more `RecordBatch`es.
+/// Internally wraps a `wp_connector_api::DataSource` and converts each
+/// `SourceBatch` into one or more `RecordBatch`es.
 pub struct FileBatchSource {
     key: String,
     inner: Box<dyn DataSource>,
     schema: Arc<Schema>,
-    started: bool,
 }
 
 impl FileBatchSource {
-    /// Create a new `FileBatchSource` from an existing file `DataSource`.
-    ///
-    /// The `schema` defines the Arrow column types for NDJSON → RecordBatch
-    /// conversion.
-    pub fn new(key: impl Into<String>, source: Box<dyn DataSource>, schema: Arc<Schema>) -> Self {
-        Self {
-            key: key.into(),
-            inner: source,
-            schema,
-            started: false,
-        }
+    /// Create from an existing `DataSource`.
+    pub fn new(
+        key: impl Into<String>,
+        source: Box<dyn DataSource>,
+        schema: Arc<Schema>,
+    ) -> Self {
+        Self { key: key.into(), inner: source, schema }
     }
 
-    /// Convert a batch of `SourceEvent`s into a single Arrow `RecordBatch`.
+    /// Create from a file path, using the built-in `SimpleFileSource`.
+    pub async fn from_path(
+        key: impl Into<String>,
+        path: impl AsRef<std::path::Path>,
+        schema: Arc<Schema>,
+    ) -> std::io::Result<Self> {
+        let source = SimpleFileSource::open(path).await?;
+        Ok(Self::new(key, Box::new(source), schema))
+    }
+
     fn convert_batch(&self, events: SourceBatch) -> SourceResult<Vec<RecordBatch>> {
         if events.is_empty() {
             return Ok(vec![]);
         }
-        let lines: Vec<String> = events
-            .iter()
-            .map(|e| match &e.payload {
-                RawData::String(s) => s.clone(),
-                RawData::Bytes(b) => String::from_utf8_lossy(b).to_string(),
-                RawData::ArcBytes(b) => String::from_utf8_lossy(b).to_string(),
-            })
-            .collect();
-
+        let lines: Vec<String> = events.iter().map(|e| payload_to_string(&e.payload)).collect();
         match ndjson_to_record_batch(&lines, &self.schema) {
             Ok(Some(batch)) => Ok(vec![batch]),
             Ok(None) => Ok(vec![]),
@@ -68,10 +56,12 @@ impl FileBatchSource {
     }
 
     fn wp_error_to_wf(err: WpError) -> SourceError {
-        if matches!(err.reason(), WpReason::EOF) {
-            SourceError::from(SourceReason::EOF)
-        } else {
-            SourceReason::Connect.err_detail(err.to_string())
+        match err.reason() {
+            WpReason::EOF => SourceError::from(SourceReason::EOF),
+            WpReason::SupplierError | WpReason::Disconnect => {
+                SourceReason::Connect.err_detail(err.to_string())
+            }
+            _ => SourceReason::Decode.err_detail(err.to_string()),
         }
     }
 }
@@ -79,10 +69,7 @@ impl FileBatchSource {
 #[async_trait]
 impl BatchSource for FileBatchSource {
     async fn start(&mut self) -> SourceResult<()> {
-        if self.started {
-            return Ok(());
-        }
-        self.started = true;
+        self.inner.close().await.ok(); // idempotent, ensures clean state
         Ok(())
     }
 
@@ -94,43 +81,37 @@ impl BatchSource for FileBatchSource {
     }
 
     async fn close(&mut self) -> SourceResult<()> {
-        self.inner
-            .close()
-            .await
-            .map_err(|e| SourceReason::Connect.err_detail(e.to_string()))?;
-        self.started = false;
+        self.inner.close().await.ok();
         Ok(())
     }
 
-    fn identifier(&self) -> &str {
-        &self.key
-    }
+    fn identifier(&self) -> &str { &self.key }
 }
 
-// -- Simple file source wrapper (when factory not available) -----------------
+// -- SimpleFileSource --------------------------------------------------------
 
-#[cfg(test)]
-struct SimpleFileSource {
+use std::io;
+use std::path::Path;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use wp_connector_api::{SourceEvent, Tags};
+use wp_model_core::raw::RawData;
+
+/// Lightweight line-by-line file source. Each line is one NDJSON record.
+pub struct SimpleFileSource {
     lines: tokio::io::Lines<BufReader<tokio::fs::File>>,
     key: String,
     eof: bool,
 }
 
-#[cfg(test)]
 impl SimpleFileSource {
-    async fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub async fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let p = path.as_ref();
         let file = tokio::fs::File::open(p).await?;
         let reader = BufReader::new(file);
-        Ok(Self {
-            lines: reader.lines(),
-            key: p.display().to_string(),
-            eof: false,
-        })
+        Ok(Self { lines: reader.lines(), key: p.display().to_string(), eof: false })
     }
 }
 
-#[cfg(test)]
 #[async_trait]
 impl DataSource for SimpleFileSource {
     async fn receive(&mut self) -> Result<SourceBatch, WpError> {
@@ -142,16 +123,11 @@ impl DataSource for SimpleFileSource {
             match self.lines.next_line().await {
                 Ok(Some(line)) => {
                     batch.push(SourceEvent::new(
-                        0,
-                        &self.key,
-                        RawData::from_string(line),
+                        0, &self.key, RawData::from_string(line),
                         Arc::new(Tags::new()),
                     ));
                 }
-                Ok(None) => {
-                    self.eof = true;
-                    break;
-                }
+                Ok(None) => { self.eof = true; break; }
                 Err(e) => {
                     return Err(WpReason::Other.err_detail(e.to_string()));
                 }
@@ -163,13 +139,11 @@ impl DataSource for SimpleFileSource {
         Ok(batch)
     }
 
-    fn try_receive(&mut self) -> Option<SourceBatch> {
-        None
-    }
-    fn identifier(&self) -> String {
-        self.key.clone()
-    }
+    fn try_receive(&mut self) -> Option<SourceBatch> { None }
+    fn identifier(&self) -> String { self.key.clone() }
 }
+
+// -- Tests -------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -181,11 +155,8 @@ mod tests {
     #[tokio::test]
     async fn file_batch_source_identifier() {
         let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, true)]));
-        let src = FileBatchSource::new(
-            "test_key",
-            Box::new(SimpleFileSource::open("Cargo.toml").await.unwrap()),
-            schema,
-        );
+        let src = FileBatchSource::new("test_key",
+            Box::new(SimpleFileSource::open("Cargo.toml").await.unwrap()), schema);
         assert_eq!(src.identifier(), "test_key");
     }
 
@@ -197,40 +168,38 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, true)]));
-        let mut src = FileBatchSource::new(
-            "test",
-            Box::new(SimpleFileSource::open(&path).await.unwrap()),
-            schema,
-        );
+        let mut src = FileBatchSource::new("test",
+            Box::new(SimpleFileSource::open(&path).await.unwrap()), schema);
 
-        // Start
         src.start().await.unwrap();
-
-        // Receive — should get a batch with 2 rows
         let batches = src.receive_batch().await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 2);
 
-        // After EOF, should get EOF error
         let result = src.receive_batch().await;
-        assert!(result.is_err());
-
-        // Close is idempotent
+        assert!(result.is_err()); // EOF
         src.close().await.unwrap();
-        src.close().await.unwrap();
+        src.close().await.unwrap(); // idempotent
     }
 
     #[tokio::test]
     async fn file_batch_source_empty_file() {
         let tmp = NamedTempFile::new().unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, true)]));
-        let mut src = FileBatchSource::new(
-            "empty",
-            Box::new(SimpleFileSource::open(tmp.path()).await.unwrap()),
-            schema,
-        );
+        let mut src = FileBatchSource::new("empty",
+            Box::new(SimpleFileSource::open(tmp.path()).await.unwrap()), schema);
         src.start().await.unwrap();
-        let result = src.receive_batch().await;
-        assert!(result.is_err()); // EOF immediately
+        assert!(src.receive_batch().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn from_path_constructor() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, r#"{{"msg":"hi"}}"#).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, true)]));
+        let mut src = FileBatchSource::from_path("fp", tmp.path(), schema).await.unwrap();
+        src.start().await.unwrap();
+        let batches = src.receive_batch().await.unwrap();
+        assert_eq!(batches[0].num_rows(), 1);
     }
 }
