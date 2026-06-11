@@ -4,79 +4,6 @@ use wp_connector_api::{ConnectorDef, ConnectorScope, ParamMap};
 pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
     let mut defs = Vec::new();
 
-    // arrow-ipc
-    {
-        let mut params = ParamMap::new();
-        params.insert("target".into(), json!("tcp://127.0.0.1:9800"));
-        params.insert("tag".into(), json!("default"));
-        params.insert("fields".into(), json!([]));
-        defs.push(ConnectorDef {
-            id: "arrow_ipc_sink".into(),
-            kind: "arrow-ipc".into(),
-            scope: ConnectorScope::Sink,
-            allow_override: vec!["target".into(), "tag".into(), "fields".into()],
-            default_params: params,
-            origin: Some("builtin:arrow_ipc_sink".into()),
-        });
-    }
-
-    // arrow-tcp alias
-    {
-        let mut params = ParamMap::new();
-        params.insert("target".into(), json!("tcp://127.0.0.1:9800"));
-        params.insert("tag".into(), json!("default"));
-        params.insert("fields".into(), json!([]));
-        defs.push(ConnectorDef {
-            id: "arrow_tcp_sink".into(),
-            kind: "arrow-ipc".into(),
-            scope: ConnectorScope::Sink,
-            allow_override: vec!["target".into(), "tag".into(), "fields".into()],
-            default_params: params,
-            origin: Some("builtin:arrow_tcp_sink".into()),
-        });
-    }
-
-    // arrow-file
-    {
-        let mut params = ParamMap::new();
-        params.insert("base".into(), json!("./data/out_dat"));
-        params.insert("file".into(), json!("default.arrow"));
-        params.insert("tag".into(), json!("default"));
-        params.insert("fields".into(), json!([]));
-        params.insert("sync".into(), json!(false));
-        defs.push(ConnectorDef {
-            id: "arrow_file_sink".into(),
-            kind: "arrow-file".into(),
-            scope: ConnectorScope::Sink,
-            allow_override: vec![
-                "base".into(),
-                "file".into(),
-                "tag".into(),
-                "fields".into(),
-                "sync".into(),
-            ],
-            default_params: params,
-            origin: Some("builtin:arrow_file_sink".into()),
-        });
-    }
-
-    // arrow-file-std
-    {
-        let mut params = ParamMap::new();
-        params.insert("base".into(), json!("./data/out_dat"));
-        params.insert("file".into(), json!("default.arrow"));
-        params.insert("fields".into(), json!([]));
-        params.insert("sync".into(), json!(false));
-        defs.push(ConnectorDef {
-            id: "arrow_file_std_sink".into(),
-            kind: "arrow-file-std".into(),
-            scope: ConnectorScope::Sink,
-            allow_override: vec!["base".into(), "file".into(), "fields".into(), "sync".into()],
-            default_params: params,
-            origin: Some("builtin:arrow_file_std_sink".into()),
-        });
-    }
-
     // blackhole
     {
         let mut params = ParamMap::new();
@@ -213,6 +140,41 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             allow_override: vec!["addr".into(), "port".into(), "framing".into()],
             default_params: params,
             origin: Some("builtin:tcp_sink".into()),
+        });
+    }
+
+    // file_arrow
+    {
+        let mut params = ParamMap::new();
+        params.insert("protocol".into(), json!("arrow"));
+        params.insert("base".into(), json!("./data/out_dat"));
+        params.insert("file".into(), json!("default.arrow"));
+        params.insert("fields".into(), json!([]));
+        params.insert("sync".into(), json!(false));
+        defs.push(ConnectorDef {
+            id: "file_arrow_sink".into(),
+            kind: "file".into(),
+            scope: ConnectorScope::Sink,
+            allow_override: vec!["base".into(), "file".into(), "fields".into(), "sync".into()],
+            default_params: params,
+            origin: Some("builtin:file_arrow_sink".into()),
+        });
+    }
+
+    // tcp_arrow
+    {
+        let mut params = ParamMap::new();
+        params.insert("protocol".into(), json!("arrow"));
+        params.insert("addr".into(), json!("127.0.0.1"));
+        params.insert("port".into(), json!(9000));
+        params.insert("fields".into(), json!([]));
+        defs.push(ConnectorDef {
+            id: "tcp_arrow_sink".into(),
+            kind: "tcp".into(),
+            scope: ConnectorScope::Sink,
+            allow_override: vec!["addr".into(), "port".into(), "fields".into()],
+            default_params: params,
+            origin: Some("builtin:tcp_arrow_sink".into()),
         });
     }
 

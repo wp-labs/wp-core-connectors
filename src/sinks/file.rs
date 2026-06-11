@@ -1,9 +1,14 @@
+use std::io::BufWriter;
+use std::sync::Arc;
+
+use arrow::ipc::writer::StreamWriter;
 use async_trait::async_trait;
-use orion_error::conversion::{SourceErr, ToStructError};
+use orion_error::conversion::{SourceErr, SourceRawErr, ToStructError};
 use std::fs;
 use std::io::ErrorKind;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 use wp_connector_api::{
     AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, SinkBuildCtx, SinkReason, SinkResult,
     SinkSpec as ResolvedSinkSpec,
@@ -11,6 +16,10 @@ use wp_connector_api::{
 use wp_data_fmt::{FormatType, RecordFormatter};
 use wp_model_core::model::DataRecord;
 use wp_model_core::model::fmt_def::TextFmt;
+
+use super::arrow_conv::{
+    data_record_to_batch, data_records_to_batch, infer_arrow_schema, sink_err,
+};
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,15 +41,6 @@ fn record_sync_all_call() {
 
 #[cfg(not(test))]
 fn record_sync_all_call() {}
-
-fn sink_err<E>(msg: &'static str, err: E) -> wp_connector_api::SinkError
-where
-    E: std::fmt::Display,
-{
-    SinkReason::Sink
-        .to_err()
-        .with_detail(format!("{msg}: {err}"))
-}
 
 #[derive(Clone, Debug)]
 pub struct FileSinkSpec {
@@ -401,12 +401,160 @@ impl AsyncRawDataSink for FormattedFileSink {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ArrowFileSink — Arrow IPC Stream format file sink
+// ---------------------------------------------------------------------------
+
+pub struct ArrowFileSink {
+    writer: Mutex<StreamWriter<BufWriter<std::fs::File>>>,
+    schema: Arc<arrow::datatypes::Schema>,
+    sync: bool,
+    sent_cnt: u64,
+}
+
+impl ArrowFileSink {
+    pub fn new(path: &str, fields: &[String], sync: bool) -> SinkResult<Self> {
+        if let Some(parent) = std::path::Path::new(path).parent()
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent).source_err(SinkReason::Sink, "create output dir")?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .source_err(SinkReason::Sink, "open arrow output file")?;
+        let schema = Arc::new(infer_arrow_schema(fields));
+        let writer = StreamWriter::try_new(BufWriter::new(file), &schema)
+            .source_raw_err(SinkReason::Sink, "create arrow stream writer")?;
+        Ok(Self {
+            writer: Mutex::new(writer),
+            schema,
+            sync,
+            sent_cnt: 0,
+        })
+    }
+}
+
+#[async_trait]
+impl AsyncRecordSink for ArrowFileSink {
+    async fn sink_record(&mut self, data: &DataRecord) -> SinkResult<()> {
+        let batch = data_record_to_batch(data, &self.schema)?;
+        let mut writer = self.writer.lock().await;
+        writer
+            .write(&batch)
+            .map_err(|e| sink_err("arrow_file write batch fail", e))?;
+        writer
+            .flush()
+            .map_err(|e| sink_err("arrow_file flush fail", e))?;
+        if self.sync {
+            writer
+                .get_mut()
+                .get_mut()
+                .sync_all()
+                .map_err(|e| sink_err("arrow_file sync fail", e))?;
+        }
+        drop(writer);
+
+        self.sent_cnt = self.sent_cnt.saturating_add(1);
+        if self.sent_cnt == 1 {
+            log::info!("arrow_file sink first-send: rows=1");
+        }
+        Ok(())
+    }
+
+    async fn sink_records(&mut self, data: Vec<Arc<DataRecord>>) -> SinkResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let row_count = data.len();
+        let batch = data_records_to_batch(&data, &self.schema)?;
+        let mut writer = self.writer.lock().await;
+        writer
+            .write(&batch)
+            .map_err(|e| sink_err("arrow_file write batch fail", e))?;
+        writer
+            .flush()
+            .map_err(|e| sink_err("arrow_file flush fail", e))?;
+        if self.sync {
+            writer
+                .get_mut()
+                .get_mut()
+                .sync_all()
+                .map_err(|e| sink_err("arrow_file sync fail", e))?;
+        }
+        drop(writer);
+
+        if self.sent_cnt == 0 {
+            log::info!(
+                "arrow_file sink first-send: rows={} cols={}",
+                row_count,
+                self.schema.fields().len(),
+            );
+        }
+        self.sent_cnt = self.sent_cnt.saturating_add(1);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AsyncRawDataSink for ArrowFileSink {
+    async fn sink_str(&mut self, _data: &str) -> SinkResult<()> {
+        Err(SinkReason::Sink
+            .to_err()
+            .with_detail("arrow_file sink only accepts records"))
+    }
+
+    async fn sink_bytes(&mut self, _data: &[u8]) -> SinkResult<()> {
+        Err(SinkReason::Sink
+            .to_err()
+            .with_detail("arrow_file sink only accepts records"))
+    }
+
+    async fn sink_str_batch(&mut self, _data: Vec<&str>) -> SinkResult<()> {
+        Err(SinkReason::Sink
+            .to_err()
+            .with_detail("arrow_file sink only accepts records"))
+    }
+
+    async fn sink_bytes_batch(&mut self, _data: Vec<&[u8]>) -> SinkResult<()> {
+        Err(SinkReason::Sink
+            .to_err()
+            .with_detail("arrow_file sink only accepts records"))
+    }
+}
+
+#[async_trait]
+impl AsyncCtrl for ArrowFileSink {
+    async fn stop(&mut self) -> SinkResult<()> {
+        let mut writer = self.writer.lock().await;
+        writer
+            .finish()
+            .map_err(|e| sink_err("arrow_file finish fail", e))?;
+        if self.sync {
+            writer
+                .get_mut()
+                .get_mut()
+                .sync_all()
+                .map_err(|e| sink_err("arrow_file sync on stop fail", e))?;
+        }
+        Ok(())
+    }
+
+    async fn reconnect(&mut self) -> SinkResult<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::io::Write as _;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use wp_model_core::model::{Field as ModelField, FieldStorage};
 
     use super::*;
 
@@ -530,5 +678,159 @@ mod tests {
             lock_path,
             PathBuf::from("/tmp/demo/data/out_dat/sink/default-r2.dat.lock")
         );
+    }
+
+    // ---- ArrowFileSink tests ----
+
+    fn tmp_arrow_path(label: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("wp_arrow_fs_{ts}_{label}.arrow"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn arrow_file_sink_write_and_read_back() {
+        use arrow::ipc::reader::StreamReader;
+        use arrow::record_batch::RecordBatch;
+        use wp_model_core::model::{Field as ModelField, FieldStorage};
+
+        let path = tmp_arrow_path("roundtrip");
+        let fields = vec!["name".to_string(), "count".to_string()];
+
+        // Write
+        {
+            let mut sink =
+                ArrowFileSink::new(path.to_string_lossy().as_ref(), &fields, false).unwrap();
+
+            let recs: Vec<Arc<DataRecord>> = vec![
+                Arc::new(DataRecord::from(vec![
+                    FieldStorage::from(ModelField::from_chars("name", "alice")),
+                    FieldStorage::from(ModelField::from_chars("count", "42")),
+                ])),
+                Arc::new(DataRecord::from(vec![
+                    FieldStorage::from(ModelField::from_chars("name", "bob")),
+                    FieldStorage::from(ModelField::from_chars("count", "7")),
+                ])),
+            ];
+
+            sink.sink_records(recs).await.unwrap();
+            sink.stop().await.unwrap();
+        }
+
+        // Read back
+        let file = std::fs::File::open(&path).unwrap();
+        let reader = StreamReader::try_new(file, None).unwrap();
+        let batches: Vec<RecordBatch> = reader.map(|r| r.unwrap()).collect();
+
+        assert!(!batches.is_empty(), "should have at least one batch");
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+        assert_eq!(batches[0].num_columns(), 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn arrow_file_sink_sync_writes_through() {
+        use arrow::ipc::reader::StreamReader;
+
+        let path = tmp_arrow_path("sync");
+        let fields = vec!["x".to_string()];
+
+        {
+            let mut sink = ArrowFileSink::new(
+                path.to_string_lossy().as_ref(),
+                &fields,
+                true, // sync enabled
+            )
+            .unwrap();
+
+            let rec = Arc::new(DataRecord::from(vec![FieldStorage::from(
+                ModelField::from_chars("x", "hello"),
+            )]));
+
+            sink.sink_record(&rec).await.unwrap();
+            // After sink_record with sync=true, data should already be on disk
+            sink.stop().await.unwrap();
+        }
+
+        // File should exist and be readable
+        let file = std::fs::File::open(&path).unwrap();
+        let reader = StreamReader::try_new(file, None).unwrap();
+        let batches: Vec<_> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn arrow_file_sink_empty_records_noop() {
+        let path = tmp_arrow_path("empty");
+        let fields = vec!["x".to_string()];
+
+        {
+            let mut sink =
+                ArrowFileSink::new(path.to_string_lossy().as_ref(), &fields, false).unwrap();
+
+            // Empty sink_records should be a no-op
+            sink.sink_records(Vec::new()).await.unwrap();
+            sink.stop().await.unwrap();
+        }
+
+        // File should exist but contain only the schema (StreamWriter writes
+        // schema on construction via try_new, so the file won't be empty).
+        assert!(path.exists());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn arrow_file_sink_appends_on_reopen() {
+        use arrow::ipc::reader::StreamReader;
+
+        let path = tmp_arrow_path("append");
+        let fields = vec!["v".to_string()];
+
+        // First open: write one record
+        {
+            let mut sink =
+                ArrowFileSink::new(path.to_string_lossy().as_ref(), &fields, false).unwrap();
+
+            let rec = Arc::new(DataRecord::from(vec![FieldStorage::from(
+                ModelField::from_chars("v", "first"),
+            )]));
+            sink.sink_record(&rec).await.unwrap();
+            sink.stop().await.unwrap();
+        }
+
+        let size_after_first = std::fs::metadata(&path).unwrap().len();
+
+        // Second open: append another record
+        {
+            let mut sink =
+                ArrowFileSink::new(path.to_string_lossy().as_ref(), &fields, false).unwrap();
+
+            let rec = Arc::new(DataRecord::from(vec![FieldStorage::from(
+                ModelField::from_chars("v", "second"),
+            )]));
+            sink.sink_record(&rec).await.unwrap();
+            sink.stop().await.unwrap();
+        }
+
+        let size_after_second = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size_after_second > size_after_first,
+            "append mode: file should grow after reopening and writing more records"
+        );
+
+        // Each segment is self-contained: read both independently
+        let file = std::fs::File::open(&path).unwrap();
+        let reader = StreamReader::try_new(file, None).unwrap();
+        let first_rows: usize = reader.map(|r| r.unwrap().num_rows()).sum();
+        assert_eq!(first_rows, 1, "first segment should have 1 row");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

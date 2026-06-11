@@ -1,6 +1,10 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::builtin;
+use arrow::ipc::writer::StreamWriter;
 use async_trait::async_trait;
-use orion_error::conversion::{SourceErr, ToStructError};
+use orion_error::conversion::{SourceErr, SourceRawErr, ToStructError};
 use wp_connector_api::SinkReason;
 use wp_connector_api::SinkResult;
 use wp_connector_api::{
@@ -10,6 +14,10 @@ use wp_connector_api::{
 use wp_data_fmt::RecordFormatter; // for fmt_record
 
 use crate::net::transport::{BackoffMode, NetSendPolicy, NetWriter, net_backoff_adaptive};
+
+use super::arrow_conv::{
+    data_record_to_batch, data_records_to_batch, infer_arrow_schema, sink_err,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Framing {
@@ -296,16 +304,78 @@ impl SinkFactory for TcpFactory {
     fn kind(&self) -> &'static str {
         "tcp"
     }
+
     fn validate_spec(&self, spec: &ResolvedSinkSpec) -> SinkResult<()> {
-        TcpSinkSpec::from_resolved(spec)?;
-        Ok(())
+        let protocol = spec
+            .params
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("txt");
+        match protocol {
+            "arrow" => {
+                // Validate that addr is present (port is optional with default)
+                let _ = spec
+                    .params
+                    .get("addr")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        SinkReason::core_conf()
+                            .to_err()
+                            .with_detail("tcp_arrow: missing required param 'addr'")
+                    })?;
+                // Validate that fields is present and non-empty
+                let field_names: Vec<String> = spec
+                    .params
+                    .get("fields")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if field_names.is_empty() {
+                    return Err(SinkReason::core_conf().to_err().with_detail(
+                        "tcp_arrow: requires 'fields' param (non-empty array of field names)",
+                    ));
+                }
+                Ok(())
+            }
+            "txt" | "" => {
+                TcpSinkSpec::from_resolved(spec)?;
+                Ok(())
+            }
+            other => Err(SinkReason::core_conf().to_err().with_detail(format!(
+                "unsupported tcp protocol: '{other}'; expected 'txt' or 'arrow'"
+            ))),
+        }
     }
+
     async fn build(&self, spec: &ResolvedSinkSpec, ctx: &SinkBuildCtx) -> SinkResult<SinkHandle> {
-        let resolved = TcpSinkSpec::from_resolved(spec)?;
-        // Internal defaults: no ACK; auto-drain at shutdown.
-        // 限速目标：由 SinkBuildCtx 统一传入，TcpSink 内部据此构建 SendPolicy。
-        let runtime = TcpSink::connect(&resolved, ctx.rate_limit_rps).await?;
-        Ok(SinkHandle::new(Box::new(runtime)))
+        let protocol = spec
+            .params
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("txt");
+
+        let sink: Box<dyn wp_connector_api::AsyncSink> = match protocol {
+            "arrow" => {
+                let runtime = TcpArrowSink::connect(spec, ctx.rate_limit_rps).await?;
+                Box::new(runtime)
+            }
+            "txt" | "" => {
+                let resolved = TcpSinkSpec::from_resolved(spec)?;
+                let runtime = TcpSink::connect(&resolved, ctx.rate_limit_rps).await?;
+                Box::new(runtime)
+            }
+            other => {
+                return Err(SinkReason::core_conf().to_err().with_detail(format!(
+                    "unsupported tcp protocol: '{other}'; expected 'txt' or 'arrow'"
+                )));
+            }
+        };
+
+        Ok(SinkHandle::new(sink))
     }
 }
 
@@ -339,6 +409,296 @@ fn build_payload_bytes(data: &[u8], framing: Framing) -> Vec<u8> {
             buf.extend_from_slice(data);
             buf
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TcpArrowSink — Arrow IPC Stream over TCP
+// ---------------------------------------------------------------------------
+
+const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Encode a single `RecordBatch` as Arrow IPC Stream bytes (self-contained:
+/// schema + record batch + end-of-stream marker).
+fn encode_batch_ipc_stream(batch: &arrow::record_batch::RecordBatch) -> SinkResult<Vec<u8>> {
+    let schema = batch.schema();
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &schema)
+            .source_raw_err(SinkReason::Sink, "tcp_arrow create stream writer")?;
+        writer
+            .write(batch)
+            .map_err(|e| sink_err("tcp_arrow encode batch", e))?;
+        writer
+            .finish()
+            .map_err(|e| sink_err("tcp_arrow finish stream", e))?;
+    }
+    Ok(buf)
+}
+
+enum ConnState {
+    Connected {
+        writer: Box<NetWriter>,
+    },
+    Disconnected {
+        next_attempt: tokio::time::Instant,
+        backoff: Duration,
+    },
+    Stopped,
+}
+
+pub struct TcpArrowSink {
+    conn: ConnState,
+    host: String,
+    port: u16,
+    rate_limit_rps: usize,
+    schema: Arc<arrow::datatypes::Schema>,
+    sent_cnt: u64,
+}
+
+impl TcpArrowSink {
+    pub async fn connect(spec: &ResolvedSinkSpec, rate_limit_rps: usize) -> SinkResult<Self> {
+        let addr = spec
+            .params
+            .get("addr")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SinkReason::core_conf()
+                    .to_err()
+                    .with_detail("tcp_arrow: missing required param 'addr'")
+            })?;
+        let port = spec
+            .params
+            .get("port")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(9000) as u16;
+
+        let target = format!("{addr}:{port}");
+        let mode = if rate_limit_rps == 0 {
+            BackoffMode::ForceOn
+        } else {
+            BackoffMode::ForceOff
+        };
+        let writer = NetWriter::connect_tcp_with_policy(
+            &target,
+            NetSendPolicy {
+                rate_limit_rps,
+                backoff_mode: mode,
+                adaptive: net_backoff_adaptive(),
+            },
+        )
+        .await
+        .source_err(SinkReason::Sink, "tcp_arrow connect tcp")?;
+
+        let field_names: Vec<String> = spec
+            .params
+            .get("fields")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let schema = Arc::new(infer_arrow_schema(&field_names));
+
+        log::info!("tcp_arrow sink connected: target={target} fields={field_names:?}");
+
+        Ok(Self {
+            conn: ConnState::Connected {
+                writer: Box::new(writer),
+            },
+            host: addr.to_string(),
+            port,
+            rate_limit_rps,
+            schema,
+            sent_cnt: 0,
+        })
+    }
+
+    async fn connect_writer(&self) -> SinkResult<NetWriter> {
+        let target = format!("{}:{}", self.host, self.port);
+        let mode = if self.rate_limit_rps == 0 {
+            BackoffMode::ForceOn
+        } else {
+            BackoffMode::ForceOff
+        };
+        NetWriter::connect_tcp_with_policy(
+            &target,
+            NetSendPolicy {
+                rate_limit_rps: self.rate_limit_rps,
+                backoff_mode: mode,
+                adaptive: net_backoff_adaptive(),
+            },
+        )
+        .await
+        .source_err(SinkReason::Sink, "tcp_arrow reconnect tcp")
+    }
+
+    fn enter_disconnected(&mut self) {
+        self.conn = ConnState::Disconnected {
+            next_attempt: tokio::time::Instant::now() + BACKOFF_INITIAL,
+            backoff: BACKOFF_INITIAL,
+        };
+        log::warn!("tcp_arrow sink disconnected, will retry");
+    }
+
+    async fn try_reconnect(&mut self) {
+        match self.connect_writer().await {
+            Ok(writer) => {
+                self.conn = ConnState::Connected {
+                    writer: Box::new(writer),
+                };
+                log::info!("tcp_arrow sink reconnected: {}:{}", self.host, self.port,);
+            }
+            Err(e) => {
+                if let ConnState::Disconnected {
+                    ref mut next_attempt,
+                    ref mut backoff,
+                } = self.conn
+                {
+                    *backoff = (*backoff * 2).min(BACKOFF_MAX);
+                    *next_attempt = tokio::time::Instant::now() + *backoff;
+                }
+                log::debug!("tcp_arrow sink reconnect failed: {e}");
+            }
+        }
+    }
+
+    async fn send_payload(&mut self, payload: &[u8]) -> SinkResult<()> {
+        match &mut self.conn {
+            ConnState::Connected { writer } => match writer.write(payload).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    log::warn!("tcp_arrow send error: {e}");
+                    self.enter_disconnected();
+                    Err(e)
+                }
+            },
+            ConnState::Disconnected { next_attempt, .. } => {
+                if tokio::time::Instant::now() >= *next_attempt {
+                    self.try_reconnect().await;
+                    if let ConnState::Connected { writer } = &mut self.conn {
+                        match writer.write(payload).await {
+                            Ok(()) => Ok(()),
+                            Err(e) => {
+                                log::warn!("tcp_arrow send error after reconnect: {e}");
+                                self.enter_disconnected();
+                                Err(e)
+                            }
+                        }
+                    } else {
+                        Err(SinkReason::Sink
+                            .to_err()
+                            .with_detail("tcp_arrow sink reconnect did not restore connection"))
+                    }
+                } else {
+                    Err(SinkReason::Sink
+                        .to_err()
+                        .with_detail("tcp_arrow sink waiting for reconnect backoff"))
+                }
+            }
+            ConnState::Stopped => Err(SinkReason::Sink
+                .to_err()
+                .with_detail("tcp_arrow sink stopped")),
+        }
+    }
+}
+
+#[async_trait]
+impl AsyncRecordSink for TcpArrowSink {
+    async fn sink_record(&mut self, data: &wp_model_core::model::DataRecord) -> SinkResult<()> {
+        let batch = data_record_to_batch(data, &self.schema)?;
+        let payload = encode_batch_ipc_stream(&batch)?;
+
+        self.send_payload(&payload).await?;
+        self.sent_cnt = self.sent_cnt.saturating_add(1);
+
+        if self.sent_cnt == 1 {
+            log::info!(
+                "tcp_arrow sink first-send: cols={} payload_bytes={}",
+                self.schema.fields().len(),
+                payload.len(),
+            );
+        }
+        Ok(())
+    }
+
+    async fn sink_records(
+        &mut self,
+        data: Vec<Arc<wp_model_core::model::DataRecord>>,
+    ) -> SinkResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let row_count = data.len();
+        let batch = data_records_to_batch(&data, &self.schema)?;
+        let payload = encode_batch_ipc_stream(&batch)?;
+
+        self.send_payload(&payload).await?;
+
+        if self.sent_cnt == 0 {
+            log::info!(
+                "tcp_arrow sink first-send: rows={} cols={} payload_bytes={}",
+                row_count,
+                self.schema.fields().len(),
+                payload.len(),
+            );
+        }
+        self.sent_cnt = self.sent_cnt.saturating_add(1);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AsyncRawDataSink for TcpArrowSink {
+    async fn sink_str(&mut self, _data: &str) -> SinkResult<()> {
+        Err(SinkReason::Sink
+            .to_err()
+            .with_detail("tcp_arrow sink only accepts records"))
+    }
+
+    async fn sink_bytes(&mut self, _data: &[u8]) -> SinkResult<()> {
+        Err(SinkReason::Sink
+            .to_err()
+            .with_detail("tcp_arrow sink only accepts records"))
+    }
+
+    async fn sink_str_batch(&mut self, _data: Vec<&str>) -> SinkResult<()> {
+        Err(SinkReason::Sink
+            .to_err()
+            .with_detail("tcp_arrow sink only accepts records"))
+    }
+
+    async fn sink_bytes_batch(&mut self, _data: Vec<&[u8]>) -> SinkResult<()> {
+        Err(SinkReason::Sink
+            .to_err()
+            .with_detail("tcp_arrow sink only accepts records"))
+    }
+}
+
+#[async_trait]
+impl AsyncCtrl for TcpArrowSink {
+    async fn stop(&mut self) -> SinkResult<()> {
+        let old = std::mem::replace(&mut self.conn, ConnState::Stopped);
+        if let ConnState::Connected { mut writer } = old {
+            let _ = writer.shutdown().await;
+            writer
+                .drain_until_empty(std::time::Duration::from_secs(10))
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn reconnect(&mut self) -> SinkResult<()> {
+        self.conn = ConnState::Disconnected {
+            next_attempt: tokio::time::Instant::now(),
+            backoff: BACKOFF_INITIAL,
+        };
+        self.try_reconnect().await;
+        Ok(())
     }
 }
 

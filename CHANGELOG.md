@@ -7,6 +7,26 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-06-12
+
+### Added
+
+- Arrow output for file and TCP sinks via `protocol = "arrow"` parameter in `FileFactory` and `TcpFactory`.
+- Arrow file sinks support append mode and optional `sync` fsync for durability.
+- Arrow TCP sink supports automatic reconnect with exponential backoff.
+
+### Changed
+
+- Arrow sink configuration consolidated under `protocol` dispatch (`"arrow"` / `"txt"`).
+
+### Fixed
+
+- Invalid `protocol` values now produce a clear configuration error instead of silently defaulting to text mode.
+
+### Removed
+
+- `arrow-file`, `arrow-file-std`, and `arrow-ipc` factory kinds. Use `kind = "file"` or `kind = "tcp"` with `protocol = "arrow"` instead.
+
 ## [0.3.2] - 2026-06-11
 
 ### Added

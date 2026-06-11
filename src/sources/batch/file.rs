@@ -25,12 +25,12 @@ pub struct FileBatchSource {
 
 impl FileBatchSource {
     /// Create from an existing `DataSource`.
-    pub fn new(
-        key: impl Into<String>,
-        source: Box<dyn DataSource>,
-        schema: Arc<Schema>,
-    ) -> Self {
-        Self { key: key.into(), inner: source, schema }
+    pub fn new(key: impl Into<String>, source: Box<dyn DataSource>, schema: Arc<Schema>) -> Self {
+        Self {
+            key: key.into(),
+            inner: source,
+            schema,
+        }
     }
 
     /// Create from a file path, using the built-in `SimpleFileSource`.
@@ -47,7 +47,10 @@ impl FileBatchSource {
         if events.is_empty() {
             return Ok(vec![]);
         }
-        let lines: Vec<String> = events.iter().map(|e| payload_to_string(&e.payload)).collect();
+        let lines: Vec<String> = events
+            .iter()
+            .map(|e| payload_to_string(&e.payload))
+            .collect();
         match ndjson_to_record_batch(&lines, &self.schema) {
             Ok(Some(batch)) => Ok(vec![batch]),
             Ok(None) => Ok(vec![]),
@@ -79,7 +82,9 @@ impl BatchSource for FileBatchSource {
         Ok(())
     }
 
-    fn identifier(&self) -> &str { &self.key }
+    fn identifier(&self) -> &str {
+        &self.key
+    }
 }
 
 // -- SimpleFileSource --------------------------------------------------------
@@ -102,7 +107,11 @@ impl SimpleFileSource {
         let p = path.as_ref();
         let file = tokio::fs::File::open(p).await?;
         let reader = BufReader::new(file);
-        Ok(Self { lines: reader.lines(), key: p.display().to_string(), eof: false })
+        Ok(Self {
+            lines: reader.lines(),
+            key: p.display().to_string(),
+            eof: false,
+        })
     }
 }
 
@@ -117,11 +126,16 @@ impl DataSource for SimpleFileSource {
             match self.lines.next_line().await {
                 Ok(Some(line)) => {
                     batch.push(SourceEvent::new(
-                        0, &self.key, RawData::from_string(line),
+                        0,
+                        &self.key,
+                        RawData::from_string(line),
                         Arc::new(Tags::new()),
                     ));
                 }
-                Ok(None) => { self.eof = true; break; }
+                Ok(None) => {
+                    self.eof = true;
+                    break;
+                }
                 Err(e) => {
                     return Err(WpReason::Other.err_detail(e.to_string()));
                 }
@@ -133,8 +147,12 @@ impl DataSource for SimpleFileSource {
         Ok(batch)
     }
 
-    fn try_receive(&mut self) -> Option<SourceBatch> { None }
-    fn identifier(&self) -> String { self.key.clone() }
+    fn try_receive(&mut self) -> Option<SourceBatch> {
+        None
+    }
+    fn identifier(&self) -> String {
+        self.key.clone()
+    }
 }
 
 // -- Tests -------------------------------------------------------------------
@@ -149,8 +167,11 @@ mod tests {
     #[tokio::test]
     async fn file_batch_source_identifier() {
         let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, true)]));
-        let src = FileBatchSource::new("test_key",
-            Box::new(SimpleFileSource::open("Cargo.toml").await.unwrap()), schema);
+        let src = FileBatchSource::new(
+            "test_key",
+            Box::new(SimpleFileSource::open("Cargo.toml").await.unwrap()),
+            schema,
+        );
         assert_eq!(src.identifier(), "test_key");
     }
 
@@ -162,8 +183,11 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, true)]));
-        let mut src = FileBatchSource::new("test",
-            Box::new(SimpleFileSource::open(&path).await.unwrap()), schema);
+        let mut src = FileBatchSource::new(
+            "test",
+            Box::new(SimpleFileSource::open(&path).await.unwrap()),
+            schema,
+        );
 
         src.start().await.unwrap();
         let batches = src.receive_batch().await.unwrap();
@@ -180,8 +204,11 @@ mod tests {
     async fn file_batch_source_empty_file() {
         let tmp = NamedTempFile::new().unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, true)]));
-        let mut src = FileBatchSource::new("empty",
-            Box::new(SimpleFileSource::open(tmp.path()).await.unwrap()), schema);
+        let mut src = FileBatchSource::new(
+            "empty",
+            Box::new(SimpleFileSource::open(tmp.path()).await.unwrap()),
+            schema,
+        );
         src.start().await.unwrap();
         assert!(src.receive_batch().await.is_err());
     }
@@ -191,7 +218,9 @@ mod tests {
         let mut tmp = NamedTempFile::new().unwrap();
         writeln!(tmp, r#"{{"msg":"hi"}}"#).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, true)]));
-        let mut src = FileBatchSource::from_path("fp", tmp.path(), schema).await.unwrap();
+        let mut src = FileBatchSource::from_path("fp", tmp.path(), schema)
+            .await
+            .unwrap();
         src.start().await.unwrap();
         let batches = src.receive_batch().await.unwrap();
         assert_eq!(batches[0].num_rows(), 1);

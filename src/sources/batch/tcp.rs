@@ -35,7 +35,12 @@ impl TcpBatchSource {
         schema: Arc<Schema>,
         format: TcpWireFormat,
     ) -> Self {
-        Self { key: key.into(), inner: source, schema, format }
+        Self {
+            key: key.into(),
+            inner: source,
+            schema,
+            format,
+        }
     }
 
     fn convert_batch(&self, events: SourceBatch) -> SourceResult<Vec<RecordBatch>> {
@@ -44,8 +49,10 @@ impl TcpBatchSource {
         }
         match self.format {
             TcpWireFormat::Ndjson => {
-                let lines: Vec<String> = events.iter()
-                    .map(|e| payload_to_string(&e.payload)).collect();
+                let lines: Vec<String> = events
+                    .iter()
+                    .map(|e| payload_to_string(&e.payload))
+                    .collect();
                 match ndjson_to_record_batch(&lines, &self.schema) {
                     Ok(Some(batch)) => Ok(vec![batch]),
                     Ok(None) => Ok(vec![]),
@@ -56,8 +63,8 @@ impl TcpBatchSource {
                 let mut batches = Vec::new();
                 for event in &events {
                     let bytes = payload_to_bytes(&event.payload);
-                    let batch = decode_arrow_ipc(&bytes)
-                        .map_err(|e| SourceReason::Decode.err_detail(e))?;
+                    let batch =
+                        decode_arrow_ipc(&bytes).map_err(|e| SourceReason::Decode.err_detail(e))?;
                     batches.push(batch);
                 }
                 Ok(batches)
@@ -76,9 +83,11 @@ pub fn decode_arrow_ipc(data: &[u8]) -> Result<RecordBatch, String> {
     use std::io::Cursor;
 
     let cursor = Cursor::new(data);
-    let mut reader = StreamReader::try_new(cursor, None)
-        .map_err(|e| format!("arrow ipc reader: {e}"))?;
-    reader.next().transpose()
+    let mut reader =
+        StreamReader::try_new(cursor, None).map_err(|e| format!("arrow ipc reader: {e}"))?;
+    reader
+        .next()
+        .transpose()
         .map_err(|e| format!("arrow ipc decode: {e}"))?
         .ok_or_else(|| "empty arrow ipc message".to_string())
 }
@@ -102,7 +111,9 @@ impl BatchSource for TcpBatchSource {
         Ok(())
     }
 
-    fn identifier(&self) -> &str { &self.key }
+    fn identifier(&self) -> &str {
+        &self.key
+    }
 }
 
 #[cfg(test)]
@@ -119,10 +130,14 @@ mod tests {
             Field::new("dport", DataType::Int64, false),
         ]));
 
-        let batch = RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(StringArray::from(vec!["10.0.0.1", "10.0.0.2"])),
-            Arc::new(Int64Array::from(vec![443i64, 80])),
-        ]).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["10.0.0.1", "10.0.0.2"])),
+                Arc::new(Int64Array::from(vec![443i64, 80])),
+            ],
+        )
+        .unwrap();
 
         let mut buf = Vec::new();
         {

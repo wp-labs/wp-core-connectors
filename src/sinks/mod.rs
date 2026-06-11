@@ -1,6 +1,4 @@
-pub mod arrow_file;
-pub mod arrow_file_std;
-pub mod arrow_ipc;
+pub mod arrow_conv;
 pub mod blackhole;
 pub mod blackhole_factory;
 pub mod file;
