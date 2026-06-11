@@ -4,8 +4,7 @@
 //! columnar Arrow batches matching a given schema.
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
-    TimestampNanosecondArray,
+    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -34,7 +33,10 @@ pub fn ndjson_to_record_batch(
         let obj: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(line).map_err(|e| format!("invalid JSON: {e}"))?;
         for field in schema.fields() {
-            let val = obj.get(field.name()).cloned().unwrap_or(serde_json::Value::Null);
+            let val = obj
+                .get(field.name())
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             columns.get_mut(field.name()).unwrap().push(val);
         }
     }
@@ -105,11 +107,9 @@ fn build_array(field: &Field, values: &[serde_json::Value]) -> Result<ArrayRef, 
             let arr: TimestampNanosecondArray = values
                 .iter()
                 .map(|v| match v {
-                    serde_json::Value::String(s) => {
-                        chrono::DateTime::parse_from_rfc3339(s)
-                            .ok()
-                            .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0))
-                    }
+                    serde_json::Value::String(s) => chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0)),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -130,7 +130,11 @@ mod tests {
             Field::new("dport", DataType::Int64, true),
             Field::new("score", DataType::Float64, true),
             Field::new("active", DataType::Boolean, true),
-            Field::new("event_time", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
         ])
     }
 
@@ -144,9 +148,7 @@ mod tests {
             r#"{"sip":"10.0.0.1","dport":"443"}"#.to_string(),
             r#"{"sip":"10.0.0.2","dport":"80"}"#.to_string(),
         ];
-        let batch = ndjson_to_record_batch(&lines, &schema)
-            .unwrap()
-            .unwrap();
+        let batch = ndjson_to_record_batch(&lines, &schema).unwrap().unwrap();
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 2);
     }
@@ -164,9 +166,7 @@ mod tests {
         let lines = vec![
             r#"{"sip":null,"dport":null,"score":null,"active":null,"event_time":null}"#.to_string(),
         ];
-        let batch = ndjson_to_record_batch(&lines, &schema)
-            .unwrap()
-            .unwrap();
+        let batch = ndjson_to_record_batch(&lines, &schema).unwrap().unwrap();
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 5);
     }
@@ -182,25 +182,23 @@ mod tests {
             r#"{"score":0.0,"active":false}"#.to_string(),
             r#"{"score":"99.9","active":"true"}"#.to_string(), // string→number, string→bool
         ];
-        let batch = ndjson_to_record_batch(&lines, &schema)
-            .unwrap()
-            .unwrap();
+        let batch = ndjson_to_record_batch(&lines, &schema).unwrap().unwrap();
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.num_columns(), 2);
     }
 
     #[test]
     fn timestamp_from_rfc3339() {
-        let schema = Schema::new(vec![
-            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
-        ]);
+        let schema = Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]);
         let lines = vec![
             r#"{"ts":"2026-01-01T00:00:00Z"}"#.to_string(),
             r#"{"ts":"2026-01-01T00:00:01Z"}"#.to_string(),
         ];
-        let batch = ndjson_to_record_batch(&lines, &schema)
-            .unwrap()
-            .unwrap();
+        let batch = ndjson_to_record_batch(&lines, &schema).unwrap().unwrap();
         assert_eq!(batch.num_rows(), 2);
     }
 
@@ -213,9 +211,7 @@ mod tests {
         let lines = vec![
             r#"{"sip":"10.0.0.1"}"#.to_string(), // dport missing
         ];
-        let batch = ndjson_to_record_batch(&lines, &schema)
-            .unwrap()
-            .unwrap();
+        let batch = ndjson_to_record_batch(&lines, &schema).unwrap().unwrap();
         assert_eq!(batch.num_rows(), 1);
     }
 
@@ -229,15 +225,9 @@ mod tests {
 
     #[test]
     fn extra_fields_are_ignored() {
-        let schema = Schema::new(vec![
-            Field::new("sip", DataType::Utf8, true),
-        ]);
-        let lines = vec![
-            r#"{"sip":"10.0.0.1","extra_field":"ignored","another":42}"#.to_string(),
-        ];
-        let batch = ndjson_to_record_batch(&lines, &schema)
-            .unwrap()
-            .unwrap();
+        let schema = Schema::new(vec![Field::new("sip", DataType::Utf8, true)]);
+        let lines = vec![r#"{"sip":"10.0.0.1","extra_field":"ignored","another":42}"#.to_string()];
+        let batch = ndjson_to_record_batch(&lines, &schema).unwrap().unwrap();
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 1);
     }

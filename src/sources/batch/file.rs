@@ -14,11 +14,9 @@ use wf_connector_api::{BatchSource, SourceError, SourceReason, SourceResult};
 use std::{io, path::Path};
 #[cfg(test)]
 use tokio::io::{AsyncBufReadExt, BufReader};
+use wp_connector_api::{DataSource, SourceBatch, SourceError as WpError, SourceReason as WpReason};
 #[cfg(test)]
 use wp_connector_api::{SourceEvent, Tags};
-use wp_connector_api::{
-    DataSource, SourceBatch, SourceError as WpError, SourceReason as WpReason,
-};
 use wp_model_core::raw::RawData;
 
 use super::ndjson::ndjson_to_record_batch;
@@ -39,11 +37,7 @@ impl FileBatchSource {
     ///
     /// The `schema` defines the Arrow column types for NDJSON → RecordBatch
     /// conversion.
-    pub fn new(
-        key: impl Into<String>,
-        source: Box<dyn DataSource>,
-        schema: Arc<Schema>,
-    ) -> Self {
+    pub fn new(key: impl Into<String>, source: Box<dyn DataSource>, schema: Arc<Schema>) -> Self {
         Self {
             key: key.into(),
             inner: source,
@@ -85,7 +79,9 @@ impl FileBatchSource {
 #[async_trait]
 impl BatchSource for FileBatchSource {
     async fn start(&mut self) -> SourceResult<()> {
-        if self.started { return Ok(()); }
+        if self.started {
+            return Ok(());
+        }
         self.started = true;
         Ok(())
     }
@@ -179,14 +175,12 @@ impl DataSource for SimpleFileSource {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field};
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[tokio::test]
     async fn file_batch_source_identifier() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("msg", DataType::Utf8, true),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, true)]));
         let src = FileBatchSource::new(
             "test_key",
             Box::new(SimpleFileSource::open("Cargo.toml").await.unwrap()),
@@ -202,9 +196,7 @@ mod tests {
         writeln!(tmp, r#"{{"msg":"world"}}"#).unwrap();
         let path = tmp.path().to_path_buf();
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("msg", DataType::Utf8, true),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, true)]));
         let mut src = FileBatchSource::new(
             "test",
             Box::new(SimpleFileSource::open(&path).await.unwrap()),
@@ -231,9 +223,7 @@ mod tests {
     #[tokio::test]
     async fn file_batch_source_empty_file() {
         let tmp = NamedTempFile::new().unwrap();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("msg", DataType::Utf8, true),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, true)]));
         let mut src = FileBatchSource::new(
             "empty",
             Box::new(SimpleFileSource::open(tmp.path()).await.unwrap()),

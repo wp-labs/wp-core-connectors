@@ -9,9 +9,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use std::sync::Arc;
 use wf_connector_api::{BatchSource, SourceError, SourceReason, SourceResult};
-use wp_connector_api::{
-    DataSource, SourceBatch, SourceReason as WpReason,
-};
+use wp_connector_api::{DataSource, SourceBatch, SourceReason as WpReason};
 use wp_model_core::raw::RawData;
 
 use super::ndjson::ndjson_to_record_batch;
@@ -71,8 +69,8 @@ impl TcpBatchSource {
                 let mut batches = Vec::new();
                 for event in &events {
                     let bytes = payload_to_bytes(&event.payload);
-                    let batch = decode_arrow_ipc(&bytes)
-                        .map_err(|e| SourceReason::Decode.err_detail(e))?;
+                    let batch =
+                        decode_arrow_ipc(&bytes).map_err(|e| SourceReason::Decode.err_detail(e))?;
                     batches.push(batch);
                 }
                 Ok(batches)
@@ -106,8 +104,8 @@ fn decode_arrow_ipc(data: &[u8]) -> Result<RecordBatch, String> {
     use std::io::Cursor;
 
     let cursor = Cursor::new(data);
-    let mut reader = StreamReader::try_new(cursor, None)
-        .map_err(|e| format!("arrow ipc reader: {e}"))?;
+    let mut reader =
+        StreamReader::try_new(cursor, None).map_err(|e| format!("arrow ipc reader: {e}"))?;
 
     reader
         .next()
@@ -156,7 +154,6 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field};
     use arrow::ipc::writer::StreamWriter;
-    use std::io::Cursor;
 
     #[test]
     fn decode_arrow_ipc_round_trip() {
