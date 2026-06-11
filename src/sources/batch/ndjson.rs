@@ -124,6 +124,16 @@ fn build_array(field: &Field, values: &[serde_json::Value]) -> Result<ArrayRef, 
 mod tests {
     use super::*;
 
+    fn test_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("sip", DataType::Utf8, true),
+            Field::new("dport", DataType::Int64, true),
+            Field::new("score", DataType::Float64, true),
+            Field::new("active", DataType::Boolean, true),
+            Field::new("event_time", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+        ])
+    }
+
     #[test]
     fn parse_simple_ndjson() {
         let schema = Schema::new(vec![
@@ -139,5 +149,96 @@ mod tests {
             .unwrap();
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 2);
+    }
+
+    #[test]
+    fn empty_lines_returns_none() {
+        let schema = test_schema();
+        let result = ndjson_to_record_batch(&[], &schema).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn null_fields_become_null() {
+        let schema = test_schema();
+        let lines = vec![
+            r#"{"sip":null,"dport":null,"score":null,"active":null,"event_time":null}"#.to_string(),
+        ];
+        let batch = ndjson_to_record_batch(&lines, &schema)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 5);
+    }
+
+    #[test]
+    fn float_and_bool_types() {
+        let schema = Schema::new(vec![
+            Field::new("score", DataType::Float64, true),
+            Field::new("active", DataType::Boolean, true),
+        ]);
+        let lines = vec![
+            r#"{"score":70.5,"active":true}"#.to_string(),
+            r#"{"score":0.0,"active":false}"#.to_string(),
+            r#"{"score":"99.9","active":"true"}"#.to_string(), // string→number, string→bool
+        ];
+        let batch = ndjson_to_record_batch(&lines, &schema)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 2);
+    }
+
+    #[test]
+    fn timestamp_from_rfc3339() {
+        let schema = Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+        ]);
+        let lines = vec![
+            r#"{"ts":"2026-01-01T00:00:00Z"}"#.to_string(),
+            r#"{"ts":"2026-01-01T00:00:01Z"}"#.to_string(),
+        ];
+        let batch = ndjson_to_record_batch(&lines, &schema)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    #[test]
+    fn missing_field_defaults_to_null() {
+        let schema = Schema::new(vec![
+            Field::new("sip", DataType::Utf8, true),
+            Field::new("dport", DataType::Int64, true),
+        ]);
+        let lines = vec![
+            r#"{"sip":"10.0.0.1"}"#.to_string(), // dport missing
+        ];
+        let batch = ndjson_to_record_batch(&lines, &schema)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    #[test]
+    fn invalid_json_returns_error() {
+        let schema = test_schema();
+        let lines = vec!["not json".to_string()];
+        let result = ndjson_to_record_batch(&lines, &schema);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn extra_fields_are_ignored() {
+        let schema = Schema::new(vec![
+            Field::new("sip", DataType::Utf8, true),
+        ]);
+        let lines = vec![
+            r#"{"sip":"10.0.0.1","extra_field":"ignored","another":42}"#.to_string(),
+        ];
+        let batch = ndjson_to_record_batch(&lines, &schema)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 1);
     }
 }

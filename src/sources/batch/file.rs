@@ -168,3 +168,73 @@ impl DataSource for SimpleFileSource {
         self.key.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field};
+    use tempfile::NamedTempFile;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn file_batch_source_identifier() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("msg", DataType::Utf8, true),
+        ]));
+        let src = FileBatchSource::new(
+            "test_key",
+            Box::new(SimpleFileSource::open("Cargo.toml").await.unwrap()),
+            schema,
+        );
+        assert_eq!(src.identifier(), "test_key");
+    }
+
+    #[tokio::test]
+    async fn file_batch_source_lifecycle() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, r#"{{"msg":"hello"}}"#).unwrap();
+        writeln!(tmp, r#"{{"msg":"world"}}"#).unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("msg", DataType::Utf8, true),
+        ]));
+        let mut src = FileBatchSource::new(
+            "test",
+            Box::new(SimpleFileSource::open(&path).await.unwrap()),
+            schema,
+        );
+
+        // Start
+        src.start().await.unwrap();
+
+        // Receive — should get a batch with 2 rows
+        let batches = src.receive_batch().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+
+        // After EOF, should get EOF error
+        let result = src.receive_batch().await;
+        assert!(result.is_err());
+
+        // Close is idempotent
+        src.close().await.unwrap();
+        src.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_batch_source_empty_file() {
+        let tmp = NamedTempFile::new().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("msg", DataType::Utf8, true),
+        ]));
+        let mut src = FileBatchSource::new(
+            "empty",
+            Box::new(SimpleFileSource::open(tmp.path()).await.unwrap()),
+            schema,
+        );
+        src.start().await.unwrap();
+        let result = src.receive_batch().await;
+        assert!(result.is_err()); // EOF immediately
+    }
+}
