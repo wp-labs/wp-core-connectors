@@ -27,7 +27,6 @@ fn resolve_file_path(spec: &SinkSpec, ctx: &SinkBuildCtx) -> SinkResult<String> 
         .to_string())
 }
 
-
 pub struct FileFactory;
 
 #[async_trait]

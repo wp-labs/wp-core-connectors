@@ -52,8 +52,12 @@ fn wp_type_to_arrow(dt: &wp_model_core::model::DataType) -> arrow::datatypes::Da
         WpDt::Bool => arrow::datatypes::DataType::Boolean,
         WpDt::Digit => arrow::datatypes::DataType::Int64,
         WpDt::Float => arrow::datatypes::DataType::Float64,
-        WpDt::Time | WpDt::TimeISO | WpDt::TimeRFC3339 | WpDt::TimeRFC2822
-            | WpDt::TimeTIMESTAMP | WpDt::TimeCLF => {
+        WpDt::Time
+        | WpDt::TimeISO
+        | WpDt::TimeRFC3339
+        | WpDt::TimeRFC2822
+        | WpDt::TimeTIMESTAMP
+        | WpDt::TimeCLF => {
             arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
         }
         // Ip, Hex, IpNet, Domain, Email, Chars, Symbol, etc → Utf8
@@ -140,10 +144,7 @@ pub fn data_records_to_batch(
 }
 
 /// Build a single column array for a schema field from the given records.
-fn build_column_from_field(
-    field: &Field,
-    records: &[Arc<DataRecord>],
-) -> SinkResult<ArrayRef> {
+fn build_column_from_field(field: &Field, records: &[Arc<DataRecord>]) -> SinkResult<ArrayRef> {
     let field_name = field.name();
     match field.data_type() {
         DataType::Boolean => {
@@ -160,7 +161,10 @@ fn build_column_from_field(
         DataType::Int64 => {
             let mut builder = Int64Builder::with_capacity(records.len());
             for record in records {
-                match record.field(field_name).and_then(|f| parse_digit(f.get_value())) {
+                match record
+                    .field(field_name)
+                    .and_then(|f| parse_digit(f.get_value()))
+                {
                     Some(v) => builder.append_value(v),
                     None => builder.append_null(),
                 }
@@ -170,7 +174,10 @@ fn build_column_from_field(
         DataType::Float64 => {
             let mut builder = Float64Builder::with_capacity(records.len());
             for record in records {
-                match record.field(field_name).and_then(|f| parse_float(f.get_value())) {
+                match record
+                    .field(field_name)
+                    .and_then(|f| parse_float(f.get_value()))
+                {
                     Some(v) => builder.append_value(v),
                     None => builder.append_null(),
                 }
@@ -180,7 +187,10 @@ fn build_column_from_field(
         DataType::Timestamp(TimeUnit::Nanosecond, None) => {
             let mut builder = TimestampNanosecondBuilder::with_capacity(records.len());
             for record in records {
-                match record.field(field_name).and_then(|f| parse_timestamp_ns(f.get_value())) {
+                match record
+                    .field(field_name)
+                    .and_then(|f| parse_timestamp_ns(f.get_value()))
+                {
                     Some(v) => builder.append_value(v),
                     None => builder.append_null(),
                 }
@@ -243,9 +253,9 @@ fn empty_column_for_type(data_type: &DataType, _capacity: usize) -> Result<Array
         DataType::Boolean => Arc::new(arrow::array::BooleanArray::from(Vec::<bool>::new())),
         DataType::Int64 => Arc::new(arrow::array::Int64Array::from(Vec::<i64>::new())),
         DataType::Float64 => Arc::new(arrow::array::Float64Array::from(Vec::<f64>::new())),
-        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
-            Arc::new(arrow::array::TimestampNanosecondArray::from(Vec::<i64>::new()))
-        }
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => Arc::new(
+            arrow::array::TimestampNanosecondArray::from(Vec::<i64>::new()),
+        ),
         _ => Arc::new(arrow::array::StringArray::from(Vec::<Option<&str>>::new())),
     };
     Ok(arr)
@@ -339,7 +349,7 @@ mod tests {
         let rec = DataRecord::from(vec![
             FieldStorage::from(ModelField::from_bool("active", true)),
             FieldStorage::from(ModelField::from_digit("count", 42)),
-            FieldStorage::from(ModelField::from_float("score", 3.14)),
+            FieldStorage::from(ModelField::from_float("score", 2.71)),
             FieldStorage::from(ModelField::from_chars("name", "alice")),
         ]);
 
@@ -355,9 +365,7 @@ mod tests {
     fn infer_schema_include_time_type() {
         use chrono::NaiveDateTime;
         let dt = NaiveDateTime::parse_from_str("2026-06-13 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
-        let rec = DataRecord::from(vec![
-            FieldStorage::from(ModelField::from_time("ts", dt)),
-        ]);
+        let rec = DataRecord::from(vec![FieldStorage::from(ModelField::from_time("ts", dt))]);
         let schema = infer_schema_from_record(&rec);
         assert_eq!(
             schema.field(0).data_type(),
@@ -369,37 +377,49 @@ mod tests {
 
     #[test]
     fn typed_batch_bool_column() {
-        let rec = DataRecord::from(vec![
-            FieldStorage::from(ModelField::from_bool("flag", true)),
-        ]);
+        let rec = DataRecord::from(vec![FieldStorage::from(ModelField::from_bool(
+            "flag", true,
+        ))]);
         let schema = Arc::new(infer_schema_from_record(&rec));
         let batch = data_record_to_batch(&rec, &schema).unwrap();
 
-        let col = batch.column(0).as_any().downcast_ref::<arrow::array::BooleanArray>().unwrap();
-        assert_eq!(col.value(0), true);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+        assert!(col.value(0));
     }
 
     #[test]
     fn typed_batch_digit_column() {
-        let rec = DataRecord::from(vec![
-            FieldStorage::from(ModelField::from_digit("count", 99)),
-        ]);
+        let rec = DataRecord::from(vec![FieldStorage::from(ModelField::from_digit(
+            "count", 99,
+        ))]);
         let schema = Arc::new(infer_schema_from_record(&rec));
         let batch = data_record_to_batch(&rec, &schema).unwrap();
 
-        let col = batch.column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
         assert_eq!(col.value(0), 99);
     }
 
     #[test]
     fn typed_batch_float_column() {
-        let rec = DataRecord::from(vec![
-            FieldStorage::from(ModelField::from_float("score", 2.5)),
-        ]);
+        let rec = DataRecord::from(vec![FieldStorage::from(ModelField::from_float(
+            "score", 2.5,
+        ))]);
         let schema = Arc::new(infer_schema_from_record(&rec));
         let batch = data_record_to_batch(&rec, &schema).unwrap();
 
-        let col = batch.column(0).as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
         assert!((col.value(0) - 2.5).abs() < 0.001);
     }
 
@@ -411,15 +431,19 @@ mod tests {
 
         let records: Vec<Arc<DataRecord>> = (0..5)
             .map(|i| {
-                Arc::new(DataRecord::from(vec![
-                    FieldStorage::from(ModelField::from_digit("v", i)),
-                ]))
+                Arc::new(DataRecord::from(vec![FieldStorage::from(
+                    ModelField::from_digit("v", i),
+                )]))
             })
             .collect();
 
         let batch = data_records_to_batch(&records, &schema).unwrap();
         assert_eq!(batch.num_rows(), 5);
-        let col = batch.column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
         for i in 0..5 {
             assert_eq!(col.value(i), i as i64);
         }
@@ -454,21 +478,28 @@ mod tests {
 
     #[test]
     fn boolean_builder_chars_fallback() {
-        let rec = DataRecord::from(vec![
-            FieldStorage::from(ModelField::from_chars("flag", "TRUE")),
-        ]);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("flag", DataType::Boolean, true),
-        ]));
+        let rec = DataRecord::from(vec![FieldStorage::from(ModelField::from_chars(
+            "flag", "TRUE",
+        ))]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Boolean,
+            true,
+        )]));
         let batch = data_record_to_batch(&rec, &schema).unwrap();
-        let col = batch.column(0).as_any().downcast_ref::<arrow::array::BooleanArray>().unwrap();
-        assert_eq!(col.value(0), true);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+        assert!(col.value(0));
     }
 
     #[test]
     fn parse_float_from_chars_fallback() {
-        let v = Value::Chars("3.14".into());
-        assert_eq!(parse_float(&v), Some(3.14));
+        let v = Value::Chars("2.71".into());
+        let result = parse_float(&v).unwrap();
+        assert!((result - 2.71).abs() < 0.001);
     }
 
     #[test]
@@ -504,9 +535,7 @@ mod tests {
 
     #[test]
     fn typed_batch_null_on_missing_field() {
-        let rec = DataRecord::from(vec![
-            FieldStorage::from(ModelField::from_digit("x", 1)),
-        ]);
+        let rec = DataRecord::from(vec![FieldStorage::from(ModelField::from_digit("x", 1))]);
         // Schema expects "x" and "y", but "y" is missing
         let schema = Arc::new(Schema::new(vec![
             Field::new("x", DataType::Int64, true),
@@ -514,7 +543,11 @@ mod tests {
         ]));
         let batch = data_record_to_batch(&rec, &schema).unwrap();
         assert_eq!(batch.num_columns(), 2);
-        let y = batch.column(1).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap();
+        let y = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
         assert!(y.is_null(0));
     }
 }

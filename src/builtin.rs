@@ -205,11 +205,7 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             id: "tcp_arrow_sink".into(),
             kind: "tcp".into(),
             scope: ConnectorScope::Sink,
-            allow_override: vec![
-                "addr".into(),
-                "port".into(),
-                "protocol".into(),
-            ],
+            allow_override: vec!["addr".into(), "port".into(), "protocol".into()],
             default_params: params,
             origin: Some("builtin:tcp_arrow_sink".into()),
         });

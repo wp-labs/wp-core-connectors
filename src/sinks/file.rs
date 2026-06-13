@@ -727,8 +727,7 @@ mod tests {
 
         // Write
         {
-            let mut sink =
-                ArrowFileSink::new(path.to_string_lossy().as_ref(), false).unwrap();
+            let mut sink = ArrowFileSink::new(path.to_string_lossy().as_ref(), false).unwrap();
 
             let recs: Vec<Arc<DataRecord>> = vec![
                 Arc::new(DataRecord::from(vec![
@@ -794,8 +793,7 @@ mod tests {
         let path = tmp_arrow_path("empty");
 
         {
-            let mut sink =
-                ArrowFileSink::new(path.to_string_lossy().as_ref(), false).unwrap();
+            let mut sink = ArrowFileSink::new(path.to_string_lossy().as_ref(), false).unwrap();
 
             // Empty sink_records should be a no-op
             sink.sink_records(Vec::new()).await.unwrap();
@@ -814,8 +812,7 @@ mod tests {
 
         // First open: write one record
         {
-            let mut sink =
-                ArrowFileSink::new(path.to_string_lossy().as_ref(), false).unwrap();
+            let mut sink = ArrowFileSink::new(path.to_string_lossy().as_ref(), false).unwrap();
 
             let rec = Arc::new(DataRecord::from(vec![FieldStorage::from(
                 ModelField::from_chars("v", "first"),
@@ -828,8 +825,7 @@ mod tests {
 
         // Second open: append another record
         {
-            let mut sink =
-                ArrowFileSink::new(path.to_string_lossy().as_ref(), false).unwrap();
+            let mut sink = ArrowFileSink::new(path.to_string_lossy().as_ref(), false).unwrap();
 
             let rec = Arc::new(DataRecord::from(vec![FieldStorage::from(
                 ModelField::from_chars("v", "second"),
