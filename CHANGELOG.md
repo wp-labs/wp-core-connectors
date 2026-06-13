@@ -7,6 +7,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-06-13
+
+### Added
+
+- Arrow sink 支持类型化字段：schema 从 DataRecord 自动推断真实类型（Bool→Boolean, Digit→Int64, Float→Float64, Time→Timestamp, 其余→Utf8）
+
 ## [0.3.5] - 2026-06-13
 
 ### Changed
