@@ -782,4 +782,69 @@ mod tests {
         assert_eq!(body, b"5 hello");
         Ok(())
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_arrow_roundtrip_stream() -> anyhow::Result<()> {
+        // TcpArrowSink sends Arrow IPC Stream → receiver decodes via read_arrow_stream_batches
+        use crate::sources::batch::tcp::read_arrow_stream_batches;
+
+        use wp_model_core::model::{Field, FieldStorage};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+
+        // Receiver: accept connection, read Arrow IPC Stream
+        let srv = std::thread::spawn(move || {
+            let (stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+            let reader = std::io::BufReader::new(&stream);
+            let batches: Vec<_> = read_arrow_stream_batches(reader)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok::<_, anyhow::Error>(batches)
+        });
+
+        // Sender: build TcpArrowSink and send records
+        let fac = TcpFactory;
+        let mut params = toml::map::Map::new();
+        params.insert("protocol".into(), toml::Value::String("arrow".into()));
+        params.insert("addr".into(), toml::Value::String("127.0.0.1".into()));
+        params.insert("port".into(), toml::Value::Integer(port as i64));
+        let spec = wp_connector_api::SinkSpec {
+            group: String::new(),
+            name: "t".into(),
+            kind: "tcp".into(),
+            connector_id: String::new(),
+            params: wp_connector_api::parammap_from_toml_map(params),
+            filter: None,
+        };
+        let ctx = wp_connector_api::SinkBuildCtx::new(std::env::current_dir().unwrap());
+        let mut h = fac
+            .build(&spec, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let rec1 = Arc::new(DataRecord::from(vec![
+            FieldStorage::from(Field::from_chars("name", "alice")),
+            FieldStorage::from(Field::from_digit("count", 42)),
+        ]));
+        let rec2 = Arc::new(DataRecord::from(vec![
+            FieldStorage::from(Field::from_chars("name", "bob")),
+            FieldStorage::from(Field::from_digit("count", 7)),
+        ]));
+        // Single sink_records call with 2 records → one IPC stream, 2 rows
+        h.sink
+            .as_mut()
+            .sink_records(vec![rec1, rec2])
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        drop(h);
+
+        let batches = srv.join().unwrap()?;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2, "2 records in one batch");
+        assert_eq!(batches[0].num_columns(), 2);
+        Ok(())
+    }
 }

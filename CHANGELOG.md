@@ -7,6 +7,20 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-13
+
+### Added
+
+- Arrow 类型映射全覆盖：35 个 DataType 变体全部显式映射（Port→Int32, Hex/Base64→Binary, 其余→Utf8）
+- `format_utf8_value`：Obj/Array 序列化为 JSON
+- `to_raw_bytes`：Hex 值提取原始字节用于 Binary 列
+- `infer_schema_from_record` 过滤 Ignore 字段
+- Arrow source 测试：typed columns roundtrip、empty stream
+
+### Changed
+
+- `arrow_conv.rs` 拆分为 `arrow_conv/{mod,schema,batch}.rs`
+
 ## [0.3.6] - 2026-06-13
 
 ### Added

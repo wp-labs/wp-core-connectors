@@ -1,8 +1,10 @@
+//! `DataRecord` → `RecordBatch` conversion with typed column builders.
+
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
-    TimestampNanosecondBuilder,
+    ArrayRef, BinaryBuilder, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder,
+    StringBuilder, TimestampNanosecondBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -12,81 +14,13 @@ use wp_model_core::model::DataRecord;
 use wp_model_core::model::Value;
 
 // ---------------------------------------------------------------------------
-// Shared error helper
-// ---------------------------------------------------------------------------
-
-pub(crate) fn sink_err<E>(msg: &'static str, err: E) -> wp_connector_api::SinkError
-where
-    E: std::fmt::Display,
-{
-    SinkReason::Sink
-        .to_err()
-        .with_detail(format!("{msg}: {err}"))
-}
-
-// ---------------------------------------------------------------------------
-// Schema inference
-// ---------------------------------------------------------------------------
-
-/// Infer an Arrow schema from field names.
-///
-/// All fields default to `Utf8` (conservative).
-pub fn infer_arrow_schema(fields: &[String]) -> Schema {
-    Schema::new(
-        fields
-            .iter()
-            .map(|f| Field::new(f.as_str(), DataType::Utf8, true))
-            .collect::<Vec<_>>(),
-    )
-}
-
-/// Infer an Arrow schema automatically from a [`DataRecord`]'s fields.
-///
-/// All fields default to `Utf8` (conservative). Use this instead of
-/// `infer_arrow_schema` when the field names should be derived from
-/// the data itself rather than passed externally.
-/// Map wp_model_core DataType to Arrow DataType.
-fn wp_type_to_arrow(dt: &wp_model_core::model::DataType) -> arrow::datatypes::DataType {
-    use wp_model_core::model::DataType as WpDt;
-    match dt {
-        WpDt::Bool => arrow::datatypes::DataType::Boolean,
-        WpDt::Digit => arrow::datatypes::DataType::Int64,
-        WpDt::Float => arrow::datatypes::DataType::Float64,
-        WpDt::Time
-        | WpDt::TimeISO
-        | WpDt::TimeRFC3339
-        | WpDt::TimeRFC2822
-        | WpDt::TimeTIMESTAMP
-        | WpDt::TimeCLF => {
-            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
-        }
-        // Ip, Hex, IpNet, Domain, Email, Chars, Symbol, etc → Utf8
-        _ => arrow::datatypes::DataType::Utf8,
-    }
-}
-
-/// Infer an Arrow schema from a DataRecord using actual field types (get_meta()).
-pub fn infer_schema_from_record(record: &DataRecord) -> Schema {
-    Schema::new(
-        record
-            .items
-            .iter()
-            .map(|f| {
-                let arrow_type = wp_type_to_arrow(f.get_meta());
-                Field::new(f.get_name(), arrow_type, true)
-            })
-            .collect::<Vec<_>>(),
-    )
-}
-
-// ---------------------------------------------------------------------------
 // DataRecord → RecordBatch
 // ---------------------------------------------------------------------------
 
 /// Convert a single `DataRecord` into an Arrow `RecordBatch`.
 ///
 /// Each field in the schema is looked up by name in the record.
-/// Missing fields default to an empty string.
+/// Missing fields default to null.
 pub fn data_record_to_batch(record: &DataRecord, schema: &Arc<Schema>) -> SinkResult<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
@@ -111,7 +45,6 @@ pub fn data_records_to_batch(
     schema: &Arc<Schema>,
 ) -> SinkResult<RecordBatch> {
     if records.is_empty() {
-        // Return an empty batch with the given schema
         let empty_columns: Vec<ArrayRef> = schema
             .fields()
             .iter()
@@ -143,7 +76,10 @@ pub fn data_records_to_batch(
     })
 }
 
-/// Build a single column array for a schema field from the given records.
+// ---------------------------------------------------------------------------
+// Column builders
+// ---------------------------------------------------------------------------
+
 fn build_column_from_field(field: &Field, records: &[Arc<DataRecord>]) -> SinkResult<ArrayRef> {
     let field_name = field.name();
     match field.data_type() {
@@ -166,6 +102,32 @@ fn build_column_from_field(field: &Field, records: &[Arc<DataRecord>]) -> SinkRe
                     .and_then(|f| parse_digit(f.get_value()))
                 {
                     Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Int32 => {
+            let mut builder = Int32Builder::with_capacity(records.len());
+            for record in records {
+                match record
+                    .field(field_name)
+                    .and_then(|f| parse_digit(f.get_value()))
+                {
+                    Some(v) => builder.append_value(v as i32),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Binary => {
+            let mut builder = BinaryBuilder::with_capacity(records.len(), records.len() * 64);
+            for record in records {
+                match record.field(field_name).map(|f| f.get_value()) {
+                    Some(v) => {
+                        let bytes = to_raw_bytes(v);
+                        builder.append_value(&bytes[..]);
+                    }
                     None => builder.append_null(),
                 }
             }
@@ -202,7 +164,7 @@ fn build_column_from_field(field: &Field, records: &[Arc<DataRecord>]) -> SinkRe
             let mut builder = StringBuilder::with_capacity(records.len(), records.len() * 32);
             for record in records {
                 match record.field(field_name) {
-                    Some(f) => builder.append_value(f.get_value().to_string()),
+                    Some(f) => builder.append_value(format_utf8_value(f.get_value())),
                     None => builder.append_null(),
                 }
             }
@@ -210,6 +172,44 @@ fn build_column_from_field(field: &Field, records: &[Arc<DataRecord>]) -> SinkRe
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Value formatting
+// ---------------------------------------------------------------------------
+
+/// Format a [`Value`] for Utf8 column output.
+///
+/// Complex types (`Obj`, `Array`) are serialized as JSON; all others use [`Display`].
+fn format_utf8_value(v: &Value) -> String {
+    match v {
+        Value::Obj(_) | Value::Array(_) => {
+            serde_json::to_string(v).unwrap_or_else(|_| format!("{v:?}"))
+        }
+        _ => v.to_string(),
+    }
+}
+
+/// Convert a [`Value`] to raw bytes for Binary column output.
+///
+/// `Value::Hex` stores the decoded value as `u128` — extract minimal big-endian bytes.
+/// All other types fall back to the UTF-8 string representation.
+fn to_raw_bytes(v: &Value) -> Vec<u8> {
+    match v {
+        Value::Hex(h) => {
+            if h.0 == 0 {
+                return vec![0];
+            }
+            let be = h.0.to_be_bytes();
+            let start = be.iter().position(|&b| b != 0).unwrap();
+            be[start..].to_vec()
+        }
+        _ => format_utf8_value(v).into_bytes(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parse helpers — extract typed values with Chars fallback
+// ---------------------------------------------------------------------------
 
 fn parse_digit(v: &Value) -> Option<i64> {
     match v {
@@ -232,30 +232,33 @@ fn parse_float(v: &Value) -> Option<f64> {
 fn parse_timestamp_ns(v: &Value) -> Option<i64> {
     match v {
         Value::Time(t) => Some(t.and_utc().timestamp_nanos_opt()?),
-        Value::Digit(d) => d.checked_mul(1_000_000), // millis → nanos
-        Value::Chars(s) => {
-            // Try RFC3339 or simple format
-            chrono::DateTime::parse_from_rfc3339(s)
-                .ok()
-                .or_else(|| {
-                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                        .ok()
-                        .map(|dt| dt.and_utc().fixed_offset())
-                })
-                .and_then(|dt| dt.timestamp_nanos_opt())
-        }
+        Value::Digit(d) => d.checked_mul(1_000_000),
+        Value::Chars(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .or_else(|| {
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                    .ok()
+                    .map(|dt| dt.and_utc().fixed_offset())
+            })
+            .and_then(|dt| dt.timestamp_nanos_opt()),
         _ => None,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Empty column helpers
+// ---------------------------------------------------------------------------
+
 fn empty_column_for_type(data_type: &DataType, _capacity: usize) -> Result<ArrayRef, String> {
     let arr: ArrayRef = match data_type {
         DataType::Boolean => Arc::new(arrow::array::BooleanArray::from(Vec::<bool>::new())),
+        DataType::Int32 => Arc::new(arrow::array::Int32Array::from(Vec::<i32>::new())),
         DataType::Int64 => Arc::new(arrow::array::Int64Array::from(Vec::<i64>::new())),
         DataType::Float64 => Arc::new(arrow::array::Float64Array::from(Vec::<f64>::new())),
         DataType::Timestamp(TimeUnit::Nanosecond, None) => Arc::new(
             arrow::array::TimestampNanosecondArray::from(Vec::<i64>::new()),
         ),
+        DataType::Binary => Arc::new(arrow::array::BinaryArray::from(Vec::<Option<&[u8]>>::new())),
         _ => Arc::new(arrow::array::StringArray::from(Vec::<Option<&str>>::new())),
     };
     Ok(arr)
@@ -265,23 +268,15 @@ fn empty_column_for_type(data_type: &DataType, _capacity: usize) -> Result<Array
 mod tests {
     use super::*;
     use arrow::array::Array;
-    use wp_model_core::model::{Field as ModelField, FieldStorage};
 
-    #[test]
-    fn infer_schema_all_utf8() {
-        let fields = vec!["name".to_string(), "count".to_string()];
-        let schema = infer_arrow_schema(&fields);
-        assert_eq!(schema.fields().len(), 2);
-        for f in schema.fields() {
-            assert_eq!(f.data_type(), &DataType::Utf8);
-            assert!(f.is_nullable());
-        }
-    }
+    use wp_model_core::model::{Field as ModelField, FieldStorage};
 
     #[test]
     fn data_record_to_batch_roundtrip() {
         let fields = vec!["name".to_string(), "count".to_string()];
-        let schema = Arc::new(infer_arrow_schema(&fields));
+        let schema = Arc::new(crate::sinks::arrow_conv::schema::infer_arrow_schema(
+            &fields,
+        ));
 
         let rec = DataRecord::from(vec![
             FieldStorage::from(ModelField::from_chars("name", "alice")),
@@ -294,9 +289,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_field_defaults_to_empty() {
+    fn missing_field_defaults_to_null() {
         let fields = vec!["present".to_string(), "missing".to_string()];
-        let schema = Arc::new(infer_arrow_schema(&fields));
+        let schema = Arc::new(crate::sinks::arrow_conv::schema::infer_arrow_schema(
+            &fields,
+        ));
 
         let rec = DataRecord::from(vec![FieldStorage::from(ModelField::from_chars(
             "present", "hello",
@@ -310,7 +307,9 @@ mod tests {
     #[test]
     fn data_records_to_batch_multiple_rows() {
         let fields = vec!["name".to_string(), "count".to_string()];
-        let schema = Arc::new(infer_arrow_schema(&fields));
+        let schema = Arc::new(crate::sinks::arrow_conv::schema::infer_arrow_schema(
+            &fields,
+        ));
 
         let records: Vec<Arc<DataRecord>> = vec![
             Arc::new(DataRecord::from(vec![
@@ -335,54 +334,23 @@ mod tests {
     #[test]
     fn data_records_to_batch_empty() {
         let fields = vec!["x".to_string()];
-        let schema = Arc::new(infer_arrow_schema(&fields));
-
+        let schema = Arc::new(crate::sinks::arrow_conv::schema::infer_arrow_schema(
+            &fields,
+        ));
         let batch = data_records_to_batch(&[], &schema).unwrap();
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 1);
     }
-
-    // -- Typed schema inference -------------------------------------------
-
-    #[test]
-    fn infer_schema_from_record_uses_actual_types() {
-        let rec = DataRecord::from(vec![
-            FieldStorage::from(ModelField::from_bool("active", true)),
-            FieldStorage::from(ModelField::from_digit("count", 42)),
-            FieldStorage::from(ModelField::from_float("score", 2.71)),
-            FieldStorage::from(ModelField::from_chars("name", "alice")),
-        ]);
-
-        let schema = infer_schema_from_record(&rec);
-        assert_eq!(schema.fields().len(), 4);
-        assert_eq!(schema.field(0).data_type(), &DataType::Boolean);
-        assert_eq!(schema.field(1).data_type(), &DataType::Int64);
-        assert_eq!(schema.field(2).data_type(), &DataType::Float64);
-        assert_eq!(schema.field(3).data_type(), &DataType::Utf8);
-    }
-
-    #[test]
-    fn infer_schema_include_time_type() {
-        use chrono::NaiveDateTime;
-        let dt = NaiveDateTime::parse_from_str("2026-06-13 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
-        let rec = DataRecord::from(vec![FieldStorage::from(ModelField::from_time("ts", dt))]);
-        let schema = infer_schema_from_record(&rec);
-        assert_eq!(
-            schema.field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Nanosecond, None)
-        );
-    }
-
-    // -- Typed column building --------------------------------------------
 
     #[test]
     fn typed_batch_bool_column() {
         let rec = DataRecord::from(vec![FieldStorage::from(ModelField::from_bool(
             "flag", true,
         ))]);
-        let schema = Arc::new(infer_schema_from_record(&rec));
+        let schema = Arc::new(crate::sinks::arrow_conv::schema::infer_schema_from_record(
+            &rec,
+        ));
         let batch = data_record_to_batch(&rec, &schema).unwrap();
-
         let col = batch
             .column(0)
             .as_any()
@@ -396,9 +364,10 @@ mod tests {
         let rec = DataRecord::from(vec![FieldStorage::from(ModelField::from_digit(
             "count", 99,
         ))]);
-        let schema = Arc::new(infer_schema_from_record(&rec));
+        let schema = Arc::new(crate::sinks::arrow_conv::schema::infer_schema_from_record(
+            &rec,
+        ));
         let batch = data_record_to_batch(&rec, &schema).unwrap();
-
         let col = batch
             .column(0)
             .as_any()
@@ -412,9 +381,10 @@ mod tests {
         let rec = DataRecord::from(vec![FieldStorage::from(ModelField::from_float(
             "score", 2.5,
         ))]);
-        let schema = Arc::new(infer_schema_from_record(&rec));
+        let schema = Arc::new(crate::sinks::arrow_conv::schema::infer_schema_from_record(
+            &rec,
+        ));
         let batch = data_record_to_batch(&rec, &schema).unwrap();
-
         let col = batch
             .column(0)
             .as_any()
@@ -425,9 +395,9 @@ mod tests {
 
     #[test]
     fn typed_batch_multi_row() {
-        let schema = Arc::new(infer_schema_from_record(&DataRecord::from(vec![
-            FieldStorage::from(ModelField::from_digit("v", 0)),
-        ])));
+        let schema = Arc::new(crate::sinks::arrow_conv::schema::infer_schema_from_record(
+            &DataRecord::from(vec![FieldStorage::from(ModelField::from_digit("v", 0))]),
+        ));
 
         let records: Vec<Arc<DataRecord>> = (0..5)
             .map(|i| {
@@ -470,10 +440,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_timestamp_ns_from_digit_millis() {
-        let v = Value::Digit(1_700_000_000_000_i64); // millis
+    fn parse_float_from_chars_fallback() {
+        let v = Value::Chars("2.71".into());
+        let result = parse_float(&v).unwrap();
+        assert!((result - 2.71).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_float_from_digit() {
+        let v = Value::Digit(42);
+        assert_eq!(parse_float(&v), Some(42.0));
+    }
+
+    #[test]
+    fn parse_timestamp_ns_from_rfc3339() {
+        let v = Value::Chars("2026-06-13T12:00:00+00:00".into());
         let ns = parse_timestamp_ns(&v);
-        assert_eq!(ns, Some(1_700_000_000_000_000_000_i64)); // nanos
+        assert!(ns.is_some(), "should parse RFC3339");
+    }
+
+    #[test]
+    fn parse_timestamp_ns_from_digit_millis() {
+        let v = Value::Digit(1_700_000_000_000_i64);
+        let ns = parse_timestamp_ns(&v);
+        assert_eq!(ns, Some(1_700_000_000_000_000_000_i64));
     }
 
     #[test]
@@ -495,24 +485,36 @@ mod tests {
         assert!(col.value(0));
     }
 
+    // -- Hex → raw bytes -------------------------------------------------
+
     #[test]
-    fn parse_float_from_chars_fallback() {
-        let v = Value::Chars("2.71".into());
-        let result = parse_float(&v).unwrap();
-        assert!((result - 2.71).abs() < 0.001);
+    fn hex_value_to_binary_raw_bytes() {
+        let v = Value::Hex(wp_model_core::model::types::value::HexT(0x1A2B));
+        let bytes = to_raw_bytes(&v);
+        assert_eq!(bytes, vec![0x1A, 0x2B]);
     }
 
     #[test]
-    fn parse_float_from_digit() {
-        let v = Value::Digit(42);
-        assert_eq!(parse_float(&v), Some(42.0));
+    fn hex_zero_value_to_binary() {
+        let v = Value::Hex(wp_model_core::model::types::value::HexT(0));
+        let bytes = to_raw_bytes(&v);
+        assert_eq!(bytes, vec![0]);
     }
 
     #[test]
-    fn parse_timestamp_ns_from_rfc3339() {
-        let v = Value::Chars("2026-06-13T12:00:00+00:00".into());
-        let ns = parse_timestamp_ns(&v);
-        assert!(ns.is_some(), "should parse RFC3339");
+    fn chars_falls_back_to_string_bytes_for_binary() {
+        let v = Value::Chars("hello".into());
+        let bytes = to_raw_bytes(&v);
+        assert_eq!(bytes, b"hello");
+    }
+
+    // -- Obj → JSON -------------------------------------------------------
+
+    #[test]
+    fn obj_value_formatted_as_json() {
+        let v = Value::Obj(wp_model_core::model::types::value::ObjectValue::default());
+        let s = format_utf8_value(&v);
+        assert!(s.starts_with('{') || s == "{}", "expected JSON, got: {s}");
     }
 
     // -- Empty column helpers ---------------------------------------------
@@ -521,9 +523,11 @@ mod tests {
     fn empty_column_for_each_supported_type() {
         for dt in &[
             DataType::Boolean,
+            DataType::Int32,
             DataType::Int64,
             DataType::Float64,
             DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Binary,
             DataType::Utf8,
         ] {
             let arr = empty_column_for_type(dt, 0).unwrap();
@@ -536,7 +540,6 @@ mod tests {
     #[test]
     fn typed_batch_null_on_missing_field() {
         let rec = DataRecord::from(vec![FieldStorage::from(ModelField::from_digit("x", 1))]);
-        // Schema expects "x" and "y", but "y" is missing
         let schema = Arc::new(Schema::new(vec![
             Field::new("x", DataType::Int64, true),
             Field::new("y", DataType::Int64, true),
