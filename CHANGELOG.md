@@ -7,6 +7,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-06-13
+
+### Changed
+
+- 所有 sink def 的 `allow_override` 增加 `"protocol"` 参数
+
 ## [0.3.3] - 2026-06-12
 
 ### Added

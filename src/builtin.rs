@@ -12,7 +12,7 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             id: "blackhole_sink".into(),
             kind: "blackhole".into(),
             scope: ConnectorScope::Sink,
-            allow_override: vec!["sleep_ms".into()],
+            allow_override: vec!["sleep_ms".into(), "protocol".into()],
             default_params: params,
             origin: Some("builtin:blackhole".into()),
         });
@@ -29,7 +29,12 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             id: "file_json_sink".into(),
             kind: "file".into(),
             scope: ConnectorScope::Sink,
-            allow_override: vec!["base".into(), "file".into(), "sync".into()],
+            allow_override: vec![
+                "base".into(),
+                "file".into(),
+                "sync".into(),
+                "protocol".into(),
+            ],
             default_params: params,
             origin: Some("builtin:file".into()),
         });
@@ -46,7 +51,12 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             id: "file_proto_text_sink".into(),
             kind: "file".into(),
             scope: ConnectorScope::Sink,
-            allow_override: vec!["base".into(), "file".into(), "sync".into()],
+            allow_override: vec![
+                "base".into(),
+                "file".into(),
+                "sync".into(),
+                "protocol".into(),
+            ],
             default_params: params,
             origin: Some("builtin:file".into()),
         });
@@ -63,7 +73,12 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             id: "file_proto_sink".into(),
             kind: "file".into(),
             scope: ConnectorScope::Sink,
-            allow_override: vec!["base".into(), "file".into(), "sync".into()],
+            allow_override: vec![
+                "base".into(),
+                "file".into(),
+                "sync".into(),
+                "protocol".into(),
+            ],
             default_params: params,
             origin: Some("builtin:file".into()),
         });
@@ -80,7 +95,12 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             id: "file_kv_sink".into(),
             kind: "file".into(),
             scope: ConnectorScope::Sink,
-            allow_override: vec!["base".into(), "file".into(), "sync".into()],
+            allow_override: vec![
+                "base".into(),
+                "file".into(),
+                "sync".into(),
+                "protocol".into(),
+            ],
             default_params: params,
             origin: Some("builtin:file".into()),
         });
@@ -97,7 +117,12 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             id: "file_raw_sink".into(),
             kind: "file".into(),
             scope: ConnectorScope::Sink,
-            allow_override: vec!["base".into(), "file".into(), "sync".into()],
+            allow_override: vec![
+                "base".into(),
+                "file".into(),
+                "sync".into(),
+                "protocol".into(),
+            ],
             default_params: params,
             origin: Some("builtin:file".into()),
         });
@@ -137,7 +162,12 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             id: "tcp_sink".into(),
             kind: "tcp".into(),
             scope: ConnectorScope::Sink,
-            allow_override: vec!["addr".into(), "port".into(), "framing".into()],
+            allow_override: vec![
+                "addr".into(),
+                "port".into(),
+                "framing".into(),
+                "protocol".into(),
+            ],
             default_params: params,
             origin: Some("builtin:tcp_sink".into()),
         });
@@ -155,7 +185,13 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             id: "file_arrow_sink".into(),
             kind: "file".into(),
             scope: ConnectorScope::Sink,
-            allow_override: vec!["base".into(), "file".into(), "fields".into(), "sync".into()],
+            allow_override: vec![
+                "base".into(),
+                "file".into(),
+                "fields".into(),
+                "sync".into(),
+                "protocol".into(),
+            ],
             default_params: params,
             origin: Some("builtin:file_arrow_sink".into()),
         });
@@ -172,7 +208,12 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             id: "tcp_arrow_sink".into(),
             kind: "tcp".into(),
             scope: ConnectorScope::Sink,
-            allow_override: vec!["addr".into(), "port".into(), "fields".into()],
+            allow_override: vec![
+                "addr".into(),
+                "port".into(),
+                "fields".into(),
+                "protocol".into(),
+            ],
             default_params: params,
             origin: Some("builtin:tcp_arrow_sink".into()),
         });
@@ -188,7 +229,7 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             id: "file_rescue_sink".into(),
             kind: "test_rescue".into(),
             scope: ConnectorScope::Sink,
-            allow_override: vec!["base".into(), "file".into()],
+            allow_override: vec!["base".into(), "file".into(), "protocol".into()],
             default_params: params,
             origin: Some("builtin:test_rescue".into()),
         });
@@ -320,5 +361,16 @@ mod tests {
             .collect();
         assert!(ids.iter().any(|id| id == "file_json_sink"));
         assert!(ids.iter().any(|id| id == "file_raw_sink"));
+    }
+
+    #[test]
+    fn all_sink_defs_allow_override_protocol() {
+        for def in builtin_sink_defs() {
+            assert!(
+                def.allow_override.iter().any(|k| k == "protocol"),
+                "{} should allow override of 'protocol'",
+                def.id
+            );
+        }
     }
 }
