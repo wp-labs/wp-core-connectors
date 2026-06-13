@@ -179,7 +179,6 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
         params.insert("protocol".into(), json!("arrow"));
         params.insert("base".into(), json!("./data/out_dat"));
         params.insert("file".into(), json!("default.arrow"));
-        params.insert("fields".into(), json!([]));
         params.insert("sync".into(), json!(false));
         defs.push(ConnectorDef {
             id: "file_arrow_sink".into(),
@@ -188,7 +187,6 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             allow_override: vec![
                 "base".into(),
                 "file".into(),
-                "fields".into(),
                 "sync".into(),
                 "protocol".into(),
             ],
@@ -203,7 +201,6 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
         params.insert("protocol".into(), json!("arrow"));
         params.insert("addr".into(), json!("127.0.0.1"));
         params.insert("port".into(), json!(9000));
-        params.insert("fields".into(), json!([]));
         defs.push(ConnectorDef {
             id: "tcp_arrow_sink".into(),
             kind: "tcp".into(),
@@ -211,7 +208,6 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
             allow_override: vec![
                 "addr".into(),
                 "port".into(),
-                "fields".into(),
                 "protocol".into(),
             ],
             default_params: params,

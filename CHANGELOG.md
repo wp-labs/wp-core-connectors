@@ -7,6 +7,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-06-13
+
+### Changed
+
+- Arrow sink 不再依赖外部传入 `fields`，schema 从首条 DataRecord 自动推断
+
 ## [0.3.4] - 2026-06-13
 
 ### Changed

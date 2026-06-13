@@ -27,18 +27,6 @@ fn resolve_file_path(spec: &SinkSpec, ctx: &SinkBuildCtx) -> SinkResult<String> 
         .to_string())
 }
 
-/// Parse field names from a `fields` param (JSON array of strings).
-fn parse_field_names(spec: &SinkSpec) -> Vec<String> {
-    spec.params
-        .get("fields")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 pub struct FileFactory;
 
@@ -66,13 +54,6 @@ impl SinkFactory for FileFactory {
                             .to_err()
                             .with_detail("arrow file sink requires 'file' param")
                     })?;
-                // Ensure 'fields' is present and non-empty
-                let fields = parse_field_names(spec);
-                if fields.is_empty() {
-                    return Err(SinkReason::core_conf().to_err().with_detail(
-                        "arrow file sink requires 'fields' param (non-empty array of field names)",
-                    ));
-                }
                 Ok(())
             }
             "txt" | "" => {
@@ -101,8 +82,7 @@ impl SinkFactory for FileFactory {
                     .get("sync")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let fields = parse_field_names(spec);
-                Box::new(ArrowFileSink::new(&file_path, &fields, sync)?)
+                Box::new(ArrowFileSink::new(&file_path, sync)?)
             }
             "txt" | "" => {
                 let resolved = FileSinkSpec::from_resolved("file", spec)?;

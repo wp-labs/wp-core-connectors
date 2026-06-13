@@ -36,6 +36,21 @@ pub fn infer_arrow_schema(fields: &[String]) -> Schema {
     )
 }
 
+/// Infer an Arrow schema automatically from a [`DataRecord`]'s fields.
+///
+/// All fields default to `Utf8` (conservative). Use this instead of
+/// `infer_arrow_schema` when the field names should be derived from
+/// the data itself rather than passed externally.
+pub fn infer_schema_from_record(record: &DataRecord) -> Schema {
+    Schema::new(
+        record
+            .items
+            .iter()
+            .map(|f| Field::new(f.get_name(), DataType::Utf8, true))
+            .collect::<Vec<_>>(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // DataRecord → RecordBatch
 // ---------------------------------------------------------------------------

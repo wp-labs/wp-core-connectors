@@ -1,6 +1,6 @@
 [package]
 name = "wp-core-connectors"
-version = "0.3.4" #@gxl:set(version)
+version = "0.3.5" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 authors = ["WarpParse Dev Team"]

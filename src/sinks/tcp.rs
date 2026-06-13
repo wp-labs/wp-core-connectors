@@ -16,8 +16,9 @@ use wp_data_fmt::RecordFormatter; // for fmt_record
 use crate::net::transport::{BackoffMode, NetSendPolicy, NetWriter, net_backoff_adaptive};
 
 use super::arrow_conv::{
-    data_record_to_batch, data_records_to_batch, infer_arrow_schema, sink_err,
+    data_record_to_batch, data_records_to_batch, infer_schema_from_record, sink_err,
 };
+use wp_model_core::model::DataRecord;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Framing {
@@ -323,22 +324,6 @@ impl SinkFactory for TcpFactory {
                             .to_err()
                             .with_detail("tcp_arrow: missing required param 'addr'")
                     })?;
-                // Validate that fields is present and non-empty
-                let field_names: Vec<String> = spec
-                    .params
-                    .get("fields")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                if field_names.is_empty() {
-                    return Err(SinkReason::core_conf().to_err().with_detail(
-                        "tcp_arrow: requires 'fields' param (non-empty array of field names)",
-                    ));
-                }
                 Ok(())
             }
             "txt" | "" => {
@@ -453,7 +438,7 @@ pub struct TcpArrowSink {
     host: String,
     port: u16,
     rate_limit_rps: usize,
-    schema: Arc<arrow::datatypes::Schema>,
+    schema: tokio::sync::Mutex<Option<Arc<arrow::datatypes::Schema>>>,
     sent_cnt: u64,
 }
 
@@ -491,20 +476,7 @@ impl TcpArrowSink {
         .await
         .source_err(SinkReason::Sink, "tcp_arrow connect tcp")?;
 
-        let field_names: Vec<String> = spec
-            .params
-            .get("fields")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let schema = Arc::new(infer_arrow_schema(&field_names));
-
-        log::info!("tcp_arrow sink connected: target={target} fields={field_names:?}");
+        log::info!("tcp_arrow sink connected: target={target}");
 
         Ok(Self {
             conn: ConnState::Connected {
@@ -513,9 +485,21 @@ impl TcpArrowSink {
             host: addr.to_string(),
             port,
             rate_limit_rps,
-            schema,
+            schema: tokio::sync::Mutex::new(None),
             sent_cnt: 0,
         })
+    }
+
+    /// Lazily get or infer the Arrow schema from the first DataRecord.
+    async fn get_or_infer_schema(
+        &self,
+        record: &DataRecord,
+    ) -> SinkResult<Arc<arrow::datatypes::Schema>> {
+        let mut guard = self.schema.lock().await;
+        if guard.is_none() {
+            *guard = Some(Arc::new(infer_schema_from_record(record)));
+        }
+        Ok(Arc::clone(guard.as_ref().unwrap()))
     }
 
     async fn connect_writer(&self) -> SinkResult<NetWriter> {
@@ -610,7 +594,8 @@ impl TcpArrowSink {
 #[async_trait]
 impl AsyncRecordSink for TcpArrowSink {
     async fn sink_record(&mut self, data: &wp_model_core::model::DataRecord) -> SinkResult<()> {
-        let batch = data_record_to_batch(data, &self.schema)?;
+        let schema = self.get_or_infer_schema(data).await?;
+        let batch = data_record_to_batch(data, &schema)?;
         let payload = encode_batch_ipc_stream(&batch)?;
 
         self.send_payload(&payload).await?;
@@ -619,7 +604,7 @@ impl AsyncRecordSink for TcpArrowSink {
         if self.sent_cnt == 1 {
             log::info!(
                 "tcp_arrow sink first-send: cols={} payload_bytes={}",
-                self.schema.fields().len(),
+                schema.fields().len(),
                 payload.len(),
             );
         }
@@ -634,7 +619,8 @@ impl AsyncRecordSink for TcpArrowSink {
             return Ok(());
         }
         let row_count = data.len();
-        let batch = data_records_to_batch(&data, &self.schema)?;
+        let schema = self.get_or_infer_schema(&data[0]).await?;
+        let batch = data_records_to_batch(&data, &schema)?;
         let payload = encode_batch_ipc_stream(&batch)?;
 
         self.send_payload(&payload).await?;
@@ -643,7 +629,7 @@ impl AsyncRecordSink for TcpArrowSink {
             log::info!(
                 "tcp_arrow sink first-send: rows={} cols={} payload_bytes={}",
                 row_count,
-                self.schema.fields().len(),
+                schema.fields().len(),
                 payload.len(),
             );
         }
