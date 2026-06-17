@@ -10,24 +10,16 @@ use std::sync::Arc;
 use wf_connector_api::{BatchSource, SourceError, SourceReason, SourceResult};
 use wp_connector_api::{DataSource, SourceBatch, SourceError as WpError};
 
+use super::arrow::{WireFormat, decode_arrow_framed_batches, decode_arrow_ipc_batches};
 use super::ndjson::ndjson_to_record_batch;
 use super::payload::payload_to_string;
-
-/// Format expected on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TcpWireFormat {
-    Ndjson,
-    /// Arrow IPC Stream format (no length prefix, `StreamReader`-compatible).
-    /// Suitable for continuous streaming connections.
-    ArrowStream,
-}
 
 /// A TCP source that produces Arrow `RecordBatch`es.
 pub struct TcpBatchSource {
     key: String,
     inner: Box<dyn DataSource>,
     schema: Arc<Schema>,
-    format: TcpWireFormat,
+    format: WireFormat,
 }
 
 impl TcpBatchSource {
@@ -35,7 +27,7 @@ impl TcpBatchSource {
         key: impl Into<String>,
         source: Box<dyn DataSource>,
         schema: Arc<Schema>,
-        format: TcpWireFormat,
+        format: WireFormat,
     ) -> Self {
         Self {
             key: key.into(),
@@ -50,7 +42,7 @@ impl TcpBatchSource {
             return Ok(vec![]);
         }
         match self.format {
-            TcpWireFormat::Ndjson => {
+            WireFormat::Ndjson => {
                 let lines: Vec<String> = events
                     .iter()
                     .map(|e| payload_to_string(&e.payload))
@@ -61,9 +53,8 @@ impl TcpBatchSource {
                     Err(e) => Err(SourceReason::Decode.err_detail(e)),
                 }
             }
-            TcpWireFormat::ArrowStream => Err(SourceError::from(
-                SourceReason::Connect.err_detail("ArrowStream format is not supported by TcpBatchSource; use read_arrow_stream_batches()"),
-            )),
+            WireFormat::ArrowStream => decode_arrow_ipc_batches(&events),
+            WireFormat::ArrowFramed => decode_arrow_framed_batches(&events),
         }
     }
 
@@ -273,5 +264,112 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(batches.len(), 0);
+    }
+
+    // -- TcpBatchSource::convert_batch (via receive_batch) -----------------
+
+    use wp_connector_api::{DataSource, SourceBatch, SourceError as WpError};
+    use wp_model_core::raw::RawData;
+
+    /// In-memory `DataSource` that yields one pre-built batch then EOF.
+    struct OnceDataSource {
+        batch: Option<SourceBatch>,
+    }
+
+    #[async_trait::async_trait]
+    impl DataSource for OnceDataSource {
+        async fn receive(&mut self) -> Result<SourceBatch, WpError> {
+            match self.batch.take() {
+                Some(b) => Ok(b),
+                None => Err(WpError::from(wp_connector_api::SourceReason::EOF)),
+            }
+        }
+        fn try_receive(&mut self) -> Option<SourceBatch> {
+            None
+        }
+        fn identifier(&self) -> String {
+            "once".to_string()
+        }
+    }
+
+    fn ipc_bytes(values: &[&str]) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
+        let mut buf = Vec::new();
+        let mut w = StreamWriter::try_new(&mut buf, &schema).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(values.to_vec()))],
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.finish().unwrap();
+        buf
+    }
+
+    #[tokio::test]
+    async fn tcp_batch_source_arrow_stream_decodes() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
+        let event = wp_connector_api::SourceEvent::new(
+            1,
+            "k".to_string(),
+            RawData::Bytes(bytes::Bytes::from(ipc_bytes(&["a", "b"]))),
+            Default::default(),
+        );
+        let inner = Box::new(OnceDataSource {
+            batch: Some(vec![event]),
+        });
+        let mut src = TcpBatchSource::new("t", inner, schema, WireFormat::ArrowStream);
+        src.start().await.unwrap();
+        let batches = src.receive_batch().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+        // drained -> EOF surfaces as an error
+        assert!(src.receive_batch().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn tcp_batch_source_arrow_framed_decodes() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
+        let ipc = ipc_bytes(&["c"]);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(b"t");
+        frame.extend_from_slice(&ipc);
+
+        let event = wp_connector_api::SourceEvent::new(
+            1,
+            "k".to_string(),
+            RawData::Bytes(bytes::Bytes::from(frame)),
+            Default::default(),
+        );
+        let inner = Box::new(OnceDataSource {
+            batch: Some(vec![event]),
+        });
+        let mut src = TcpBatchSource::new("t", inner, schema, WireFormat::ArrowFramed);
+        src.start().await.unwrap();
+        let batches = src.receive_batch().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_batch_source_ndjson_decodes() {
+        let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, true)]));
+        let make = |s: &str| {
+            wp_connector_api::SourceEvent::new(
+                1,
+                "k".to_string(),
+                RawData::from_string(s.to_string()),
+                Default::default(),
+            )
+        };
+        let inner = Box::new(OnceDataSource {
+            batch: Some(vec![make(r#"{"msg":"hi"}"#), make(r#"{"msg":"yo"}"#)]),
+        });
+        let mut src = TcpBatchSource::new("t", inner, schema, WireFormat::Ndjson);
+        src.start().await.unwrap();
+        let batches = src.receive_batch().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
     }
 }

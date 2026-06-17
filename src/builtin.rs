@@ -239,11 +239,17 @@ pub fn builtin_source_defs() -> Vec<ConnectorDef> {
         params.insert("base".into(), json!("./data/in_dat"));
         params.insert("file".into(), json!("gen.dat"));
         params.insert("encode".into(), json!("text"));
+        params.insert("data_format".into(), json!("ndjson"));
         defs.push(ConnectorDef {
             id: "file_src".into(),
             kind: "file".into(),
             scope: ConnectorScope::Source,
-            allow_override: vec!["base".into(), "file".into(), "encode".into()],
+            allow_override: vec![
+                "base".into(),
+                "file".into(),
+                "encode".into(),
+                "data_format".into(),
+            ],
             default_params: params,
             origin: Some("builtin:file_source".into()),
         });
@@ -285,6 +291,7 @@ pub fn builtin_source_defs() -> Vec<ConnectorDef> {
         params.insert("framing".into(), json!("auto"));
         params.insert("tcp_recv_bytes".into(), json!(256_000));
         params.insert("instances".into(), json!(1));
+        params.insert("data_format".into(), json!("ndjson"));
         defs.push(ConnectorDef {
             id: "tcp_src".into(),
             kind: "tcp".into(),
@@ -295,6 +302,7 @@ pub fn builtin_source_defs() -> Vec<ConnectorDef> {
                 "framing".into(),
                 "tcp_recv_bytes".into(),
                 "instances".into(),
+                "data_format".into(),
             ],
             default_params: params,
             origin: Some("builtin:tcp_source".into()),

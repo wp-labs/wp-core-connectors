@@ -57,6 +57,14 @@ impl TcpSourceSpec {
         );
         let instances = instances as usize;
 
+        // Validate data_format if provided
+        if let Some(raw) = params.get("data_format").and_then(|v| v.as_str()) {
+            ensure!(
+                matches!(raw, "ndjson" | "arrow_ipc" | "arrow_framed"),
+                "tcp.data_format must be one of: ndjson, arrow_ipc, arrow_framed"
+            );
+        }
+
         Ok(Self {
             addr,
             port,

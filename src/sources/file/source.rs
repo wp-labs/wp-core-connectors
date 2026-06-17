@@ -321,6 +321,70 @@ impl DataSource for MultiFileSource {
     }
 }
 
+// -- BinaryFileSource --------------------------------------------------------
+
+/// Whole-file binary source. Reads an entire file as a single `RawData::Bytes`
+/// payload, then signals EOF. Suitable for Arrow IPC / framed formats where
+/// line-based splitting would corrupt the stream.
+///
+/// Unlike [`FileSource`], this does not support intra-file byte-range sharding
+/// (`instances`) because splitting an arbitrary byte range can land mid-record.
+pub struct BinaryFileSource {
+    key: String,
+    data: Option<Bytes>,
+    base_tags: Tags,
+}
+
+impl BinaryFileSource {
+    pub async fn new(key: String, path: &str, mut tags: Tags) -> SourceResult<Self> {
+        let file_path = Path::new(path);
+        if !file_path.exists() {
+            return Err(SourceReason::core_conf().to_err());
+        }
+        let data = tokio::fs::read(file_path)
+            .await
+            .map_err(|e| SourceReason::disconnect(e.to_string()))
+            .with_context(file_path)
+            .doing("read binary source file")?;
+        tags.set("access_source", path.to_string());
+        Ok(Self {
+            key,
+            data: Some(Bytes::from(data)),
+            base_tags: tags,
+        })
+    }
+}
+
+#[async_trait]
+impl DataSource for BinaryFileSource {
+    async fn receive(&mut self) -> SourceResult<SourceBatch> {
+        match self.data.take() {
+            Some(bytes) if !bytes.is_empty() => {
+                let event = SourceEvent::new(
+                    next_event_id(),
+                    &self.key,
+                    RawData::Bytes(bytes),
+                    Arc::new(self.base_tags.clone()),
+                );
+                Ok(vec![event])
+            }
+            _ => Err(SourceError::from(SourceReason::EOF)),
+        }
+    }
+
+    fn try_receive(&mut self) -> Option<SourceBatch> {
+        None
+    }
+
+    fn can_try_receive(&mut self) -> bool {
+        false
+    }
+
+    fn identifier(&self) -> String {
+        self.key.clone()
+    }
+}
+
 pub(super) fn compute_file_ranges(
     path: &Path,
     instances: usize,

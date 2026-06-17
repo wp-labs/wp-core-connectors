@@ -7,6 +7,20 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-18
+
+### Added
+
+- Source factory 支持 `data_format` 参数校验（`ndjson` / `arrow_ipc` / `arrow_framed`）
+- `WireFormat` 枚举集中到 `sources/batch/arrow`，TCP/File batch source 共享解码逻辑
+- `BinaryFileSource`：整文件二进制读取，支持 Arrow IPC / framed 格式文件
+- `decode_arrow_ipc_batches` / `decode_arrow_framed_batches`：Arrow 格式解码
+
+### Changed
+
+- `TcpBatchSource::convert_batch` 按 `WireFormat` 分派解码路径
+- `FileSourceSpec` 非 NDJSON 格式自动路由到 `BinaryFileSource`
+
 ## [0.5.0] - 2026-06-13
 
 ### Added
