@@ -7,6 +7,36 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-06-18
+
+### Added
+
+- Sink 支持 `data_format` 参数（`arrow_ipc` / `arrow_framed`）：`TcpArrowSink`、`ArrowFileSink` 均接入，`TcpFactory`、`FileFactory` 严格校验未知值
+- `encode_ipc_frame` / `encode_ipc_frame_multi` 共享编码函数集中到 `sinks/arrow_conv/mod.rs`，TCP 和 File Arrow sink 共用
+- `ArrowFileSink::with_format` 构造器：framed 模式下 batch 缓存在内存，`stop()` 时编码为单个 wp_arrow frame 原子写入
+- `ArrowFileWriter` 内部枚举分派 stream / framed 两种写入模式
+- `encode_batch_ipc_stream` 移入 `arrow_conv` 模块，`TcpArrowSink::encode_batch_payload` 统一按格式分派
+
+### Changed
+
+- `ArrowFileSink` 重构：`ensure_writer` → `ensure_schema` + `write_stream_batch` 辅助方法
+- `stop()` 中 framed 路径统一使用 `encode_ipc_frame_multi`，消除空/非空分支重复
+- `TcpArrowSink` 中本地 `encode_ipc_frame` / `encode_batch_ipc_stream` 移入共享 `arrow_conv` 模块
+
+### Fixed
+
+- `ArrowFileSink::stop()` framed 模式空 batches 不执行 `fsync` 的问题
+
+### Documentation
+
+- `ArrowFileSink::with_format` 文档标注 framed 模式数据仅在 `stop()` 时写盘，进程崩溃可能丢数据
+
+## [0.5.2] - 2026-06-18
+
+### Documentation
+
+- README（中英双语）与 `TCP_SOURCE_DESIGN.md` 完善 `data_format` 使用文档（WireFormat 变体映射、校验、共享解码层、TOML 配置示例）
+
 ## [0.5.1] - 2026-06-18
 
 ### Added
@@ -188,7 +218,15 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Preserve the first registered factory for duplicate connector kinds and emit diagnostics instead of silently overriding
 - Handle raw byte payloads in TCP and syslog sinks consistently with string payload handling
 
-[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.2...v0.5.3
+[0.5.2]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.6...v0.5.0
+[0.3.6]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.5...v0.3.6
+[0.3.5]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.4...v0.3.5
+[0.3.4]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.3...v0.3.4
+[0.3.3]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.0...v0.3.2
 [0.3.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.2.0

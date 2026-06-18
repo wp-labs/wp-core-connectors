@@ -2,9 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::builtin;
-use arrow::ipc::writer::StreamWriter;
 use async_trait::async_trait;
-use orion_error::conversion::{SourceErr, SourceRawErr, ToStructError};
+use orion_error::conversion::{SourceErr, ToStructError};
 use wp_connector_api::SinkReason;
 use wp_connector_api::SinkResult;
 use wp_connector_api::{
@@ -16,7 +15,8 @@ use wp_data_fmt::RecordFormatter; // for fmt_record
 use crate::net::transport::{BackoffMode, NetSendPolicy, NetWriter, net_backoff_adaptive};
 
 use super::arrow_conv::{
-    data_record_to_batch, data_records_to_batch, infer_schema_from_record, sink_err,
+    data_record_to_batch, data_records_to_batch, encode_batch_ipc_stream, encode_ipc_frame,
+    infer_schema_from_record,
 };
 use wp_model_core::model::DataRecord;
 
@@ -324,6 +324,17 @@ impl SinkFactory for TcpFactory {
                             .to_err()
                             .with_detail("tcp_arrow: missing required param 'addr'")
                     })?;
+                // data_format selects the on-wire Arrow encoding:
+                //   "arrow_framed" -> wp_arrow frame `[4B tag_len BE][tag][ipc]`,
+                //                     length-prefixed (RFC6587) for peer framing=len
+                //   "arrow_ipc" / absent -> bare Arrow IPC Stream (legacy)
+                if let Some(df) = spec.params.get("data_format").and_then(|v| v.as_str())
+                    && !matches!(df, "arrow_framed" | "arrow_ipc")
+                {
+                    return Err(SinkReason::core_conf().to_err().with_detail(format!(
+                        "tcp_arrow.data_format must be 'arrow_framed' or 'arrow_ipc' (got '{df}')"
+                    )));
+                }
                 Ok(())
             }
             "txt" | "" => {
@@ -404,24 +415,6 @@ fn build_payload_bytes(data: &[u8], framing: Framing) -> Vec<u8> {
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// Encode a single `RecordBatch` as Arrow IPC Stream bytes (self-contained:
-/// schema + record batch + end-of-stream marker).
-fn encode_batch_ipc_stream(batch: &arrow::record_batch::RecordBatch) -> SinkResult<Vec<u8>> {
-    let schema = batch.schema();
-    let mut buf = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut buf, &schema)
-            .source_raw_err(SinkReason::Sink, "tcp_arrow create stream writer")?;
-        writer
-            .write(batch)
-            .map_err(|e| sink_err("tcp_arrow encode batch", e))?;
-        writer
-            .finish()
-            .map_err(|e| sink_err("tcp_arrow finish stream", e))?;
-    }
-    Ok(buf)
-}
-
 enum ConnState {
     Connected {
         writer: Box<NetWriter>,
@@ -440,6 +433,11 @@ pub struct TcpArrowSink {
     rate_limit_rps: usize,
     schema: tokio::sync::Mutex<Option<Arc<arrow::datatypes::Schema>>>,
     sent_cnt: u64,
+    /// When true, emit wp_arrow frames (`[tag_len][tag][ipc]`) with RFC6587
+    /// length-prefixing — selected by `data_format = "arrow_framed"`.
+    framed: bool,
+    /// Stream tag embedded in each wp_arrow frame (only used when `framed`).
+    tag: String,
 }
 
 impl TcpArrowSink {
@@ -458,6 +456,20 @@ impl TcpArrowSink {
             .get("port")
             .and_then(|v| v.as_i64())
             .unwrap_or(9000) as u16;
+
+        let data_format = spec
+            .params
+            .get("data_format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("arrow_ipc")
+            .to_ascii_lowercase();
+        let framed = data_format == "arrow_framed";
+        let tag = spec
+            .params
+            .get("tag")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         let target = format!("{addr}:{port}");
         let mode = if rate_limit_rps == 0 {
@@ -487,6 +499,8 @@ impl TcpArrowSink {
             rate_limit_rps,
             schema: tokio::sync::Mutex::new(None),
             sent_cnt: 0,
+            framed,
+            tag,
         })
     }
 
@@ -551,6 +565,22 @@ impl TcpArrowSink {
         }
     }
 
+    /// Encode a batch into the on-wire payload, honouring `data_format`:
+    /// - `arrow_framed`: wp_arrow frame `[tag_len][tag][ipc]`, RFC6587 length-prefixed
+    ///   so the peer's `framing = "len"` can delineate messages.
+    /// - otherwise (`arrow_ipc`/absent): a bare Arrow IPC Stream (legacy behaviour).
+    fn encode_batch_payload(
+        &self,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> SinkResult<Vec<u8>> {
+        if self.framed {
+            let frame = encode_ipc_frame(&self.tag, batch)?;
+            Ok(build_payload_bytes(&frame, Framing::Len))
+        } else {
+            encode_batch_ipc_stream(batch)
+        }
+    }
+
     async fn send_payload(&mut self, payload: &[u8]) -> SinkResult<()> {
         match &mut self.conn {
             ConnState::Connected { writer } => match writer.write(payload).await {
@@ -596,7 +626,7 @@ impl AsyncRecordSink for TcpArrowSink {
     async fn sink_record(&mut self, data: &wp_model_core::model::DataRecord) -> SinkResult<()> {
         let schema = self.get_or_infer_schema(data).await?;
         let batch = data_record_to_batch(data, &schema)?;
-        let payload = encode_batch_ipc_stream(&batch)?;
+        let payload = self.encode_batch_payload(&batch)?;
 
         self.send_payload(&payload).await?;
         self.sent_cnt = self.sent_cnt.saturating_add(1);
@@ -621,7 +651,7 @@ impl AsyncRecordSink for TcpArrowSink {
         let row_count = data.len();
         let schema = self.get_or_infer_schema(&data[0]).await?;
         let batch = data_records_to_batch(&data, &schema)?;
-        let payload = encode_batch_ipc_stream(&batch)?;
+        let payload = self.encode_batch_payload(&batch)?;
 
         self.send_payload(&payload).await?;
 
@@ -846,5 +876,110 @@ mod tests {
         assert_eq!(batches[0].num_rows(), 2, "2 records in one batch");
         assert_eq!(batches[0].num_columns(), 2);
         Ok(())
+    }
+
+    // -- encode_ipc_frame → decode_arrow_framed_batches roundtrip ---------
+
+    use crate::sinks::arrow_conv::encode_ipc_frame_multi;
+    use crate::sources::batch::arrow::decode_arrow_framed_batches;
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use bytes::Bytes;
+    use wp_connector_api::SourceEvent;
+    use wp_model_core::raw::RawData;
+
+    #[test]
+    fn encode_ipc_frame_roundtrip() {
+        // Encode with shared arrow_conv::encode_ipc_frame, decode with
+        // sources::batch::arrow::decode_arrow_framed_batches.
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+        )
+        .unwrap();
+
+        // 1. Sink side: encode as framed
+        let frame = encode_ipc_frame("my_tag", &batch).unwrap();
+
+        // 2. Sink side: wrap with RFC6587 length prefix (Framing::Len)
+        let wire_payload = build_payload_bytes(&frame, Framing::Len);
+
+        // 3. Source side: framing layer strips RFC6587 prefix
+        //    Format is "{N} " followed by N bytes. Parse the length prefix.
+        let prefix_end = wire_payload
+            .iter()
+            .position(|&b| b == b' ')
+            .expect("RFC6587 payload must have space delimiter");
+        let _len: usize = std::str::from_utf8(&wire_payload[..prefix_end])
+            .unwrap()
+            .parse()
+            .unwrap();
+        let framed_payload = &wire_payload[prefix_end + 1..];
+
+        // 4. Source side: decode the frame
+        let event = SourceEvent::new(
+            1,
+            "key",
+            RawData::Bytes(Bytes::from(framed_payload.to_vec())),
+            Default::default(),
+        );
+        let batches = decode_arrow_framed_batches(&vec![event]).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+    }
+
+    #[test]
+    fn encode_ipc_frame_multi_roundtrip() {
+        // encode_ipc_frame_multi encodes multiple batches into one frame.
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
+        let b1 = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["a"]))])
+            .unwrap();
+        let b2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["b", "c"]))],
+        )
+        .unwrap();
+
+        let frame = encode_ipc_frame_multi("multi", &[b1, b2]).unwrap();
+
+        let event = SourceEvent::new(
+            1,
+            "key",
+            RawData::Bytes(Bytes::from(frame)),
+            Default::default(),
+        );
+        let batches = decode_arrow_framed_batches(&vec![event]).unwrap();
+        assert_eq!(
+            batches.len(),
+            2,
+            "two batches decoded from multi-batch IPC stream"
+        );
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[1].num_rows(), 2);
+    }
+
+    #[test]
+    fn encode_ipc_frame_empty_tag() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["data"]))],
+        )
+        .unwrap();
+
+        let frame = encode_ipc_frame("", &batch).unwrap();
+        // Should start with tag_len = 0, no tag bytes, then IPC stream
+        assert_eq!(&frame[0..4], &0u32.to_be_bytes());
+
+        let event = SourceEvent::new(
+            1,
+            "key",
+            RawData::Bytes(Bytes::from(frame)),
+            Default::default(),
+        );
+        let batches = decode_arrow_framed_batches(&vec![event]).unwrap();
+        assert_eq!(batches[0].num_rows(), 1);
     }
 }

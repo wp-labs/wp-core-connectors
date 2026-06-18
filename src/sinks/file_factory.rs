@@ -53,6 +53,14 @@ impl SinkFactory for FileFactory {
                             .to_err()
                             .with_detail("arrow file sink requires 'file' param")
                     })?;
+                // Validate data_format if provided
+                if let Some(df) = spec.params.get("data_format").and_then(|v| v.as_str())
+                    && !matches!(df, "arrow_framed" | "arrow_ipc")
+                {
+                    return Err(SinkReason::core_conf().to_err().with_detail(format!(
+                        "file_arrow.data_format must be 'arrow_framed' or 'arrow_ipc' (got '{df}')"
+                    )));
+                }
                 Ok(())
             }
             "txt" | "" => {
@@ -81,7 +89,19 @@ impl SinkFactory for FileFactory {
                     .get("sync")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                Box::new(ArrowFileSink::new(&file_path, sync)?)
+                let data_format = spec
+                    .params
+                    .get("data_format")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("arrow_ipc")
+                    .to_ascii_lowercase();
+                let framed = data_format == "arrow_framed";
+                let tag = spec
+                    .params
+                    .get("tag")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Box::new(ArrowFileSink::with_format(&file_path, sync, framed, tag)?)
             }
             "txt" | "" => {
                 let resolved = FileSinkSpec::from_resolved("file", spec)?;
