@@ -21,6 +21,10 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - `TcpBatchSource::convert_batch` 按 `WireFormat` 分派解码路径
 - `FileSourceSpec` 非 NDJSON 格式自动路由到 `BinaryFileSource`
 
+### Documentation
+
+- README（中英双语）新增 "Source 数据格式（`data_format`）" 章节；`TCP_SOURCE_DESIGN.md` 补充 `data_format` 解码说明
+
 ## [0.5.0] - 2026-06-13
 
 ### Added

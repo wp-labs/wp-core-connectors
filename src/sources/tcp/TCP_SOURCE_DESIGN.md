@@ -183,9 +183,27 @@ connect = "tcp_src"
 params = {
     port = 19001,                    # 监听端口
     addr = "127.0.0.1",             # 监听地址
-    tcp_recv_bytes = 8192           # 缓冲区大小
+    tcp_recv_bytes = 8192,           # 缓冲区大小
+    data_format = "ndjson"          # 数据格式：ndjson | arrow_ipc | arrow_framed
 }
 ```
+
+#### 数据格式（`data_format`）与 Arrow 解码
+
+`data_format` 决定 `TcpSource` 接收到的字节如何被解码为 Arrow `RecordBatch`。该参数在 `TcpSourceSpec::from_params()` 中被严格校验（未知值会报错，而不是静默退化为 NDJSON）。
+
+| `data_format` | 解码方式 |
+|---------------|---------|
+| `ndjson`（默认） | 逐行解析为 JSON，按传入 schema 构建类型化列 |
+| `arrow_ipc` | 整段字节作为 Arrow IPC Stream（`StreamReader`）解码 |
+| `arrow_framed` | 解析 wp_arrow 帧 `[4B tag_len][tag][Arrow IPC Stream]` 后解码 |
+
+枚举与解码函数集中在 `src/sources/batch/arrow.rs`：
+
+- `WireFormat` 枚举 + `from_data_format()`（宽松解析）
+- `decode_arrow_ipc_batches` / `decode_arrow_framed_batches`
+
+解码由 `TcpBatchSource` 适配器在 `convert_batch` 中按 `WireFormat` 分派完成。Arrow 路径直接从流取 schema，不依赖外部传入的 schema。
 
 ## 实现特点
 
