@@ -11,19 +11,21 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
-- Source factory 支持 `data_format` 参数校验（`ndjson` / `arrow_ipc` / `arrow_framed`）
-- `WireFormat` 枚举集中到 `sources/batch/arrow`，TCP/File batch source 共享解码逻辑
-- `BinaryFileSource`：整文件二进制读取，支持 Arrow IPC / framed 格式文件
-- `decode_arrow_ipc_batches` / `decode_arrow_framed_batches`：Arrow 格式解码
+- Source 支持 `data_format` 参数（`ndjson` / `arrow_ipc` / `arrow_framed`）：`FileSourceSpec`、`TcpSourceSpec`、builtin 定义（`file_src`/`tcp_src`）均接入，严格校验未知值
+- `WireFormat` 枚举集中到 `sources/batch/arrow.rs`，TCP/File batch source 共享解码逻辑；移除了此前重复的 `payload_to_bytes`
+- `BinaryFileSource`（生产）与 `SimpleBinaryFileSource`（测试）：整文件二进制读取，支持 Arrow IPC / framed 格式文件
+- `decode_arrow_ipc_batches` / `decode_arrow_framed_batches`：Arrow 字节 → `RecordBatch`
+- `ArrowFramed` 解码：`TcpBatchSource` 从仅支持 NDJSON/ArrowStream 扩展为支持三种格式
 
 ### Changed
 
-- `TcpBatchSource::convert_batch` 按 `WireFormat` 分派解码路径
-- `FileSourceSpec` 非 NDJSON 格式自动路由到 `BinaryFileSource`
+- `TcpBatchSource` / `FileBatchSource::convert_batch` 按 `WireFormat` 分派解码路径
+- `FileSourceFactory::build` 非 NDJSON 格式自动路由到 `BinaryFileSource`；Arrow 文件不做文件内字节范围分片（`instances` 不生效）
 
 ### Documentation
 
-- README（中英双语）新增 "Source 数据格式（`data_format`）" 章节；`TCP_SOURCE_DESIGN.md` 补充 `data_format` 解码说明
+- README（中英双语）新增 "Source 数据格式（`data_format`）" 章节（含 `WireFormat` 变体映射、严格校验、共享解码层、schema 处理、TOML 配置示例）
+- `TCP_SOURCE_DESIGN.md` 补充 `data_format` 解码说明与配置示例
 
 ## [0.5.0] - 2026-06-13
 

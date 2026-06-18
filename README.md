@@ -51,20 +51,53 @@ Note: this crate currently includes concrete sink factory/runtime implementation
 
 The builtin `file` and `tcp` sources accept a `data_format` parameter that selects how each batch is decoded into Arrow `RecordBatch`es:
 
-| `data_format` | Meaning | Suitable source |
-|---------------|---------|-------------------|
-| `ndjson` (default) | Newline-delimited JSON (line-oriented) | `file`, `tcp` |
-| `arrow_ipc` | Arrow IPC Stream (`StreamReader`-compatible) | `file`, `tcp` |
-| `arrow_framed` | wp_arrow frame: `[4B tag_len][tag][Arrow IPC Stream]` | `file`, `tcp` |
+| `data_format` | Meaning | `WireFormat` variant | Suitable source |
+|---------------|---------|----------------------|-------------------|
+| `ndjson` (default) | Newline-delimited JSON (line-oriented) | `WireFormat::Ndjson` | `file`, `tcp` |
+| `arrow_ipc` | Arrow IPC Stream (`StreamReader`-compatible) | `WireFormat::ArrowStream` | `file`, `tcp` |
+| `arrow_framed` | wp_arrow frame: `[4B tag_len][tag][Arrow IPC Stream]` | `WireFormat::ArrowFramed` | `file`, `tcp` |
 
-`data_format` is validated strictly at spec parse time; an unknown value is rejected rather than silently degrading to NDJSON.
+> Note: the variant for `arrow_ipc` is named `ArrowStream` because it decodes an Arrow IPC *streaming* format (length-prefix-free, `StreamReader`-compatible).
 
-The `WireFormat` enum and shared decode helpers live in `src/sources/batch/arrow.rs`:
+**Validation.** `data_format` is validated strictly at spec parse time
+(`FileSourceSpec` / `TcpSourceSpec`); an unknown value is rejected with a clear
+error rather than silently degrading to NDJSON.
 
-- `WireFormat::{from_data_format, ...}` — lenient parse (unknown → Ndjson) and the enum itself
-- `decode_arrow_ipc_batches` / `decode_arrow_framed_batches` — Arrow → `RecordBatch`
+**Shared decode layer.** `WireFormat` and the Arrow decode routines are
+centralised in `src/sources/batch/arrow.rs` and shared by both `TcpBatchSource`
+and `FileBatchSource` (this also removed a previously duplicated
+`payload_to_bytes`):
 
-For NDJSON inputs the `FileBatchSource` / `TcpBatchSource` adapters build typed columns from a provided schema; for Arrow inputs the schema is taken from the stream itself. Arrow **file** inputs use the binary whole-file reader (`BinaryFileSource` / `SimpleBinaryFileSource`) — line-based splitting is avoided because it would corrupt a binary Arrow stream.
+- `WireFormat::from_data_format()` — lenient parse used for defaults (`None`/unknown → `Ndjson`)
+- `decode_arrow_ipc_batches` / `decode_arrow_framed_batches` — Arrow bytes → `RecordBatch`
+
+**Schema handling.** For NDJSON inputs the `FileBatchSource` / `TcpBatchSource`
+adapters build typed columns from a provided schema; for Arrow inputs the
+schema is taken from the stream itself. Arrow **file** inputs use the binary
+whole-file reader (`BinaryFileSource` / `SimpleBinaryFileSource`) — line-based
+splitting is avoided because it would corrupt a binary Arrow stream, so
+`instances` (intra-file byte-range sharding) does not apply to Arrow.
+
+```toml
+# file source reading an Arrow IPC stream
+[[sources]]
+key = "arrow_in"
+connect = "file_src"
+params = {
+  base = "./data/in_dat",
+  file = "events.arrow",
+  data_format = "arrow_ipc"      # ndjson | arrow_ipc | arrow_framed
+}
+
+# tcp source decoding wp_arrow frames
+[[sources]]
+key = "tcp_in"
+connect = "tcp_src"
+params = {
+  addr = "0.0.0.0", port = 9000,
+  data_format = "arrow_framed"
+}
+```
 
 ### Builtin Sink Implementations
 
@@ -237,20 +270,43 @@ Licensed under [Apache License 2.0](./LICENSE).
 
 内置的 `file`、`tcp` source 支持 `data_format` 参数，选择每个批次如何被解码为 Arrow `RecordBatch`：
 
-| `data_format` | 含义 | 适用 source |
-|---------------|------|------------|
-| `ndjson`（默认） | 换行分隔的 JSON（行式） | `file`、`tcp` |
-| `arrow_ipc` | Arrow IPC Stream（`StreamReader` 可读） | `file`、`tcp` |
-| `arrow_framed` | wp_arrow 帧：`[4B tag_len][tag][Arrow IPC Stream]` | `file`、`tcp` |
+| `data_format` | 含义 | `WireFormat` 变体 | 适用 source |
+|---------------|------|------------------|------------|
+| `ndjson`（默认） | 换行分隔的 JSON（行式） | `WireFormat::Ndjson` | `file`、`tcp` |
+| `arrow_ipc` | Arrow IPC Stream（`StreamReader` 可读） | `WireFormat::ArrowStream` | `file`、`tcp` |
+| `arrow_framed` | wp_arrow 帧：`[4B tag_len][tag][Arrow IPC Stream]` | `WireFormat::ArrowFramed` | `file`、`tcp` |
 
-`data_format` 在 spec 解析期被严格校验，未知值会被拒绝，而不是静默退化为 NDJSON。
+> 说明：`arrow_ipc` 对应的变体名为 `ArrowStream`，因为它解码的是 Arrow IPC *streaming* 格式（无长度前缀，`StreamReader` 可读）。
 
-`WireFormat` 枚举与共享解码函数位于 `src/sources/batch/arrow.rs`：
+**校验。** `data_format` 在 spec 解析期（`FileSourceSpec` / `TcpSourceSpec`）被严格校验，未知值会返回明确错误，而不是静默退化为 NDJSON。
 
-- `WireFormat::{from_data_format, ...}`——宽松解析（未知值 → Ndjson）及枚举本身
-- `decode_arrow_ipc_batches` / `decode_arrow_framed_batches`——Arrow → `RecordBatch`
+**共享解码层。** `WireFormat` 与 Arrow 解码函数集中在 `src/sources/batch/arrow.rs`，由 `TcpBatchSource` 和 `FileBatchSource` 共享（同时移除了此前重复的 `payload_to_bytes`）：
 
-NDJSON 输入由 `FileBatchSource` / `TcpBatchSource` 适配器按传入的 schema 构建类型化列；Arrow 输入的 schema 直接取自流本身。Arrow **文件**输入使用整文件二进制读取器（`BinaryFileSource` / `SimpleBinaryFileSource`）——不按行切分，否则会损坏二进制 Arrow 流。
+- `WireFormat::from_data_format()`——宽松解析，用于默认值（`None`/未知值 → `Ndjson`）
+- `decode_arrow_ipc_batches` / `decode_arrow_framed_batches`——Arrow 字节 → `RecordBatch`
+
+**Schema 处理。** NDJSON 输入由 `FileBatchSource` / `TcpBatchSource` 适配器按传入的 schema 构建类型化列；Arrow 输入的 schema 直接取自流本身。Arrow **文件**输入使用整文件二进制读取器（`BinaryFileSource` / `SimpleBinaryFileSource`）——不按行切分，否则会损坏二进制 Arrow 流，因此 `instances`（文件内字节范围分片）对 Arrow 不生效。
+
+```toml
+# 文件 source 读取 Arrow IPC 流
+[[sources]]
+key = "arrow_in"
+connect = "file_src"
+params = {
+  base = "./data/in_dat",
+  file = "events.arrow",
+  data_format = "arrow_ipc"      # ndjson | arrow_ipc | arrow_framed
+}
+
+# tcp source 解码 wp_arrow 帧
+[[sources]]
+key = "tcp_in"
+connect = "tcp_src"
+params = {
+  addr = "0.0.0.0", port = 9000,
+  data_format = "arrow_framed"
+}
+```
 
 ## 配置示例
 
