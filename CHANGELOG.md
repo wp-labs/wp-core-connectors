@@ -7,6 +7,13 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-19
+
+### Fixed
+
+- Syslog UDP sink `sink_str_batch` 修复：UDP 每条消息必须是独立数据报，先前合并多消息为一次 `send()` 超过 65535 字节导致 `EMSGSIZE` 错误；现按传输类型分叉——TCP 保持合并 buffer 一次 `write()`，UDP 逐条 `send()`
+
+
 ## [0.4.0] - 2026-06-19
 
 ### Added
@@ -107,7 +114,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Preserve the first registered factory for duplicate connector kinds and emit diagnostics instead of silently overriding
 - Handle raw byte payloads in TCP and syslog sinks consistently with string payload handling
 
-[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/wp-labs/wp-core-connectors/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.2.0...v0.4.0
 [0.2.0]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.2.0
 [0.1.3]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.1.3

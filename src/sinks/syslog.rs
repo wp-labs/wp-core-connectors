@@ -279,30 +279,51 @@ impl AsyncRawDataSink for SyslogSink {
             return Ok(());
         }
         let is_tcp = matches!(self.writer.transport, Transport::Tcp(_));
-        let mut total = 0usize;
-        for s in &data {
-            total = total.saturating_add(s.len() + 64);
+
+        if is_tcp {
+            // TCP: 流式协议，合并 buffer 一次 write 效率更高
+            let mut total = 0usize;
+            for s in &data {
+                total = total.saturating_add(s.len() + 64);
+            }
+            let mut buf: Vec<u8> = Vec::with_capacity(total);
+            for str_data in data.iter() {
+                let mut emit = EmitMessage::new(str_data);
+                emit.priority = 13;
+                emit.hostname = Some(self.hostname.as_str());
+                emit.app_name = Some(self.app_name.as_str());
+                emit.append_newline = true;
+                let msg = self.encoder.encode_rfc3164(&emit);
+                buf.extend_from_slice(msg.as_ref());
+            }
+            let record_cnt = data.len();
+            log::trace!(
+                "syslog tcp sink send-batch seq={} records={} bytes={}",
+                self.sent_cnt + 1,
+                record_cnt,
+                buf.len()
+            );
+            self.writer.write(&buf).await?;
+            self.sent_cnt = self.sent_cnt.saturating_add(1);
+        } else {
+            // UDP: 每条消息必须是独立数据报，逐条 send()
+            for str_data in data.iter() {
+                let mut emit = EmitMessage::new(str_data);
+                emit.priority = 13;
+                emit.hostname = Some(self.hostname.as_str());
+                emit.app_name = Some(self.app_name.as_str());
+                emit.append_newline = false;
+                let msg = self.encoder.encode_rfc3164(&emit);
+                self.writer.write(msg.as_ref()).await?;
+            }
+            let record_cnt = data.len();
+            log::trace!(
+                "syslog udp sink send-batch seq={} records={}",
+                self.sent_cnt + 1,
+                record_cnt
+            );
+            self.sent_cnt = self.sent_cnt.saturating_add(record_cnt as u64);
         }
-        let mut buf: Vec<u8> = Vec::with_capacity(total);
-        for str_data in data.iter() {
-            let mut emit = EmitMessage::new(str_data);
-            emit.priority = 13;
-            emit.hostname = Some(self.hostname.as_str());
-            emit.app_name = Some(self.app_name.as_str());
-            emit.append_newline = is_tcp;
-            let msg = self.encoder.encode_rfc3164(&emit);
-            buf.extend_from_slice(msg.as_ref());
-        }
-        let record_cnt = data.len();
-        log::trace!(
-            "syslog {} sink send-batch seq={} records={} bytes={}",
-            if is_tcp { "tcp" } else { "udp" },
-            self.sent_cnt + 1,
-            record_cnt,
-            buf.len()
-        );
-        self.writer.write(&buf).await?;
-        self.sent_cnt = self.sent_cnt.saturating_add(1);
         Ok(())
     }
 
@@ -478,5 +499,130 @@ mod tests {
             "body mismatch: {}",
             text
         );
+    }
+
+    // -- sink_str_batch tests -----------------------------------------------
+
+    #[tokio::test]
+    async fn syslog_tcp_batch_merges_messages() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let mut sink = SyslogSink::tcp(addr.to_string().as_str(), Some("batch".into()), 0)
+            .await
+            .expect("build tcp sink");
+
+        let accept_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = Vec::new();
+            use tokio::io::AsyncReadExt;
+            stream.read_to_end(&mut buf).await.expect("read");
+            buf
+        });
+
+        sink.sink_str_batch(vec!["msg1", "msg2", "msg3"])
+            .await
+            .expect("batch");
+        sink.stop().await.expect("stop");
+
+        let bytes = accept_task.await.expect("join");
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(text.contains("msg1"), "should contain msg1");
+        assert!(text.contains("msg2"), "should contain msg2");
+        assert!(text.contains("msg3"), "should contain msg3");
+        let newline_count = text.matches('\n').count();
+        assert_eq!(newline_count, 3, "TCP: each of 3 messages should end with newline");
+    }
+
+    #[tokio::test]
+    async fn syslog_udp_batch_sends_separate_datagrams() {
+        use tokio::net::UdpSocket;
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+        let addr = sock.local_addr().expect("addr");
+
+        let mut sink = SyslogSink::udp(addr.to_string().as_str(), Some("udp_batch".into()))
+            .await
+            .expect("build udp sink");
+
+        let recv_task = tokio::spawn(async move {
+            let mut datagrams = Vec::new();
+            let mut buf = [0u8; 2048];
+            for _ in 0..3 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    sock.recv_from(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok((n, _src))) => {
+                        datagrams.push(buf[..n].to_vec());
+                    }
+                    _ => break,
+                }
+            }
+            datagrams
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        sink.sink_str_batch(vec!["udp1", "udp2", "udp3"])
+            .await
+            .expect("batch");
+
+        let datagrams = recv_task.await.expect("join");
+        assert_eq!(
+            datagrams.len(),
+            3,
+            "UDP: each message should be a separate datagram"
+        );
+
+        let texts: Vec<String> = datagrams
+            .iter()
+            .map(|d| String::from_utf8_lossy(d).to_string())
+            .collect();
+        assert!(texts[0].contains("udp1"), "datagram 0: {}", texts[0]);
+        assert!(texts[1].contains("udp2"), "datagram 1: {}", texts[1]);
+        assert!(texts[2].contains("udp3"), "datagram 2: {}", texts[2]);
+        for (i, t) in texts.iter().enumerate() {
+            assert!(
+                !t.ends_with('\n'),
+                "UDP datagram {i} should not end with newline: {t:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn syslog_udp_sink_str_single_datagram() {
+        use tokio::net::UdpSocket;
+
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+        let addr = sock.local_addr().expect("addr");
+
+        let mut sink = SyslogSink::udp(addr.to_string().as_str(), Some("single".into()))
+            .await
+            .expect("build udp sink");
+
+        let recv_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                sock.recv_from(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok((n, _src))) => Some(buf[..n].to_vec()),
+                _ => None,
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        sink.sink_str("single_msg").await.expect("sink str");
+
+        let datagram = recv_task.await.expect("join").expect("should receive");
+        let text = String::from_utf8_lossy(&datagram);
+        assert!(text.contains("single_msg"), "body: {text}");
+        assert!(!text.ends_with('\n'), "UDP should not append newline: {text:?}");
     }
 }
