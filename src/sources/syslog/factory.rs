@@ -91,42 +91,62 @@ impl SourceFactory for SyslogSourceFactory {
                 }
                 Protocol::Tcp => {
                     let tags = base_tags.clone();
-                    let pool = Arc::new(Mutex::new(HashSet::<u64>::new()));
-                    let (reg_tx, reg_rx) = mpsc::channel(tcp_reader_batch_channel_cap());
+                    let connection_registry = Arc::new(Mutex::new(HashSet::<u64>::new()));
+                    let mut instance_reg_txs = Vec::with_capacity(config.instances);
+                    let mut source_handles = Vec::with_capacity(config.instances);
                     let framing = FramingMode::Auto;
 
-                    let inner = TcpSource::new(
-                        spec.name.clone(),
-                        tags.clone(),
-                        config.address(),
-                        config.tcp_recv_bytes,
-                        framing,
-                        pool.clone(),
-                        reg_rx,
-                    )
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    for idx in 0..config.instances {
+                        let (reader_reg_tx, reader_reg_rx) =
+                            mpsc::channel(tcp_reader_batch_channel_cap());
+                        instance_reg_txs.push(reader_reg_tx);
+
+                        let key = if config.instances == 1 {
+                            spec.name.clone()
+                        } else {
+                            format!("{}#{}", spec.name, idx + 1)
+                        };
+                        let inner = TcpSource::new(
+                            key.clone(),
+                            tags.clone(),
+                            config.address(),
+                            config.tcp_recv_bytes,
+                            framing,
+                            connection_registry.clone(),
+                            reader_reg_rx,
+                        )
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                        let syslog = TcpSyslogSource::new(
+                            key.clone(),
+                            tags.clone(),
+                            config.strip_header,
+                            config.attach_meta_tags,
+                            config.fast_strip,
+                            inner,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                        let mut meta = SourceMeta::new(key.clone(), spec.kind.clone());
+                        for (k, v) in tags.iter() {
+                            meta.tags.set(k, v);
+                        }
+                        if config.instances > 1 {
+                            meta.tags.set("instance".to_string(), (idx + 1).to_string());
+                        }
+                        source_handles.push(SourceHandle::new(Box::new(syslog), meta));
+                    }
+
                     let acceptor = TcpAcceptor::new(
                         spec.name.clone(),
                         config.address(),
                         1000,
-                        pool,
-                        vec![reg_tx],
+                        connection_registry,
+                        instance_reg_txs,
                     );
 
-                    let meta = meta_builder(&spec.name, &tags);
-                    let syslog = TcpSyslogSource::new(
-                        spec.name.clone(),
-                        tags,
-                        config.strip_header,
-                        config.attach_meta_tags,
-                        config.fast_strip,
-                        inner,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-
                     SourceSvcIns::new()
-                        .with_sources(vec![SourceHandle::new(Box::new(syslog), meta)])
+                        .with_sources(source_handles)
                         .with_acceptor(AcceptorHandle::new(spec.name.clone(), Box::new(acceptor)))
                 }
             };

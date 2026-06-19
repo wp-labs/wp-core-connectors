@@ -7,6 +7,9 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-06-19
+
+
 ## [0.5.3] - 2026-06-18
 
 ### Added
@@ -71,6 +74,43 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 - `arrow_conv.rs` 拆分为 `arrow_conv/{mod,schema,batch}.rs`
 
+## [0.4.1] - 2026-06-19
+
+### Fixed
+
+- Syslog UDP sink `sink_str_batch` 修复：UDP 每条消息必须是独立数据报，先前合并多消息为一次 `send()` 超过 65535 字节导致 `EMSGSIZE` 错误；现按传输类型分叉——TCP 保持合并 buffer 一次 `write()`，UDP 逐条 `send()`
+
+
+## [0.4.0] - 2026-06-19
+
+### Added
+
+- Syslog TCP source 支持 `instances` 多实例：`SyslogSourceSpec` 新增 `instances` 字段（默认 1，范围 [1, 16]）；factory TCP 分支改为循环建 N 个 `TcpSyslogSource` reader，共享 `connection_registry`，acceptor 传 N 个 `reg_tx` 实现连接 round-robin 分发
+- Syslog source builtin def 增加 `instances` 参数（默认 `1`）到 `default_params` 和 `allow_override`
+
+### Changed
+
+- Migrate all sink constructor and config-parsing functions from `anyhow::Result` to
+  `SinkResult` (`StructError<SinkReason>`), eliminating `anyhow::Error` from sink
+  production code paths
+- Enable `orion-error`'s `anyhow` feature so `anyhow::Error` implements
+  `UnstructuredSource`, allowing `.source_err()` on `anyhow::Result<T>` directly
+- Replace `SinkReason::resource_error().to_err().with_detail(e.to_string())` with
+  `.source_err(SinkReason::Sink, "...")` (for `anyhow`/`io` errors) or
+  `.source_raw_err(SinkReason::Sink, "...")` (for third-party `StdError` types),
+  preserving original error sources instead of stringifying them
+- Replace `anyhow::bail!`/`anyhow::anyhow!` in config validation functions
+  (`from_resolved`, `parse_fields_from_params`, `parse_target`,
+  `syslog_conf_from_spec`) with `SinkReason::core_conf().to_err().with_detail(...)`,
+  returning structured config errors directly
+- Remove redundant `.map_err(|e| SinkReason::core_conf().to_err().with_detail(...))`
+  wrappers from factory `validate_spec`/`build` methods now that parsing functions
+  return `SinkResult` natively
+
+### Removed
+
+- Remove `type AnyResult<T> = anyhow::Result<T>` type aliases from all sink modules
+
 ## [0.3.6] - 2026-06-13
 
 ### Added
@@ -122,31 +162,6 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   - Shared `payload_to_string/bytes` extractors and `wp_error_to_wf` error mapping
 - Add `SimpleFileSource` — lightweight line-by-line file reader implementing `DataSource`
 - Add comprehensive tests (13 cases): NDJSON type handling, file lifecycle, TCP Arrow IPC round-trip, empty/null/missing/invalid inputs
-
-## [0.3.0] - 2026-05-03
-
-### Changed
-
-- Migrate all sink constructor and config-parsing functions from `anyhow::Result` to
-  `SinkResult` (`StructError<SinkReason>`), eliminating `anyhow::Error` from sink
-  production code paths
-- Enable `orion-error`'s `anyhow` feature so `anyhow::Error` implements
-  `UnstructuredSource`, allowing `.source_err()` on `anyhow::Result<T>` directly
-- Replace `SinkReason::resource_error().to_err().with_detail(e.to_string())` with
-  `.source_err(SinkReason::Sink, "...")` (for `anyhow`/`io` errors) or
-  `.source_raw_err(SinkReason::Sink, "...")` (for third-party `StdError` types),
-  preserving original error sources instead of stringifying them
-- Replace `anyhow::bail!`/`anyhow::anyhow!` in config validation functions
-  (`from_resolved`, `parse_fields_from_params`, `parse_target`,
-  `syslog_conf_from_spec`) with `SinkReason::core_conf().to_err().with_detail(...)`,
-  returning structured config errors directly
-- Remove redundant `.map_err(|e| SinkReason::core_conf().to_err().with_detail(...))`
-  wrappers from factory `validate_spec`/`build` methods now that parsing functions
-  return `SinkResult` natively
-
-### Removed
-
-- Remove `type AnyResult<T> = anyhow::Result<T>` type aliases from all sink modules
 
 ## [0.2.0] - 2026-04-30
 
@@ -218,11 +233,15 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Preserve the first registered factory for duplicate connector kinds and emit diagnostics instead of silently overriding
 - Handle raw byte payloads in TCP and syslog sinks consistently with string payload handling
 
-[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.3...HEAD
+
+[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.4...HEAD
+[0.5.4]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.6...v0.5.0
+[0.4.1]: https://github.com/wp-labs/wp-core-connectors/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.2.0...v0.4.0
 [0.3.6]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.3...v0.3.4

@@ -17,6 +17,8 @@ pub struct SyslogSourceSpec {
     /// Fast strip mode (works for both UDP and TCP when header_mode=skip)
     /// Enables fast path that skips full syslog parsing when only stripping header
     pub fast_strip: bool,
+    /// Number of TCP reader instances (only relevant for TCP; UDP ignores this).
+    pub instances: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +109,19 @@ impl SyslogSourceSpec {
             .get("fast_strip")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        const DEFAULT_SYSLOG_TCP_INSTANCES: usize = 1;
+        const MAX_SYSLOG_TCP_INSTANCES: usize = 16;
+        let instances = params
+            .get("instances")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(DEFAULT_SYSLOG_TCP_INSTANCES as i64);
+        ensure!(
+            (1..=MAX_SYSLOG_TCP_INSTANCES as i64).contains(&instances),
+            "syslog.instances must be between 1 and {} (got {})",
+            MAX_SYSLOG_TCP_INSTANCES,
+            instances
+        );
+        let instances = instances as usize;
         Ok(Self {
             addr,
             port,
@@ -116,6 +131,7 @@ impl SyslogSourceSpec {
             strip_header,
             attach_meta_tags,
             fast_strip,
+            instances,
         })
     }
 

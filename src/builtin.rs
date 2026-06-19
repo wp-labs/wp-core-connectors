@@ -275,6 +275,7 @@ pub fn builtin_source_defs() -> Vec<ConnectorDef> {
         params.insert("udp_recv_buffer".into(), json!(8_388_608));
         params.insert("header_mode".into(), json!("skip"));
         params.insert("fast_strip".into(), json!(false));
+        params.insert("instances".into(), json!(1));
         defs.push(ConnectorDef {
             id: "syslog_src".into(),
             kind: "syslog".into(),
@@ -287,6 +288,7 @@ pub fn builtin_source_defs() -> Vec<ConnectorDef> {
                 "udp_recv_buffer".into(),
                 "header_mode".into(),
                 "fast_strip".into(),
+                "instances".into(),
             ],
             default_params: params,
             origin: Some("builtin:syslog_source".into()),
