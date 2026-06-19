@@ -531,7 +531,10 @@ mod tests {
         assert!(text.contains("msg2"), "should contain msg2");
         assert!(text.contains("msg3"), "should contain msg3");
         let newline_count = text.matches('\n').count();
-        assert_eq!(newline_count, 3, "TCP: each of 3 messages should end with newline");
+        assert_eq!(
+            newline_count, 3,
+            "TCP: each of 3 messages should end with newline"
+        );
     }
 
     #[tokio::test]
@@ -605,11 +608,8 @@ mod tests {
 
         let recv_task = tokio::spawn(async move {
             let mut buf = [0u8; 2048];
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                sock.recv_from(&mut buf),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv_from(&mut buf))
+                .await
             {
                 Ok(Ok((n, _src))) => Some(buf[..n].to_vec()),
                 _ => None,
@@ -623,6 +623,9 @@ mod tests {
         let datagram = recv_task.await.expect("join").expect("should receive");
         let text = String::from_utf8_lossy(&datagram);
         assert!(text.contains("single_msg"), "body: {text}");
-        assert!(!text.ends_with('\n'), "UDP should not append newline: {text:?}");
+        assert!(
+            !text.ends_with('\n'),
+            "UDP should not append newline: {text:?}"
+        );
     }
 }
