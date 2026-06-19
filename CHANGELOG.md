@@ -7,7 +7,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-05-03
+## [0.4.0] - 2026-06-19
+
+### Added
+
+- Syslog TCP source 支持 `instances` 多实例：`SyslogSourceSpec` 新增 `instances` 字段（默认 1，范围 [1, 16]）；factory TCP 分支改为循环建 N 个 `TcpSyslogSource` reader，共享 `connection_registry`，acceptor 传 N 个 `reg_tx` 实现连接 round-robin 分发
+- Syslog source builtin def 增加 `instances` 参数（默认 `1`）到 `default_params` 和 `allow_override`
 
 ### Changed
 
@@ -102,8 +107,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Preserve the first registered factory for duplicate connector kinds and emit diagnostics instead of silently overriding
 - Handle raw byte payloads in TCP and syslog sinks consistently with string payload handling
 
-[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.2.0...v0.3.0
+[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.2.0...v0.4.0
 [0.2.0]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.2.0
 [0.1.3]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.1.3
 [0.1.1]: https://github.com/wp-labs/wp-core-connectors/releases/tag/v0.1.1

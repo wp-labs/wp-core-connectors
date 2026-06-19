@@ -244,4 +244,80 @@ mod tests {
                 .await;
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn test_syslog_config_instances_default() {
+        let params = toml::map::Map::new();
+        let config =
+            SyslogSourceSpec::from_params(&wp_connector_api::parammap_from_toml_map(params))
+                .expect("default config");
+        assert_eq!(config.instances, 1);
+    }
+
+    #[test]
+    fn test_syslog_config_instances_custom() {
+        let mut params = toml::map::Map::new();
+        params.insert("instances".to_string(), toml::Value::Integer(4));
+        let config =
+            SyslogSourceSpec::from_params(&wp_connector_api::parammap_from_toml_map(params))
+                .expect("4 instances");
+        assert_eq!(config.instances, 4);
+    }
+
+    #[test]
+    fn test_syslog_config_instances_rejects_zero() {
+        let mut params = toml::map::Map::new();
+        params.insert("instances".to_string(), toml::Value::Integer(0));
+        let result =
+            SyslogSourceSpec::from_params(&wp_connector_api::parammap_from_toml_map(params));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_syslog_config_instances_rejects_too_large() {
+        let mut params = toml::map::Map::new();
+        params.insert("instances".to_string(), toml::Value::Integer(32));
+        let result =
+            SyslogSourceSpec::from_params(&wp_connector_api::parammap_from_toml_map(params));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_syslog_config_instances_accepts_max() {
+        let mut params = toml::map::Map::new();
+        params.insert("instances".to_string(), toml::Value::Integer(16));
+        let config =
+            SyslogSourceSpec::from_params(&wp_connector_api::parammap_from_toml_map(params))
+                .expect("16 instances (max)");
+        assert_eq!(config.instances, 16);
+    }
+
+    #[tokio::test]
+    async fn test_factory_tcp_multi_instance() {
+        let fac = factory::SyslogSourceFactory::new();
+        let mut params = toml::map::Map::new();
+        params.insert(
+            "protocol".to_string(),
+            toml::Value::String("tcp".to_string()),
+        );
+        params.insert("port".to_string(), toml::Value::Integer(0));
+        params.insert("instances".to_string(), toml::Value::Integer(2));
+        let spec = wp_connector_api::SourceSpec {
+            name: "syslog_multi".into(),
+            kind: "syslog".into(),
+            connector_id: String::new(),
+            params: wp_connector_api::parammap_from_toml_map(params),
+            tags: vec![],
+        };
+        let svc = fac.build(&spec, &ctx()).await.expect("build");
+        assert_eq!(svc.sources.len(), 2);
+        let mut idents: Vec<String> = svc.sources.iter().map(|h| h.source.identifier()).collect();
+        idents.sort();
+        assert_eq!(
+            idents,
+            vec!["syslog_multi#1".to_string(), "syslog_multi#2".to_string()]
+        );
+        // Acceptor should be present for TCP
+        assert!(svc.acceptor.is_some());
+    }
 }
