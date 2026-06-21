@@ -7,6 +7,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-06-21
+
+### Changed
+
+- `TcpArrowSink` 暴露 `encode_batch_payload`、`send_payload` 为 `pub`，新增 `encode_batch_payload_with_tag` 方法支持多流 tag 复用同一连接
+
 ## [0.5.4] - 2026-06-19
 
 
@@ -234,7 +240,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Handle raw byte payloads in TCP and syslog sinks consistently with string payload handling
 
 
-[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.4...HEAD
+[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.5...HEAD
+[0.5.5]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.1...v0.5.2

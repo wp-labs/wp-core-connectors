@@ -569,7 +569,7 @@ impl TcpArrowSink {
     /// - `arrow_framed`: wp_arrow frame `[tag_len][tag][ipc]`, RFC6587 length-prefixed
     ///   so the peer's `framing = "len"` can delineate messages.
     /// - otherwise (`arrow_ipc`/absent): a bare Arrow IPC Stream (legacy behaviour).
-    fn encode_batch_payload(
+    pub fn encode_batch_payload(
         &self,
         batch: &arrow::record_batch::RecordBatch,
     ) -> SinkResult<Vec<u8>> {
@@ -581,7 +581,25 @@ impl TcpArrowSink {
         }
     }
 
-    async fn send_payload(&mut self, payload: &[u8]) -> SinkResult<()> {
+    /// Like [`encode_batch_payload`], but uses the given `tag` instead of `self.tag`.
+    ///
+    /// This allows callers that multiplex multiple streams over a single TCP
+    /// connection (e.g. `conn_events`, `auth_events`, etc.) to tag each batch
+    /// independently so the receiver can route to the correct window.
+    pub fn encode_batch_payload_with_tag(
+        &self,
+        tag: &str,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> SinkResult<Vec<u8>> {
+        if self.framed {
+            let frame = encode_ipc_frame(tag, batch)?;
+            Ok(build_payload_bytes(&frame, Framing::Len))
+        } else {
+            encode_batch_ipc_stream(batch)
+        }
+    }
+
+    pub async fn send_payload(&mut self, payload: &[u8]) -> SinkResult<()> {
         match &mut self.conn {
             ConnState::Connected { writer } => match writer.write(payload).await {
                 Ok(()) => Ok(()),
