@@ -410,7 +410,7 @@ impl AsyncRawDataSink for FormattedFileSink {
 enum ArrowFileWriter {
     /// Legacy `arrow_ipc` mode: lazily-created `StreamWriter` (opened on first
     /// write with the inferred schema).
-    Stream(Option<StreamWriter<BufWriter<std::fs::File>>>),
+    Stream(Box<Option<StreamWriter<BufWriter<std::fs::File>>>>),
     /// `arrow_framed` mode: batches buffered in memory, flushed on `stop()`.
     FramedBuf {
         batches: Vec<arrow::record_batch::RecordBatch>,
@@ -456,7 +456,7 @@ impl ArrowFileSink {
             }
         } else {
             // Stream mode: lazily created on first write.
-            ArrowFileWriter::Stream(None)
+            ArrowFileWriter::Stream(Box::new(None))
         };
         Ok(Self {
             path: path.to_string(),
@@ -492,7 +492,7 @@ impl ArrowFileSink {
                         .source_err(SinkReason::Sink, "open arrow output file")?;
                     let writer = StreamWriter::try_new(BufWriter::new(file), &schema)
                         .source_raw_err(SinkReason::Sink, "create arrow stream writer")?;
-                    *opt = Some(writer);
+                    **opt = Some(writer);
                 }
             }
         }
@@ -537,7 +537,7 @@ impl AsyncRecordSink for ArrowFileSink {
         } else {
             let mut writer_guard = self.writer.lock().await;
             if let ArrowFileWriter::Stream(writer_opt) = &mut *writer_guard {
-                Self::write_stream_batch(writer_opt, &batch, self.sync)?;
+                Self::write_stream_batch(writer_opt.as_mut(), &batch, self.sync)?;
             }
         }
 
@@ -564,7 +564,7 @@ impl AsyncRecordSink for ArrowFileSink {
         } else {
             let mut writer_guard = self.writer.lock().await;
             if let ArrowFileWriter::Stream(writer_opt) = &mut *writer_guard {
-                Self::write_stream_batch(writer_opt, &batch, self.sync)?;
+                Self::write_stream_batch(writer_opt.as_mut(), &batch, self.sync)?;
             }
         }
 

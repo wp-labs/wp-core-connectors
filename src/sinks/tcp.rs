@@ -10,7 +10,8 @@ use wp_connector_api::{
     AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, ConnectorDef, SinkBuildCtx, SinkDefProvider,
     SinkFactory, SinkHandle, SinkSpec as ResolvedSinkSpec,
 };
-use wp_data_fmt::RecordFormatter; // for fmt_record
+use wp_data_fmt::{FormatType, RecordFormatter};
+use wp_model_core::model::fmt_def::TextFmt;
 
 use crate::net::transport::{BackoffMode, NetSendPolicy, NetWriter, net_backoff_adaptive};
 
@@ -31,6 +32,7 @@ struct TcpSinkSpec {
     addr: String,
     port: u16,
     framing: Framing,
+    fmt: TextFmt,
 }
 
 impl TcpSinkSpec {
@@ -68,10 +70,17 @@ impl TcpSinkSpec {
         };
         Self::ensure_bool(spec, "max_backoff")?;
         Self::ensure_bool(spec, "sendq_backpressure")?;
+        let fmt = spec
+            .params
+            .get("fmt")
+            .and_then(|v| v.as_str())
+            .map(TextFmt::from)
+            .unwrap_or(TextFmt::Raw);
         Ok(Self {
             addr,
             port,
             framing,
+            fmt,
         })
     }
 
@@ -96,7 +105,10 @@ const TCP_DRAIN_MAX_SECS: u64 = 10;
 
 pub struct TcpSink {
     writer: NetWriter,
+    target_addr: String,
+    rate_limit_rps: usize,
     framing: Framing,
+    fmt: TextFmt,
     sent_cnt: u64,
 }
 
@@ -124,7 +136,10 @@ impl TcpSink {
         log::info!("tcp sink connected: target={}", target);
         Ok(Self {
             writer,
+            target_addr: target,
+            rate_limit_rps,
             framing: spec.framing,
+            fmt: spec.fmt,
             sent_cnt: 0,
         })
     }
@@ -142,6 +157,24 @@ impl AsyncCtrl for TcpSink {
         Ok(())
     }
     async fn reconnect(&mut self) -> SinkResult<()> {
+        let _ = self.writer.shutdown().await;
+        let mode = if self.rate_limit_rps == 0 {
+            BackoffMode::ForceOn
+        } else {
+            BackoffMode::ForceOff
+        };
+        let writer = NetWriter::connect_tcp_with_policy(
+            &self.target_addr,
+            NetSendPolicy {
+                rate_limit_rps: self.rate_limit_rps,
+                backoff_mode: mode,
+                adaptive: net_backoff_adaptive(),
+            },
+        )
+        .await
+        .source_err(SinkReason::Sink, "tcp sink reconnect tcp")?;
+        log::info!("tcp sink reconnected: target={}", self.target_addr);
+        self.writer = writer;
         Ok(())
     }
 }
@@ -149,9 +182,8 @@ impl AsyncCtrl for TcpSink {
 #[async_trait]
 impl AsyncRecordSink for TcpSink {
     async fn sink_record(&mut self, data: &wp_model_core::model::DataRecord) -> SinkResult<()> {
-        // 复用 Raw 格式化，随后走 raw 路径
-        let raw = wp_data_fmt::Raw::new().fmt_record(data);
-        AsyncRawDataSink::sink_str(self, raw.as_str()).await
+        let output = FormatType::from(&self.fmt).fmt_record(data);
+        AsyncRawDataSink::sink_str(self, output.as_str()).await
     }
 
     async fn sink_records(
