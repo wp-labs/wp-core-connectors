@@ -7,6 +7,16 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-06-26
+
+### Fixed
+
+- Box `ArrowFileWriter::Stream` 变体，修复 clippy `large_enum_variant` 警告
+
+### Changed
+
+- TCP sink 实现 `reconnect` 并支持可配置输出格式
+
 ## [0.5.5] - 2026-06-21
 
 ### Changed
@@ -240,7 +250,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Handle raw byte payloads in TCP and syslog sinks consistently with string payload handling
 
 
-[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.5...HEAD
+[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.7...HEAD
+[0.5.7]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.5...v0.5.7
 [0.5.5]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.2...v0.5.3
