@@ -7,6 +7,28 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-26
+
+### Added
+
+- 依赖 `wp-connector-utils` v0.1.0：Arrow IPC 编解码、WireFormat、NDJSON 转换、BatchMeta 处理等共享逻辑统一移入
+- `AsyncRecordSink::sink_records_with_meta` 实现：`TcpArrowSink` 用 `oml_name` 作 frame tag，`FormattedFileSink`/`TcpSink`/`SyslogSink` 注入 `wp_oml_name` 字段
+- `ArrowFileSink` framed 模式支持从 `BatchMeta.oml_name` 更新输出 tag
+
+### Changed
+
+- **arrow_conv 模块迁移至 `wp-connector-utils::arrow`**：
+  - `encode_batch_ipc_stream` / `encode_ipc_frame` / `encode_ipc_frame_multi` → 委托到共享 crate
+  - `infer_arrow_schema` / `infer_schema_from_record` → 重导出
+  - `data_record_to_batch` / `data_records_to_batch` → 重导出
+  - 删除本地 `batch.rs` / `schema.rs`
+- **`sources/batch/arrow.rs`**：`WireFormat` 重导出 + decode 薄 wrapper
+- **`sources/batch/ndjson.rs`**：重导出自 `wp_connector_utils::ndjson`
+
+### Documentation
+
+- CHANGELOG 补全 v0.5.7~v0.7.0 条目
+
 ## [0.5.7] - 2026-06-26
 
 ### Fixed
@@ -250,7 +272,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Handle raw byte payloads in TCP and syslog sinks consistently with string payload handling
 
 
-[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.7...HEAD
+[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.7...v0.7.0
 [0.5.7]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.5...v0.5.7
 [0.5.5]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.3...v0.5.4

@@ -7,8 +7,8 @@ use orion_error::conversion::{SourceErr, ToStructError};
 use wp_connector_api::SinkReason;
 use wp_connector_api::SinkResult;
 use wp_connector_api::{
-    AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, ConnectorDef, SinkBuildCtx, SinkDefProvider,
-    SinkFactory, SinkHandle, SinkSpec as ResolvedSinkSpec,
+    AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, BatchMeta, ConnectorDef, SinkBuildCtx,
+    SinkDefProvider, SinkFactory, SinkHandle, SinkSpec as ResolvedSinkSpec,
 };
 use wp_data_fmt::{FormatType, RecordFormatter};
 use wp_model_core::model::fmt_def::TextFmt;
@@ -194,6 +194,15 @@ impl AsyncRecordSink for TcpSink {
             self.sink_record(&record).await?;
         }
         Ok(())
+    }
+
+    async fn sink_records_with_meta(
+        &mut self,
+        meta: BatchMeta,
+        data: Vec<std::sync::Arc<wp_model_core::model::DataRecord>>,
+    ) -> SinkResult<()> {
+        let data = wp_connector_utils::batch::inject_oml_name(&meta, data);
+        self.sink_records(data).await
     }
 }
 
@@ -711,6 +720,44 @@ impl AsyncRecordSink for TcpArrowSink {
                 row_count,
                 schema.fields().len(),
                 payload.len(),
+            );
+        }
+        self.sent_cnt = self.sent_cnt.saturating_add(1);
+        Ok(())
+    }
+
+    /// Override to honour [`BatchMeta::oml_name`] as the Arrow frame tag.
+    ///
+    /// Priority: `BatchMeta.oml_name` (non-empty) > connector `tag` config.
+    async fn sink_records_with_meta(
+        &mut self,
+        meta: BatchMeta,
+        data: Vec<Arc<wp_model_core::model::DataRecord>>,
+    ) -> SinkResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let row_count = data.len();
+        let schema = self.get_or_infer_schema(&data[0]).await?;
+        let batch = data_records_to_batch(&data, &schema)?;
+
+        let tag = meta.oml_name().unwrap_or(&self.tag).to_string();
+        let payload = if self.framed {
+            let frame = encode_ipc_frame(&tag, &batch)?;
+            build_payload_bytes(&frame, Framing::Len)
+        } else {
+            encode_batch_ipc_stream(&batch)?
+        };
+
+        self.send_payload(&payload).await?;
+
+        if self.sent_cnt == 0 {
+            log::info!(
+                "tcp_arrow sink first-send: rows={} cols={} payload_bytes={} tag={}",
+                row_count,
+                schema.fields().len(),
+                payload.len(),
+                tag,
             );
         }
         self.sent_cnt = self.sent_cnt.saturating_add(1);

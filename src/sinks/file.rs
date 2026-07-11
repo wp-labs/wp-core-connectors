@@ -381,6 +381,15 @@ impl AsyncRecordSink for FormattedFileSink {
         let refs: Vec<&str> = batch.iter().map(|s| s.as_str()).collect();
         self.inner.sink_str_batch(refs).await
     }
+
+    async fn sink_records_with_meta(
+        &mut self,
+        meta: wp_connector_api::BatchMeta,
+        data: Vec<std::sync::Arc<DataRecord>>,
+    ) -> SinkResult<()> {
+        let data = wp_connector_utils::batch::inject_oml_name(&meta, data);
+        self.sink_records(data).await
+    }
 }
 
 #[async_trait]
@@ -414,6 +423,8 @@ enum ArrowFileWriter {
     /// `arrow_framed` mode: batches buffered in memory, flushed on `stop()`.
     FramedBuf {
         batches: Vec<arrow::record_batch::RecordBatch>,
+        /// Tag to use when encoding the frame; updated by `sink_records_with_meta`.
+        tag: String,
     },
 }
 
@@ -425,8 +436,6 @@ pub struct ArrowFileSink {
     sent_cnt: u64,
     /// Whether to produce wp_arrow frames (`arrow_framed`).
     framed: bool,
-    /// Stream tag embedded in the wp_arrow frame (only used when `framed`).
-    tag: String,
 }
 
 impl ArrowFileSink {
@@ -453,6 +462,7 @@ impl ArrowFileSink {
         let writer = if framed {
             ArrowFileWriter::FramedBuf {
                 batches: Vec::new(),
+                tag: tag.to_string(),
             }
         } else {
             // Stream mode: lazily created on first write.
@@ -465,7 +475,6 @@ impl ArrowFileSink {
             sync,
             sent_cnt: 0,
             framed,
-            tag: tag.to_string(),
         })
     }
 
@@ -531,7 +540,7 @@ impl AsyncRecordSink for ArrowFileSink {
 
         if self.framed {
             let mut writer_guard = self.writer.lock().await;
-            if let ArrowFileWriter::FramedBuf { batches } = &mut *writer_guard {
+            if let ArrowFileWriter::FramedBuf { batches, .. } = &mut *writer_guard {
                 batches.push(batch);
             }
         } else {
@@ -558,7 +567,7 @@ impl AsyncRecordSink for ArrowFileSink {
 
         if self.framed {
             let mut writer_guard = self.writer.lock().await;
-            if let ArrowFileWriter::FramedBuf { batches } = &mut *writer_guard {
+            if let ArrowFileWriter::FramedBuf { batches, .. } = &mut *writer_guard {
                 batches.push(batch);
             }
         } else {
@@ -579,6 +588,25 @@ impl AsyncRecordSink for ArrowFileSink {
         }
         self.sent_cnt = self.sent_cnt.saturating_add(1);
         Ok(())
+    }
+
+    async fn sink_records_with_meta(
+        &mut self,
+        meta: wp_connector_api::BatchMeta,
+        data: Vec<std::sync::Arc<DataRecord>>,
+    ) -> SinkResult<()> {
+        if self.framed {
+            // Update the FramedBuf tag if meta provides an oml_name
+            if let Some(name) = meta.oml_name()
+                && !name.is_empty()
+            {
+                let mut writer_guard = self.writer.lock().await;
+                if let ArrowFileWriter::FramedBuf { tag, .. } = &mut *writer_guard {
+                    *tag = name.to_string();
+                }
+            }
+        }
+        self.sink_records(data).await
     }
 }
 
@@ -628,8 +656,8 @@ impl AsyncCtrl for ArrowFileSink {
                     }
                 }
             }
-            ArrowFileWriter::FramedBuf { batches } => {
-                let payload = encode_ipc_frame_multi(&self.tag, batches)?;
+            ArrowFileWriter::FramedBuf { batches, tag } => {
+                let payload = encode_ipc_frame_multi(tag, batches)?;
                 std::fs::write(&self.path, &payload)
                     .source_err(SinkReason::Sink, "arrow_file write framed")?;
                 if self.sync {

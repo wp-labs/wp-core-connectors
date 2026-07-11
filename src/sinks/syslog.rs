@@ -4,8 +4,8 @@ use orion_error::conversion::{SourceErr, ToStructError};
 use wp_connector_api::SinkReason;
 use wp_connector_api::SinkResult;
 use wp_connector_api::{
-    AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, ConnectorDef, SinkBuildCtx, SinkDefProvider,
-    SinkFactory, SinkHandle, SinkSpec as ResolvedSinkSpec,
+    AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, BatchMeta, ConnectorDef, SinkBuildCtx,
+    SinkDefProvider, SinkFactory, SinkHandle, SinkSpec as ResolvedSinkSpec,
 };
 use wp_data_fmt::RecordFormatter; // for fmt_record
 // no extra orion-error/conf helpers needed after route-builder removal
@@ -225,6 +225,15 @@ impl AsyncRecordSink for SyslogSink {
             self.sink_record(&record).await?;
         }
         Ok(())
+    }
+
+    async fn sink_records_with_meta(
+        &mut self,
+        meta: BatchMeta,
+        data: Vec<std::sync::Arc<wp_model_core::model::DataRecord>>,
+    ) -> SinkResult<()> {
+        let data = wp_connector_utils::batch::inject_oml_name(&meta, data);
+        self.sink_records(data).await
     }
 }
 
