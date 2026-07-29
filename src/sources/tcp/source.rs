@@ -196,15 +196,6 @@ impl<'a> ConnectionGuard<'a> {
 impl<'a> Drop for ConnectionGuard<'a> {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            let pending_events = conn.pending_len();
-            let pending_bytes = conn.pending_bytes();
-            warn_ctrl!(
-                "TCP source '{}' guard dropped without disposition; requeueing conn {} (pending_events={}, pending_bytes={})",
-                self.source.key,
-                self.conn_id,
-                pending_events,
-                pending_bytes
-            );
             self.source.push_connection_back(self.conn_id, conn);
         }
     }
