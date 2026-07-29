@@ -215,7 +215,7 @@ impl AsyncRawDataSink for TcpSink {
                 "tcp sink first-send: framing={:?} msg_len={} preview='{}'",
                 self.framing,
                 payload.len(),
-                &data.chars().take(64).collect::<String>()
+                data.chars().take(64).collect::<String>()
             );
         }
         self.writer.write(&payload).await?;
