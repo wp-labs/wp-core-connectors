@@ -7,6 +7,11 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Changed
+
+- **TCP Source**: 移除 `ConnectionGuard` drop 时的噪音 requeue 警告日志（断线重连不再刷无关 warn）
+- **TCP Sink**: 修复 clippy 警告
+
 ## [0.7.0] - 2026-06-26
 
 ### Added
