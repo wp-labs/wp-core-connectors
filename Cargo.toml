@@ -1,6 +1,6 @@
 [package]
 name = "wp-core-connectors"
-version = "0.8.0" #@gxl:set(version)
+version = "0.8.1" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 authors = ["WarpParse Dev Team"]
@@ -40,7 +40,7 @@ wp-connector-api = "0.12"
 wp-connector-utils = "0.2"
 wf-connector-api =  "0.2"
 wp-model-core = "0.9"
-wp-conf-base = "0.4"
+wp-conf-base = "0.5"
 wp-data-fmt = "0.9"
 wp-log = "0.4"
 
