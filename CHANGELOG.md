@@ -7,6 +7,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-04
+
+### ⚠️ BREAKING CHANGES
+
+- 依赖升级：`wp-model-core` 0.8 → 0.9（上游新增 `Value::BigUint` / `DataType::BigInt` 变体）、`wp-connector-api` 0.11 → 0.12、`wp-connector-utils` 0.1 → 0.2、`wp-data-fmt` 0.2 → 0.9
+
 ### Changed
 
 - **TCP Source**: 移除 `ConnectionGuard` drop 时的噪音 requeue 警告日志（断线重连不再刷无关 warn）
@@ -277,7 +283,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Handle raw byte payloads in TCP and syslog sinks consistently with string payload handling
 
 
-[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.7.1...v0.8.0
 [0.7.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.7...v0.7.0
 [0.5.7]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.5...v0.5.7
 [0.5.5]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.4...v0.5.5
