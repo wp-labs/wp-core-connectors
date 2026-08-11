@@ -7,6 +7,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-08-11
+
 ### Fixed
 
 - **TCP Source**: 修复连接 EOF 时丢弃缓冲区内未处理帧的问题。`try_read_batch`/`read_batch`
@@ -292,7 +294,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Handle raw byte payloads in TCP and syslog sinks consistently with string payload handling
 
 
-[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/wp-labs/wp-core-connectors/compare/v0.8.0...v0.8.2
 [0.8.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.7.1...v0.8.0
 [0.7.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.7...v0.7.0
 [0.5.7]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.5...v0.5.7
