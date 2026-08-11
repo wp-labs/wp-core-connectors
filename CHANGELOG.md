@@ -7,6 +7,15 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- **TCP Source**: 修复连接 EOF 时丢弃缓冲区内未处理帧的问题。`try_read_batch`/`read_batch`
+  在 socket EOF 时直接返回 `Closed`，但 `drain_messages` 会因 batch 字节/容量上限提前 break，
+  把连接尾部帧（大帧后面的较小帧）留在 buffer——关闭时这些事件被静默丢弃，
+  持续流（sustain）输入丢 ~5-6%。现在 EOF 时先把剩余缓冲帧与 pending 事件 drain 成
+  batch 返回 `Produced`，下一轮读到空才关闭。实测 sustain 1M 事件从 94% 送达（~97s）
+  提升到 100%（~32s）。
+
 ## [0.8.0] - 2026-08-04
 
 ### ⚠️ BREAKING CHANGES
