@@ -109,6 +109,26 @@ impl TcpConnection {
         loop {
             match self.stream.try_read_buf(self.batcher.buffer_mut()) {
                 Ok(0) => {
+                    // EOF — drain any frames still buffered or pending before
+                    // closing. `drain_messages` breaks on a batch byte/capacity
+                    // cap, leaving the tail of the stream in the buffer; if we
+                    // close now, those events are silently dropped (a single
+                    // oversized frame like a big conn batch can leave the
+                    // smaller auth/dns frames behind).
+                    self.batcher.drain_messages(
+                        self.framing,
+                        self.client_addr.ip(),
+                        &mut produced,
+                        &mut produced_bytes,
+                    );
+                    let mut extra = SourceBatch::with_capacity(self.batcher.batch_capacity);
+                    let mut extra_bytes = 0usize;
+                    self.batcher.fill_batch_from_pending(&mut extra, &mut extra_bytes);
+                    produced.extend(extra);
+                    produced_bytes += extra_bytes;
+                    if !produced.is_empty() {
+                        return Ok(ReadOutcome::Produced(produced));
+                    }
                     info_data!(
                         "TCP conn {} try_read returned EOF (pending_events={} pending_bytes={})",
                         self.client_addr,
@@ -171,6 +191,23 @@ impl TcpConnection {
             }
             match self.stream.try_read_buf(self.batcher.buffer_mut()) {
                 Ok(0) => {
+                    // EOF — drain any frames still buffered or pending before
+                    // closing (see try_read_batch: a batch-cap break leaves the
+                    // tail of the stream unprocessed).
+                    self.batcher.drain_messages(
+                        self.framing,
+                        self.client_addr.ip(),
+                        &mut produced,
+                        &mut produced_bytes,
+                    );
+                    let mut extra = SourceBatch::with_capacity(self.batcher.batch_capacity);
+                    let mut extra_bytes = 0usize;
+                    self.batcher.fill_batch_from_pending(&mut extra, &mut extra_bytes);
+                    produced.extend(extra);
+                    produced_bytes += extra_bytes;
+                    if !produced.is_empty() {
+                        return Ok(ReadOutcome::Produced(produced));
+                    }
                     info_data!(
                         "TCP conn {} blocking read returned EOF (pending_events={} pending_bytes={})",
                         self.client_addr,
