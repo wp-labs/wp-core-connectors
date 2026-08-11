@@ -121,11 +121,7 @@ impl TcpConnection {
                         &mut produced,
                         &mut produced_bytes,
                     );
-                    let mut extra = SourceBatch::with_capacity(self.batcher.batch_capacity);
-                    let mut extra_bytes = 0usize;
-                    self.batcher.fill_batch_from_pending(&mut extra, &mut extra_bytes);
-                    produced.extend(extra);
-                    produced_bytes += extra_bytes;
+                    self.batcher.fill_batch_from_pending(&mut produced, &mut produced_bytes);
                     if !produced.is_empty() {
                         return Ok(ReadOutcome::Produced(produced));
                     }
@@ -200,11 +196,7 @@ impl TcpConnection {
                         &mut produced,
                         &mut produced_bytes,
                     );
-                    let mut extra = SourceBatch::with_capacity(self.batcher.batch_capacity);
-                    let mut extra_bytes = 0usize;
-                    self.batcher.fill_batch_from_pending(&mut extra, &mut extra_bytes);
-                    produced.extend(extra);
-                    produced_bytes += extra_bytes;
+                    self.batcher.fill_batch_from_pending(&mut produced, &mut produced_bytes);
                     if !produced.is_empty() {
                         return Ok(ReadOutcome::Produced(produced));
                     }
