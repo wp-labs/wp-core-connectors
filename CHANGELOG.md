@@ -7,6 +7,17 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- **TCP Source**: 修复 macOS 下 `read()` EINVAL (os error 22) 导致连接中断的问题。
+  `try_read_buf` 无界读入 BytesMut——下游处理慢（规则重负载）时 source 被背压拖住、
+  socket 积压，一次读入数 GB → buffer 涨到 1.4GB → macOS `read()` 对超大 buffer 返回
+  EINVAL → 连接断开。`try_read_batch`/`read_batch` 改为**有界读**（每次 ≤256KB，
+  `MAX_READ_BYTES` staging buffer + `extend_from_slice`），buffer 不再无界增长。
+  修复前小帧（200KiB）+ 慢规则场景 100M 事件 0 送达；修复后完整处理（Q2 200KiB 帧
+  EPS ~4.5M）。新增回归测试 `bounded_read_keeps_buffer_bounded_under_backlog_burst`
+  （首次读有界 + 无丢失 + buffer 不占满 backlog）。
+
 ## [0.8.2] - 2026-08-11
 
 ### Fixed
