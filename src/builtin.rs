@@ -134,9 +134,7 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
         params.insert("addr".into(), json!("127.0.0.1"));
         params.insert("port".into(), json!(1514));
         params.insert("protocol".into(), json!("udp"));
-        params.insert("strip_header".into(), json!(true));
-        params.insert("attach_meta_tags".into(), json!(true));
-        params.insert("tcp_recv_bytes".into(), json!(256000));
+        params.insert("header_mode".into(), json!("wrap"));
         defs.push(ConnectorDef {
             id: "syslog_sink".into(),
             kind: "syslog".into(),
@@ -146,6 +144,7 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
                 "port".into(),
                 "protocol".into(),
                 "app_name".into(),
+                "header_mode".into(),
             ],
             default_params: params,
             origin: Some("builtin:syslog_sink".into()),
