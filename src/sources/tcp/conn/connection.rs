@@ -1,6 +1,6 @@
 use crate::sources::event_id::next_event_id;
 use crate::sources::tcp::framing::{FramingExtractor, FramingMode};
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
@@ -12,10 +12,11 @@ use wp_model_core::raw::RawData;
 const DEFAULT_BATCH_CAPACITY: usize = 128;
 const MAX_BATCH_BYTES: usize = 64 * 1024; // soft cap; single payload may exceed but only single event allowed
 const MAX_PENDING_BYTES: usize = 256 * 1024;
-// Bounded per-read amount. Reading unbounded into the BytesMut (which grows to
-// the socket backlog size) lets the buffer balloon to GBs under backpressure,
-// after which macOS read() fails with EINVAL (os error 22). 256KiB/read keeps
-// the buffer bounded while still batching efficiently.
+// Per-read capacity budget. Reading unbounded into the BytesMut (which grows
+// to the socket backlog size) lets the buffer balloon to GBs under backpressure,
+// after which macOS read() fails with EINVAL (os error 22). Before each read we
+// ensure at least this much spare capacity, so a single read stays in the
+// low-MiB range and the buffer can't balloon.
 const MAX_READ_BYTES: usize = 256 * 1024;
 // When idle and buffer is large, shrink capacity to reduce RSS footprint.
 // Balanced shrink thresholds：空闲时将过大的缓冲收缩到较小基线
@@ -111,9 +112,8 @@ impl TcpConnection {
         if !produced.is_empty() {
             return Ok(ReadOutcome::Produced(produced));
         }
-        let mut staging = [0u8; MAX_READ_BYTES];
         loop {
-            match self.stream.try_read(&mut staging) {
+            match self.batcher.bounded_try_read(&self.stream) {
                 Ok(0) => {
                     // EOF — drain any frames still buffered or pending before
                     // closing. `drain_messages` breaks on a batch byte/capacity
@@ -141,9 +141,6 @@ impl TcpConnection {
                     return Ok(ReadOutcome::Closed);
                 }
                 Ok(n) => {
-                    // Bounded read: append at most MAX_READ_BYTES so a backlog
-                    // burst can't inflate the buffer to GBs (→ macOS EINVAL).
-                    self.batcher.buffer.extend_from_slice(&staging[..n]);
                     trace_data!(
                         "TCP conn {} try_read read {}B (pending_before={} bytes_before={})",
                         self.client_addr,
@@ -189,7 +186,6 @@ impl TcpConnection {
         if !produced.is_empty() {
             return Ok(ReadOutcome::Produced(produced));
         }
-        let mut staging = [0u8; MAX_READ_BYTES];
         loop {
             if let Err(e) = self.stream.readable().await {
                 return Err(SourceReason::disconnect(format!(
@@ -197,7 +193,7 @@ impl TcpConnection {
                     self.client_addr, e
                 )));
             }
-            match self.stream.try_read(&mut staging) {
+            match self.batcher.bounded_try_read(&self.stream) {
                 Ok(0) => {
                     // EOF — drain any frames still buffered or pending before
                     // closing (see try_read_batch: a batch-cap break leaves the
@@ -222,9 +218,6 @@ impl TcpConnection {
                     return Ok(ReadOutcome::Closed);
                 }
                 Ok(n) => {
-                    // Bounded read (see try_read_batch): cap per-read bytes so a
-                    // backlog burst can't inflate the buffer to GBs (→ EINVAL).
-                    self.batcher.buffer.extend_from_slice(&staging[..n]);
                     trace_data!(
                         "TCP conn {} blocking read read {}B (pending_before={} bytes_before={})",
                         self.client_addr,
@@ -294,6 +287,22 @@ impl BatchBuilder {
             max_batch_bytes,
             max_pending_bytes,
         }
+    }
+
+    /// Bounded direct read into the internal `buffer` (no staging copy).
+    ///
+    /// v0.8.2 read straight into the BytesMut via `try_read_buf`, which was
+    /// fast; v0.8.3 moved to a fixed staging buffer + copy to keep the buffer
+    /// bounded (macOS read() EINVAL), which regressed TCP throughput ~2.6x
+    /// (50.6万/s → 19.4万/s in the parse_to_blackhole benchmark). This keeps
+    /// the direct zero-copy read path but reserves at least `MAX_READ_BYTES` of
+    /// spare capacity before each read, so a single read can't balloon the
+    /// buffer to GBs under a large socket backlog.
+    fn bounded_try_read(&mut self, stream: &TcpStream) -> std::io::Result<usize> {
+        if self.buffer.remaining_mut() < MAX_READ_BYTES {
+            self.buffer.reserve(MAX_READ_BYTES);
+        }
+        stream.try_read_buf(&mut self.buffer)
     }
 
     /// Opportunistically shrink the internal buffer when idle to reclaim memory.
@@ -626,6 +635,107 @@ mod tests {
             peak_buf < TOTAL_BYTES,
             "buffer peak must stay below the full backlog, got {} bytes",
             peak_buf
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_bounded_read_no_loss_order_and_buffer_ceiling() {
+        // Exercises the bounded-direct-read path (bounded_try_read) end to end:
+        // - every line must arrive exactly once and in order across many batches
+        //   (crosses the 128-event / 64KiB batch caps and the 256KiB pending cap);
+        // - the internal buffer must never balloon to the full backlog (the
+        //   macOS EINVAL regression this read bounds against).
+        if std::env::var("WP_NET_TESTS").unwrap_or_default() != "1" {
+            return;
+        }
+        const LINES: usize = 4000;
+        // ~256B per line → total backlog ~1MiB, far above a single read budget.
+        let body = "x".repeat(240);
+        let mut frame = String::with_capacity(250);
+        let mut frames: Vec<String> = Vec::with_capacity(LINES);
+        for i in 0..LINES {
+            frame.clear();
+            frame.push_str(&format!("{i:05}"));
+            frame.push_str(&body);
+            frame.push('\n');
+            frames.push(frame.clone());
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().unwrap();
+        let send_frames = frames.clone();
+        let writer = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect client");
+            for chunk in send_frames.chunks(100) {
+                let mut buf = String::new();
+                for f in chunk {
+                    buf.push_str(f);
+                }
+                client.write_all(buf.as_bytes()).await.expect("write chunk");
+            }
+            client.shutdown().await.expect("shutdown");
+        });
+
+        let (stream, peer) = listener.accept().await.expect("accept");
+        let mut conn = TcpConnection::new(
+            stream,
+            peer,
+            FramingMode::Line,
+            Tags::new(),
+            4096,
+            "test".into(),
+        );
+        // Drain concurrently with the writer: awaiting the writer first would
+        // deadlock once the backlog exceeds the socket buffers (1MiB > default).
+
+        let backlog_bytes = frames.iter().map(String::len).sum::<usize>();
+        let mut got: Vec<u32> = Vec::with_capacity(LINES);
+        let mut peak_capacity = conn.batcher.buffer.capacity();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out after {}/{} lines",
+                got.len(),
+                LINES
+            );
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(2), conn.read_batch())
+                    .await
+                    .expect("read_batch timeout")
+                    .expect("read_batch error");
+            match outcome {
+                ReadOutcome::Produced(batch) => {
+                    for ev in &batch {
+                        let RawData::Bytes(bytes) = &ev.payload else {
+                            panic!("expected bytes payload")
+                        };
+                        let text = std::str::from_utf8(bytes).expect("utf8");
+                        got.push(text[..5].parse().expect("seq"));
+                    }
+                    peak_capacity = peak_capacity.max(conn.batcher.buffer.capacity());
+                }
+                ReadOutcome::NoData => tokio::task::yield_now().await,
+                ReadOutcome::Closed => break,
+            }
+        }
+
+        assert_eq!(got.len(), LINES, "no loss");
+        writer.await.expect("writer task");
+        assert!(
+            got.windows(2).all(|w| w[0] + 1 == w[1]),
+            "order preserved without duplicates"
+        );
+        // Buffer capacity (not just length) must stay far below the backlog:
+        // the pre-fix unbounded read would swallow the whole backlog at once.
+        assert!(
+            peak_capacity < backlog_bytes,
+            "buffer capacity {} must stay below backlog {backlog_bytes}",
+            peak_capacity
         );
     }
 
