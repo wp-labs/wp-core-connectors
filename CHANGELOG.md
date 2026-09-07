@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.4] - 2026-09-07
 
 ### Fixed
 
@@ -13,10 +13,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   v0.8.2 直读 `try_read_buf` 到连接级 BytesMut（零拷贝）在 parse_to_blackhole 压测约
   50.6万/s；v0.8.3 改为 256KiB staging + `extend_from_slice` 后跌到约 19.4万/s
   （CPU 不降反升）。现改为**有界直读**：读前保证 ≥256KiB 空闲容量再 `try_read_buf`，
-  既保留“buffer 不涨到 GB 级”（下方 macOS EINVAL 防护）又恢复零拷贝热路径，
+  既保留“buffer 不涨到 GB 级”（见 [0.8.3] EINVAL 防护）又恢复零拷贝热路径，
   复测回到约 50.6万/s（CPU ~161%）。新增回归测试
   `direct_bounded_read_no_loss_order_and_buffer_ceiling`：大 backlog 跨批切分下
   无丢失、顺序保持、buffer 峰值 < 全量积压。
+
+## [0.8.3] - 2026-08-15
+
+### Fixed
 
 - **TCP Source**: 修复 macOS 下 `read()` EINVAL (os error 22) 导致连接中断的问题。
   `try_read_buf` 无界读入 BytesMut——下游处理慢（规则重负载）时 source 被背压拖住、
