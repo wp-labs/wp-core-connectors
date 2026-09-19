@@ -954,11 +954,11 @@ mod tests {
 
         let rec1 = Arc::new(DataRecord::from(vec![
             FieldStorage::from(Field::from_chars("name", "alice")),
-            FieldStorage::from(Field::from_digit("count", 42)),
+            FieldStorage::from(Field::from_int("count", 42)),
         ]));
         let rec2 = Arc::new(DataRecord::from(vec![
             FieldStorage::from(Field::from_chars("name", "bob")),
-            FieldStorage::from(Field::from_digit("count", 7)),
+            FieldStorage::from(Field::from_int("count", 7)),
         ]));
         // Single sink_records call with 2 records → one IPC stream, 2 rows
         h.sink

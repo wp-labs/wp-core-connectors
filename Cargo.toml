@@ -1,6 +1,6 @@
 [package]
 name = "wp-core-connectors"
-version = "0.8.4" #@gxl:set(version)
+version = "0.9.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 authors = ["WarpParse Dev Team"]
@@ -17,9 +17,9 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1.0"
-arrow = { version = "59", default-features = false, features = ["ipc"] }
+arrow = { version = "60", default-features = false, features = ["ipc"] }
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1.11"
 chrono = "0.4"
 glob = "0.3"
@@ -36,12 +36,12 @@ orion_conf = "0.7"
 orion-error = { version = "0.8", features = ["anyhow"] }
 thiserror = "2"
 tokio = { version = "1.51", features = ["full"] }
-wp-connector-api = "0.12"
-wp-connector-utils = "0.2"
-wf-connector-api =  "0.2"
-wp-model-core = "0.9"
-wp-conf-base = "0.5"
-wp-data-fmt = "0.9"
+wp-connector-api = "0.13"
+wp-connector-utils = "0.3"
+wf-connector-api =  "0.3"
+wp-model-core = "0.10"
+wp-conf-base = "0.6"
+wp-data-fmt = "0.10"
 wp-log = "0.4"
 
 [features]

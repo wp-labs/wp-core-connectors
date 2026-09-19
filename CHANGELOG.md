@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-09-19
+
+### ⚠️ BREAKING CHANGES
+
+- 依赖 `arrow` 59 → 60：arrow 类型在本 crate 的公开 API 里（`decode_arrow_ipc_batches(...) -> SourceResult<Vec<RecordBatch>>` 等），Cargo 把「公开 API 中出现的依赖大版本」视为公开 API 的一部分 —— 消费方必须**同一次**一起升到 arrow 60，否则依赖图里两份 arrow 会让 `RecordBatch` 变成两个不同类型、编译期直接失败。
+- 依赖 `wp-model-core` 0.9 → 0.10：上游把整数类型正名（`Value::Digit` → `Value::Int`、`DataType::Digit` → `DataType::Int`、`from_digit` → `from_int`、serde 名 `"digit"` → `"int"`）。本 crate 不直接匹配 `model::Value` 变体，但 `RawData` / `DataRecord` 等公开签名里的类型来自该 crate，故对消费方仍是破坏性的。
+- 依赖升级连带：`wp-connector-api` 0.12 → 0.13、`wp-connector-utils` 0.2 → 0.3、`wf-connector-api` 0.2 → 0.3、`wp-conf-base` 0.5 → 0.6、`wp-data-fmt` 0.9 → 0.10、`base64` 0.22 → 0.23。
+- 版本 `0.8.4` → `0.9.0`。
+
+### Changed
+
+- **JSON sink 输出变化（来自 `wp-data-fmt` 0.10）**：JSON 格式化中 **Obj 内嵌**的语义类型（`Email` / `Url` / `IpNet` / `Domain` / `IdCard` / `MobilePhone` / `Hex` / `Symbol` / `Ignore`）此前被输出为 `null`，现在按其 `Display` 输出为字符串。这是修复（原先静默丢值），但走 JSON sink、且记录里有对象字段内含这些语义类型时输出内容会变 —— 下游若有对拍/快照解析需同步。
+- README 补齐徽章：crates.io / CI / codecov / crates.io 下载量 / License / Rust Edition。
+
+### Fixed
+
+- 测试代码两处 `Field::from_digit(...)` → `Field::from_int(...)`（`src/sinks/tcp.rs`），适配 `wp-model-core` 0.10 的改名；lib 本体无需改动。
+
+### Dependencies
+
+- `arrow`：`59` → `60`
+- `wp-model-core`：`0.9` → `0.10`
+- `wp-connector-api`：`0.12` → `0.13`
+- `wp-connector-utils`：`0.2` → `0.3`
+- `wf-connector-api`：`0.2` → `0.3`
+- `wp-conf-base`：`0.5` → `0.6`
+- `wp-data-fmt`：`0.9` → `0.10`
+- `base64`：`0.22` → `0.23`
+
 ## [0.8.4] - 2026-09-07
 
 ### Fixed
@@ -318,7 +347,10 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 - Handle raw byte payloads in TCP and syslog sinks consistently with string payload handling
 
 
-[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/wp-labs/wp-core-connectors/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.8.4...v0.9.0
+[0.8.4]: https://github.com/wp-labs/wp-core-connectors/compare/v0.8.3...v0.8.4
+[0.8.3]: https://github.com/wp-labs/wp-core-connectors/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/wp-labs/wp-core-connectors/compare/v0.8.0...v0.8.2
 [0.8.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.7.1...v0.8.0
 [0.7.0]: https://github.com/wp-labs/wp-core-connectors/compare/v0.5.7...v0.7.0

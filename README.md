@@ -1,5 +1,12 @@
 # wp-core-connectors
 
+[![Crates.io](https://img.shields.io/crates/v/wp-core-connectors.svg)](https://crates.io/crates/wp-core-connectors)
+[![CI](https://img.shields.io/github/actions/workflow/status/wp-labs/wp-core-connectors/ci.yml?branch=main)](https://github.com/wp-labs/wp-core-connectors/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/wp-labs/wp-core-connectors/graph/badge.svg?token=6SVCXBHB6B)](https://codecov.io/gh/wp-labs/wp-core-connectors)
+[![Crates.io downloads](https://img.shields.io/crates/d/wp-core-connectors)](https://crates.io/crates/wp-core-connectors)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust Edition](https://img.shields.io/badge/edition-2024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
+
 `wp-core-connectors` is the shared connector runtime crate for WarpParse core pipelines. It provides:
 
 - global source/sink factory registries
