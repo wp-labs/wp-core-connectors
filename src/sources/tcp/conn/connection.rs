@@ -14,7 +14,7 @@ use wp_model_core::raw::RawData;
 /// TCP 连接流：明文或 TLS（服务端）。
 pub enum ConnStream {
     Plain(TcpStream),
-    Tls(ServerTlsStream<TcpStream>),
+    Tls(Box<ServerTlsStream<TcpStream>>),
 }
 
 const DEFAULT_BATCH_CAPACITY: usize = 128;
@@ -1044,7 +1044,7 @@ mod tests {
         let (stream, peer) = listener.accept().await.unwrap();
         let tls_stream = acceptor.accept(stream).await.unwrap();
         let mut conn = TcpConnection::new(
-            ConnStream::Tls(tls_stream),
+            ConnStream::Tls(Box::new(tls_stream)),
             peer,
             FramingMode::Line,
             Tags::new(),

@@ -111,7 +111,7 @@ impl TcpListenerLoop {
                     Some(config) => {
                         let acceptor = tokio_rustls::TlsAcceptor::from(config.clone());
                         match time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
-                            Ok(Ok(tls_stream)) => ConnStream::Tls(tls_stream),
+                            Ok(Ok(tls_stream)) => ConnStream::Tls(Box::new(tls_stream)),
                             Ok(Err(e)) => {
                                 error_ctrl!(
                                     "TCP listener loop '{}' TLS handshake with {} failed: {}",

@@ -20,7 +20,7 @@ mod probe;
 pub enum Transport {
     Udp(UdpSocket),
     Tcp(TcpStream),
-    Tls(TlsStream<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
     #[cfg(test)]
     Null,
 }
@@ -181,7 +181,7 @@ impl NetWriter {
             .ok()
             .map(|a| a.to_string());
         Ok(Self {
-            transport: Transport::Tls(tls_stream),
+            transport: Transport::Tls(Box::new(tls_stream)),
             sent_cnt: 0,
             backpressure: None,
             avg_write_len: 0.0,
