@@ -3,9 +3,11 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
+use tokio_rustls::client::TlsStream;
 use wp_connector_api::{SinkReason, SinkResult};
 
 use super::config::*; // reuse constants/policy/adaptive toggles
+use crate::net::TlsConfig;
 
 // further split for readability: platform ops, probe, backoff, logging, nodelay
 mod backoff;
@@ -14,10 +16,11 @@ mod nodelay;
 mod os;
 mod probe;
 
-/// 统一的网络写入器（UDP/TCP）
+/// 统一的网络写入器（UDP/TCP/TLS）
 pub enum Transport {
     Udp(UdpSocket),
     Tcp(TcpStream),
+    Tls(TlsStream<TcpStream>),
     #[cfg(test)]
     Null,
 }
@@ -155,6 +158,53 @@ impl NetWriter {
         Ok(w)
     }
 
+    /// 建立带 TLS 的 TCP 连接（客户端）。`default_host` 为缺省 SNI 主机名。
+    pub async fn connect_tcp_tls(
+        addr: &str,
+        default_host: &str,
+        tls: &TlsConfig,
+    ) -> anyhow::Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
+        let server_name = tls.server_name(default_host)?;
+        let connector = tokio_rustls::TlsConnector::from(tls.build_client_config()?);
+        let tls_stream = connector.connect(server_name, stream).await?;
+        let peer = tls_stream
+            .get_ref()
+            .0
+            .peer_addr()
+            .ok()
+            .map(|a| a.to_string());
+        let local = tls_stream
+            .get_ref()
+            .0
+            .local_addr()
+            .ok()
+            .map(|a| a.to_string());
+        Ok(Self {
+            transport: Transport::Tls(tls_stream),
+            sent_cnt: 0,
+            backpressure: None,
+            avg_write_len: 0.0,
+            bytes_since_probe: 0,
+            #[cfg(test)]
+            sndbuf_override: None,
+            #[cfg(test)]
+            probe_count: 0,
+            #[cfg(test)]
+            pending_override: None,
+            #[cfg(test)]
+            last_slept_ms: 0,
+            nodelay_on: None,
+            nodelay_last_change: None,
+            avg_bytes_acc: 0,
+            avg_writes_acc: 0,
+            cached_sndbuf: None,
+            last_probe_at: None,
+            peer_addr: peer,
+            local_addr: local,
+        })
+    }
+
     /// 写入原始字节（UDP 发送单报文；TCP write_all）
     pub async fn write(&mut self, bytes: &[u8]) -> SinkResult<()> {
         if matches!(self.transport, Transport::Tcp(_)) && self.backpressure.is_some() {
@@ -190,6 +240,16 @@ impl NetWriter {
                 self.sent_cnt = self.sent_cnt.saturating_add(1);
                 Ok(())
             }
+            Transport::Tls(stream) => {
+                if let Err(e) = stream.write_all(bytes).await {
+                    return Err(SinkReason::Sink
+                        .to_err()
+                        .with_detail("tls send error")
+                        .with_source(e));
+                }
+                self.sent_cnt = self.sent_cnt.saturating_add(1);
+                Ok(())
+            }
             #[cfg(test)]
             Transport::Null => {
                 self.sent_cnt = self.sent_cnt.saturating_add(1);
@@ -202,11 +262,20 @@ impl NetWriter {
 
     /// 尝试优雅关闭 TCP 写端，促使对端尽快读取完所有已提交数据并收到 FIN。
     pub async fn shutdown(&mut self) -> SinkResult<()> {
-        if let Transport::Tcp(stream) = &mut self.transport {
-            stream
-                .shutdown()
-                .await
-                .source_err(SinkReason::Sink, "tcp shutdown error")?;
+        match &mut self.transport {
+            Transport::Tcp(stream) => {
+                stream
+                    .shutdown()
+                    .await
+                    .source_err(SinkReason::Sink, "tcp shutdown error")?;
+            }
+            Transport::Tls(stream) => {
+                stream
+                    .shutdown()
+                    .await
+                    .source_err(SinkReason::Sink, "tls shutdown error")?;
+            }
+            _ => {}
         }
         Ok(())
     }

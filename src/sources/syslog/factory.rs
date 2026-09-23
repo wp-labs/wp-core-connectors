@@ -143,6 +143,7 @@ impl SourceFactory for SyslogSourceFactory {
                         1000,
                         connection_registry,
                         instance_reg_txs,
+                        None,
                     );
 
                     SourceSvcIns::new()

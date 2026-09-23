@@ -403,6 +403,7 @@ impl DataSource for TcpSource {
 
 #[cfg(test)]
 mod tests {
+    use super::super::conn::ConnStream;
     use super::*;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
@@ -455,7 +456,7 @@ mod tests {
         reg_tx
             .send(ConnectionRegistration {
                 connection_id: 1,
-                stream,
+                stream: ConnStream::Plain(stream),
                 peer_addr,
             })
             .await
@@ -502,7 +503,7 @@ mod tests {
         reg_tx
             .send(ConnectionRegistration {
                 connection_id: 2,
-                stream,
+                stream: ConnStream::Plain(stream),
                 peer_addr,
             })
             .await

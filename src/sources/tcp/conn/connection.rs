@@ -5,9 +5,17 @@ use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
+use tokio_rustls::server::TlsStream as ServerTlsStream;
 use wp_connector_api::{SourceBatch, SourceEvent, SourceReason, SourceResult, Tags};
 use wp_model_core::raw::RawData;
+
+/// TCP 连接流：明文或 TLS（服务端）。
+pub enum ConnStream {
+    Plain(TcpStream),
+    Tls(ServerTlsStream<TcpStream>),
+}
 
 const DEFAULT_BATCH_CAPACITY: usize = 128;
 const MAX_BATCH_BYTES: usize = 64 * 1024; // soft cap; single payload may exceed but only single event allowed
@@ -30,7 +38,7 @@ pub enum ReadOutcome {
 }
 
 pub struct TcpConnection {
-    stream: TcpStream,
+    stream: ConnStream,
     client_addr: SocketAddr,
     framing: FramingMode,
     batcher: BatchBuilder,
@@ -41,7 +49,10 @@ impl TcpConnection {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            self.stream.as_raw_fd()
+            match &self.stream {
+                ConnStream::Plain(s) => s.as_raw_fd(),
+                ConnStream::Tls(s) => s.get_ref().0.as_raw_fd(),
+            }
         }
         #[cfg(not(unix))]
         {
@@ -75,7 +86,7 @@ struct BatchBuilder {
 
 impl TcpConnection {
     pub fn new(
-        stream: TcpStream,
+        stream: ConnStream,
         client_addr: SocketAddr,
         framing: FramingMode,
         base_tags: Tags,
@@ -178,6 +189,17 @@ impl TcpConnection {
         }
     }
 
+    /// 异步读取一块数据：Plain 走 readable + 零拷贝；Tls 走 read_buf。
+    async fn read_chunk(&mut self) -> std::io::Result<usize> {
+        match &mut self.stream {
+            ConnStream::Plain(s) => {
+                s.readable().await?;
+                self.batcher.try_read_plain(s)
+            }
+            ConnStream::Tls(s) => self.batcher.tls_read(s).await,
+        }
+    }
+
     pub async fn read_batch(&mut self) -> SourceResult<ReadOutcome> {
         let mut produced = SourceBatch::with_capacity(self.batcher.batch_capacity);
         let mut produced_bytes = 0usize;
@@ -187,13 +209,7 @@ impl TcpConnection {
             return Ok(ReadOutcome::Produced(produced));
         }
         loop {
-            if let Err(e) = self.stream.readable().await {
-                return Err(SourceReason::disconnect(format!(
-                    "tcp readable error ({}): {}",
-                    self.client_addr, e
-                )));
-            }
-            match self.batcher.bounded_try_read(&self.stream) {
+            match self.read_chunk().await {
                 Ok(0) => {
                     // EOF — drain any frames still buffered or pending before
                     // closing (see try_read_batch: a batch-cap break leaves the
@@ -298,11 +314,28 @@ impl BatchBuilder {
     /// the direct zero-copy read path but reserves at least `MAX_READ_BYTES` of
     /// spare capacity before each read, so a single read can't balloon the
     /// buffer to GBs under a large socket backlog.
-    fn bounded_try_read(&mut self, stream: &TcpStream) -> std::io::Result<usize> {
+    fn bounded_try_read(&mut self, stream: &ConnStream) -> std::io::Result<usize> {
+        match stream {
+            ConnStream::Plain(s) => self.try_read_plain(s),
+            ConnStream::Tls(_) => Err(std::io::Error::from(ErrorKind::WouldBlock)),
+        }
+    }
+
+    fn try_read_plain(&mut self, stream: &TcpStream) -> std::io::Result<usize> {
         if self.buffer.remaining_mut() < MAX_READ_BYTES {
             self.buffer.reserve(MAX_READ_BYTES);
         }
         stream.try_read_buf(&mut self.buffer)
+    }
+
+    async fn tls_read(
+        &mut self,
+        stream: &mut ServerTlsStream<TcpStream>,
+    ) -> std::io::Result<usize> {
+        if self.buffer.remaining_mut() < MAX_READ_BYTES {
+            self.buffer.reserve(MAX_READ_BYTES);
+        }
+        stream.read_buf(&mut self.buffer).await
     }
 
     /// Opportunistically shrink the internal buffer when idle to reclaim memory.
@@ -495,7 +528,7 @@ mod tests {
 
         let (stream, peer) = listener.accept().await.expect("accept connection");
         let mut conn = TcpConnection::new(
-            stream,
+            ConnStream::Plain(stream),
             peer,
             FramingMode::Line,
             Tags::new(),
@@ -571,7 +604,7 @@ mod tests {
         writer.await.unwrap();
 
         let mut conn = TcpConnection::new(
-            stream,
+            ConnStream::Plain(stream),
             peer,
             FramingMode::Len,
             Tags::new(),
@@ -682,7 +715,7 @@ mod tests {
 
         let (stream, peer) = listener.accept().await.expect("accept");
         let mut conn = TcpConnection::new(
-            stream,
+            ConnStream::Plain(stream),
             peer,
             FramingMode::Line,
             Tags::new(),
@@ -767,7 +800,7 @@ mod tests {
 
         let (stream, peer) = listener.accept().await.expect("accept connection");
         let mut conn = TcpConnection::new(
-            stream,
+            ConnStream::Plain(stream),
             peer,
             FramingMode::Len,
             Tags::new(),
@@ -820,7 +853,7 @@ mod tests {
 
         let (stream, peer) = listener.accept().await.expect("accept connection");
         let mut conn = TcpConnection::new(
-            stream,
+            ConnStream::Plain(stream),
             peer,
             FramingMode::Auto,
             Tags::new(),
@@ -974,5 +1007,68 @@ mod tests {
             tags,
         );
         assert_eq!(event_payload_len(&event_arc), 100);
+    }
+
+    /// 源侧 TLS 读取路径：`ConnStream::Tls` 经 `TcpConnection::read_batch` 解出分帧消息。
+    #[tokio::test]
+    async fn tls_stream_reads_framed_message() {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem().as_bytes()).unwrap();
+        std::fs::write(&key_path, certified.key_pair.serialize_pem().as_bytes()).unwrap();
+
+        let server_tls = crate::net::TlsConfig {
+            cert: Some(cert_path.to_string_lossy().into_owned()),
+            key: Some(key_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls.build_server_config().unwrap());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_tls = crate::net::TlsConfig {
+            insecure: true,
+            ..Default::default()
+        };
+        let connector = tokio_rustls::TlsConnector::from(client_tls.build_client_config().unwrap());
+        let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+        let client = tokio::spawn(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut tls = connector.connect(server_name, tcp).await.unwrap();
+            tls.write_all(b"hello tls\n").await.unwrap();
+        });
+
+        let (stream, peer) = listener.accept().await.unwrap();
+        let tls_stream = acceptor.accept(stream).await.unwrap();
+        let mut conn = TcpConnection::new(
+            ConnStream::Tls(tls_stream),
+            peer,
+            FramingMode::Line,
+            Tags::new(),
+            8192,
+            "tls_test".to_string(),
+        );
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), conn.read_batch())
+            .await
+            .expect("read timeout")
+            .expect("read error");
+        let batch = match outcome {
+            ReadOutcome::Produced(b) => b,
+            ReadOutcome::NoData => panic!("expected a produced batch"),
+            ReadOutcome::Closed => panic!("connection closed before data"),
+        };
+
+        assert_eq!(batch.len(), 1);
+        let ev = batch.into_iter().next().unwrap();
+        match ev.payload {
+            RawData::Bytes(b) => assert_eq!(&b[..], b"hello tls"),
+            RawData::String(s) => assert_eq!(s, "hello tls"),
+            other => panic!("unexpected payload variant: {:?}", other),
+        }
+        client.await.unwrap();
     }
 }

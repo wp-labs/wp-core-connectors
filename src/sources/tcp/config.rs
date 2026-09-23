@@ -1,6 +1,8 @@
 use super::framing::{DEFAULT_TCP_RECV_BYTES, FramingMode};
 use anyhow::{anyhow, ensure};
 
+use crate::net::TlsConfig;
+
 #[derive(Debug, Clone)]
 pub struct TcpSourceSpec {
     pub addr: String,
@@ -8,6 +10,7 @@ pub struct TcpSourceSpec {
     pub tcp_recv_bytes: usize,
     pub framing: FramingMode,
     pub instances: usize,
+    pub tls: Option<TlsConfig>,
 }
 
 pub const DEFAULT_TCP_SOURCE_INSTANCES: usize = 1;
@@ -65,12 +68,15 @@ impl TcpSourceSpec {
             );
         }
 
+        let tls = TlsConfig::from_param(params.get("tls"))?;
+
         Ok(Self {
             addr,
             port,
             tcp_recv_bytes,
             framing,
             instances,
+            tls,
         })
     }
 

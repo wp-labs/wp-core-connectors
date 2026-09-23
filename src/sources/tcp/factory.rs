@@ -88,12 +88,18 @@ impl SourceFactory for TcpSourceFactory {
                 source_handles.push(SourceHandle::new(Box::new(source), meta));
             }
 
+            let tls_server = match &conf.tls {
+                Some(t) => Some(t.build_server_config()?),
+                None => None,
+            };
+
             let acceptor = TcpAcceptor::new(
                 spec.name.clone(),
                 conf.address(),
                 1000,
                 connection_registry,
                 instance_reg_txs,
+                tls_server,
             );
 
             let acceptor_handle = AcceptorHandle::new(spec.name.clone(), Box::new(acceptor));

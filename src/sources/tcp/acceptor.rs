@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use orion_conf::ToStructError;
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
 use wp_connector_api::{CtrlRx, ServiceAcceptor, SourceReason, SourceResult};
@@ -16,15 +17,18 @@ pub struct TcpAcceptor {
     max_connections: usize,
     registry: ConnectionRegistry,
     instance_reg_txs: Vec<mpsc::Sender<ConnectionRegistration>>,
+    tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl TcpAcceptor {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         key: String,
         address: String,
         max_connections: usize,
         registry: ConnectionRegistry,
         instance_reg_txs: Vec<mpsc::Sender<ConnectionRegistration>>,
+        tls: Option<Arc<rustls::ServerConfig>>,
     ) -> Self {
         Self {
             key,
@@ -32,6 +36,7 @@ impl TcpAcceptor {
             max_connections,
             registry,
             instance_reg_txs,
+            tls,
         }
     }
 }
@@ -61,6 +66,7 @@ impl ServiceAcceptor for TcpAcceptor {
             self.registry.clone(),
             stop_tx,
             self.instance_reg_txs.clone(),
+            self.tls.clone(),
         );
 
         worker.run().await.map_err(|e| match e.reason() {

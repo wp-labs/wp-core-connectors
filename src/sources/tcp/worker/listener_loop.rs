@@ -1,14 +1,19 @@
 use crate::sources::tcp::ConnectionRegistry;
-use tokio::net::{TcpListener, TcpStream};
+use crate::sources::tcp::conn::ConnStream;
+use std::sync::Arc;
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
 use wp_connector_api::{SourceReason, SourceResult};
 
 use std::net::SocketAddr;
 
+/// TLS 握手超时：避免慢/恶意客户端在握手阶段阻塞 accept 循环。
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct ConnectionRegistration {
     pub connection_id: u64,
-    pub stream: TcpStream,
+    pub stream: ConnStream,
     pub peer_addr: SocketAddr,
 }
 
@@ -21,6 +26,7 @@ pub struct TcpListenerLoop {
     pub(crate) stop_tx: broadcast::Sender<()>,
     pub(crate) instance_reg_txs: Vec<mpsc::Sender<ConnectionRegistration>>,
     pub(crate) next_reader_idx: usize,
+    pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl TcpListenerLoop {
@@ -31,6 +37,7 @@ impl TcpListenerLoop {
         registry: ConnectionRegistry,
         stop_tx: broadcast::Sender<()>,
         instance_reg_txs: Vec<mpsc::Sender<ConnectionRegistration>>,
+        tls: Option<Arc<rustls::ServerConfig>>,
     ) -> Self {
         Self {
             key,
@@ -40,6 +47,7 @@ impl TcpListenerLoop {
             stop_tx,
             instance_reg_txs,
             next_reader_idx: 0,
+            tls,
         }
     }
 
@@ -98,6 +106,33 @@ impl TcpListenerLoop {
 
         match time::timeout(time::Duration::from_millis(1), listener.accept()).await {
             Ok(Ok((stream, addr))) => {
+                // 开启安全传输时，先完成 TLS 握手再分发连接
+                let stream = match &self.tls {
+                    Some(config) => {
+                        let acceptor = tokio_rustls::TlsAcceptor::from(config.clone());
+                        match time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                            Ok(Ok(tls_stream)) => ConnStream::Tls(tls_stream),
+                            Ok(Err(e)) => {
+                                error_ctrl!(
+                                    "TCP listener loop '{}' TLS handshake with {} failed: {}",
+                                    self.key,
+                                    addr,
+                                    e
+                                );
+                                return Ok(());
+                            }
+                            Err(_) => {
+                                error_ctrl!(
+                                    "TCP listener loop '{}' TLS handshake with {} timed out",
+                                    self.key,
+                                    addr
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
+                    None => ConnStream::Plain(stream),
+                };
                 let connection_id = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()

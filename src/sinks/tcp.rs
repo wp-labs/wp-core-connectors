@@ -13,6 +13,7 @@ use wp_connector_api::{
 use wp_data_fmt::{FormatType, RecordFormatter};
 use wp_model_core::model::fmt_def::TextFmt;
 
+use crate::net::TlsConfig;
 use crate::net::transport::{BackoffMode, NetSendPolicy, NetWriter, net_backoff_adaptive};
 
 use super::arrow_conv::{
@@ -33,6 +34,7 @@ struct TcpSinkSpec {
     port: u16,
     framing: Framing,
     fmt: TextFmt,
+    tls: Option<TlsConfig>,
 }
 
 impl TcpSinkSpec {
@@ -70,6 +72,8 @@ impl TcpSinkSpec {
         };
         Self::ensure_bool(spec, "max_backoff")?;
         Self::ensure_bool(spec, "sendq_backpressure")?;
+        let tls = TlsConfig::from_param(spec.params.get("tls"))
+            .map_err(|e| SinkReason::core_conf().to_err().with_detail(e.to_string()))?;
         let fmt = spec
             .params
             .get("fmt")
@@ -81,6 +85,7 @@ impl TcpSinkSpec {
             port,
             framing,
             fmt,
+            tls,
         })
     }
 
@@ -106,10 +111,12 @@ const TCP_DRAIN_MAX_SECS: u64 = 10;
 pub struct TcpSink {
     writer: NetWriter,
     target_addr: String,
+    host: String,
     rate_limit_rps: usize,
     framing: Framing,
     fmt: TextFmt,
     sent_cnt: u64,
+    tls: Option<TlsConfig>,
 }
 
 impl TcpSink {
@@ -123,24 +130,35 @@ impl TcpSink {
         } else {
             BackoffMode::ForceOff
         };
-        let writer = NetWriter::connect_tcp_with_policy(
-            &target,
-            NetSendPolicy {
-                rate_limit_rps,
-                backoff_mode: mode,
-                adaptive: net_backoff_adaptive(),
-            },
-        )
-        .await
-        .source_err(SinkReason::Sink, "tcp sink connect tcp")?;
-        log::info!("tcp sink connected: target={}", target);
+        let writer = match &spec.tls {
+            Some(tls) => NetWriter::connect_tcp_tls(&target, &spec.addr, tls)
+                .await
+                .source_err(SinkReason::Sink, "tcp sink connect tls")?,
+            None => NetWriter::connect_tcp_with_policy(
+                &target,
+                NetSendPolicy {
+                    rate_limit_rps,
+                    backoff_mode: mode,
+                    adaptive: net_backoff_adaptive(),
+                },
+            )
+            .await
+            .source_err(SinkReason::Sink, "tcp sink connect tcp")?,
+        };
+        log::info!(
+            "tcp sink connected: target={} tls={}",
+            target,
+            spec.tls.is_some()
+        );
         Ok(Self {
             writer,
             target_addr: target,
+            host: spec.addr.clone(),
             rate_limit_rps,
             framing: spec.framing,
             fmt: spec.fmt,
             sent_cnt: 0,
+            tls: spec.tls.clone(),
         })
     }
 }
@@ -158,21 +176,28 @@ impl AsyncCtrl for TcpSink {
     }
     async fn reconnect(&mut self) -> SinkResult<()> {
         let _ = self.writer.shutdown().await;
-        let mode = if self.rate_limit_rps == 0 {
-            BackoffMode::ForceOn
-        } else {
-            BackoffMode::ForceOff
+        let writer = match &self.tls {
+            Some(tls) => NetWriter::connect_tcp_tls(&self.target_addr, &self.host, tls)
+                .await
+                .source_err(SinkReason::Sink, "tcp sink reconnect tls")?,
+            None => {
+                let mode = if self.rate_limit_rps == 0 {
+                    BackoffMode::ForceOn
+                } else {
+                    BackoffMode::ForceOff
+                };
+                NetWriter::connect_tcp_with_policy(
+                    &self.target_addr,
+                    NetSendPolicy {
+                        rate_limit_rps: self.rate_limit_rps,
+                        backoff_mode: mode,
+                        adaptive: net_backoff_adaptive(),
+                    },
+                )
+                .await
+                .source_err(SinkReason::Sink, "tcp sink reconnect tcp")?
+            }
         };
-        let writer = NetWriter::connect_tcp_with_policy(
-            &self.target_addr,
-            NetSendPolicy {
-                rate_limit_rps: self.rate_limit_rps,
-                backoff_mode: mode,
-                adaptive: net_backoff_adaptive(),
-            },
-        )
-        .await
-        .source_err(SinkReason::Sink, "tcp sink reconnect tcp")?;
         log::info!("tcp sink reconnected: target={}", self.target_addr);
         self.writer = writer;
         Ok(())
@@ -376,6 +401,9 @@ impl SinkFactory for TcpFactory {
                         "tcp_arrow.data_format must be 'arrow_framed' or 'arrow_ipc' (got '{df}')"
                     )));
                 }
+                if let Err(e) = TlsConfig::from_param(spec.params.get("tls")) {
+                    return Err(SinkReason::core_conf().to_err().with_detail(e.to_string()));
+                }
                 Ok(())
             }
             "txt" | "" => {
@@ -479,6 +507,7 @@ pub struct TcpArrowSink {
     framed: bool,
     /// Stream tag embedded in each wp_arrow frame (only used when `framed`).
     tag: String,
+    tls: Option<TlsConfig>,
 }
 
 impl TcpArrowSink {
@@ -511,6 +540,8 @@ impl TcpArrowSink {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let tls = TlsConfig::from_param(spec.params.get("tls"))
+            .map_err(|e| SinkReason::core_conf().to_err().with_detail(e.to_string()))?;
 
         let target = format!("{addr}:{port}");
         let mode = if rate_limit_rps == 0 {
@@ -518,18 +549,26 @@ impl TcpArrowSink {
         } else {
             BackoffMode::ForceOff
         };
-        let writer = NetWriter::connect_tcp_with_policy(
-            &target,
-            NetSendPolicy {
-                rate_limit_rps,
-                backoff_mode: mode,
-                adaptive: net_backoff_adaptive(),
-            },
-        )
-        .await
-        .source_err(SinkReason::Sink, "tcp_arrow connect tcp")?;
+        let writer = match &tls {
+            Some(t) => NetWriter::connect_tcp_tls(&target, addr, t)
+                .await
+                .source_err(SinkReason::Sink, "tcp_arrow connect tls")?,
+            None => NetWriter::connect_tcp_with_policy(
+                &target,
+                NetSendPolicy {
+                    rate_limit_rps,
+                    backoff_mode: mode,
+                    adaptive: net_backoff_adaptive(),
+                },
+            )
+            .await
+            .source_err(SinkReason::Sink, "tcp_arrow connect tcp")?,
+        };
 
-        log::info!("tcp_arrow sink connected: target={target}");
+        log::info!(
+            "tcp_arrow sink connected: target={target} tls={}",
+            tls.is_some()
+        );
 
         Ok(Self {
             conn: ConnState::Connected {
@@ -542,6 +581,7 @@ impl TcpArrowSink {
             sent_cnt: 0,
             framed,
             tag,
+            tls,
         })
     }
 
@@ -559,21 +599,28 @@ impl TcpArrowSink {
 
     async fn connect_writer(&self) -> SinkResult<NetWriter> {
         let target = format!("{}:{}", self.host, self.port);
-        let mode = if self.rate_limit_rps == 0 {
-            BackoffMode::ForceOn
-        } else {
-            BackoffMode::ForceOff
-        };
-        NetWriter::connect_tcp_with_policy(
-            &target,
-            NetSendPolicy {
-                rate_limit_rps: self.rate_limit_rps,
-                backoff_mode: mode,
-                adaptive: net_backoff_adaptive(),
-            },
-        )
-        .await
-        .source_err(SinkReason::Sink, "tcp_arrow reconnect tcp")
+        match &self.tls {
+            Some(t) => NetWriter::connect_tcp_tls(&target, &self.host, t)
+                .await
+                .source_err(SinkReason::Sink, "tcp_arrow reconnect tls"),
+            None => {
+                let mode = if self.rate_limit_rps == 0 {
+                    BackoffMode::ForceOn
+                } else {
+                    BackoffMode::ForceOff
+                };
+                NetWriter::connect_tcp_with_policy(
+                    &target,
+                    NetSendPolicy {
+                        rate_limit_rps: self.rate_limit_rps,
+                        backoff_mode: mode,
+                        adaptive: net_backoff_adaptive(),
+                    },
+                )
+                .await
+                .source_err(SinkReason::Sink, "tcp_arrow reconnect tcp")
+            }
+        }
     }
 
     fn enter_disconnected(&mut self) {
@@ -1078,5 +1125,78 @@ mod tests {
         );
         let batches = decode_arrow_framed_batches(&vec![event]).unwrap();
         assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    /// `protocol = "arrow"` 的 TCP sink 通过 `tls = { enabled = true, insecure = true }` 走加密连接。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_arrow_connects_over_tls() -> anyhow::Result<()> {
+        use wp_model_core::model::{Field, FieldStorage};
+
+        // 生成自签证书
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem().as_bytes()).unwrap();
+        std::fs::write(&key_path, certified.key_pair.serialize_pem().as_bytes()).unwrap();
+
+        let server_tls = TlsConfig {
+            cert: Some(cert_path.to_string_lossy().into_owned()),
+            key: Some(key_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls.build_server_config().unwrap());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            let mut buf = [0u8; 256];
+            let n = tls.read(&mut buf).await.unwrap();
+            buf[..n].to_vec()
+        });
+
+        let fac = TcpFactory;
+        let mut tls_table = toml::map::Map::new();
+        tls_table.insert("enabled".into(), toml::Value::Boolean(true));
+        tls_table.insert("insecure".into(), toml::Value::Boolean(true));
+        let mut params = toml::map::Map::new();
+        params.insert("protocol".into(), toml::Value::String("arrow".into()));
+        params.insert("addr".into(), toml::Value::String("127.0.0.1".into()));
+        params.insert("port".into(), toml::Value::Integer(port as i64));
+        params.insert("tls".into(), toml::Value::Table(tls_table));
+        let spec = wp_connector_api::SinkSpec {
+            group: String::new(),
+            name: "t".into(),
+            kind: "tcp".into(),
+            connector_id: String::new(),
+            params: wp_connector_api::parammap_from_toml_map(params),
+            filter: None,
+        };
+        let ctx = wp_connector_api::SinkBuildCtx::new(std::env::current_dir().unwrap());
+        let mut h = fac
+            .build(&spec, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // 发送一条记录，验证 TLS 连接能实际传输 Arrow 字节
+        let rec = Arc::new(DataRecord::from(vec![
+            FieldStorage::from(Field::from_chars("name", "alice")),
+            FieldStorage::from(Field::from_int("count", 42)),
+        ]));
+        h.sink
+            .as_mut()
+            .sink_records(vec![rec])
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        drop(h);
+
+        let received = srv.await.unwrap();
+        assert!(
+            !received.is_empty(),
+            "TLS server should receive Arrow bytes"
+        );
+        Ok(())
     }
 }

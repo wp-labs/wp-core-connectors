@@ -106,6 +106,52 @@ params = {
 }
 ```
 
+### TCP Secure Transport (TLS)
+
+Both the `tcp` source (server side) and the `tcp` sink (client side) accept a nested
+`tls = { … }` block to enable encrypted transport.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `enabled` | bool | Enable TLS; default `false` |
+| `cert` | str | Certificate chain (PEM file path). Required for source; for sink only when using mTLS |
+| `key` | str | Private key (PEM file path), paired with `cert` |
+| `ca` | str | CA certificate (PEM file path). Source: client CA (enables mTLS); sink: verify server cert |
+| `server_name` | str | SNI / server name (sink only; defaults to the target host) |
+| `insecure` | bool | Sink only; `true` skips certificate verification (dangerous, test-only) |
+
+Source (server) rules: `cert` + `key` are required; `ca` is optional and enables mTLS
+(client certificate verification).
+
+Sink (client) rules: provide `ca` to verify the server, or `insecure = true` to skip
+verification; `cert` + `key` are optional (client mTLS certificate); `server_name` is
+optional (SNI).
+
+```toml
+# TCP source (server) with TLS; optional ca enables mTLS
+[[sources]]
+key = "tcp_tls_in"
+connect = "tcp_src"
+params = {
+  addr = "0.0.0.0", port = 9000,
+  framing = "line",
+  tls = { enabled = true, cert = "certs/server.pem", key = "certs/server.key", ca = "certs/client-ca.pem" }
+}
+
+# TCP sink (client) with TLS, verifying the server certificate
+[[sink_group.sinks]]
+name = "tcp_tls_out"
+connect = "tcp_sink"
+params = {
+  addr = "127.0.0.1", port = 9000,
+  framing = "line",
+  tls = { enabled = true, ca = "certs/ca.pem", server_name = "localhost" }
+}
+```
+
+> Certificates are PEM files. `tls.cert` and `tls.key` must be paired. Source `ca`
+> (mTLS) and sink `insecure` / `cert` / `key` are optional.
+
 ### Builtin Sink Implementations
 
 The `src/sinks/` module currently includes:
@@ -314,6 +360,48 @@ params = {
   data_format = "arrow_framed"
 }
 ```
+
+### TCP 安全传输（TLS）
+
+内置 `tcp` source（服务端）与 `tcp` sink（客户端）都支持用 `tls = { … }` 子块启用 TLS 加密传输。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `enabled` | bool | 是否启用 TLS，默认 `false` |
+| `cert` | str | 证书链（PEM 文件路径）。source 必填；sink 仅在 mTLS 时填 |
+| `key` | str | 私钥（PEM 文件路径），与 `cert` 成对出现 |
+| `ca` | str | CA 证书（PEM 文件路径）。source：客户端 CA（开启 mTLS）；sink：校验服务端证书 |
+| `server_name` | str | SNI / 服务端名（仅 sink；缺省取目标主机名） |
+| `insecure` | bool | 仅 sink；`true` 跳过证书校验（危险，仅测试用） |
+
+服务端（source）规则：`cert` + `key` 必填；`ca` 可选，填了即开启 mTLS（校验客户端证书）。
+
+客户端（sink）规则：提供 `ca` 校验服务端，或 `insecure = true` 跳过校验；`cert` + `key` 可选（客户端 mTLS 证书）；`server_name` 可选（SNI）。
+
+```toml
+# TCP source（服务端）启用 TLS；ca 可选 → mTLS
+[[sources]]
+key = "tcp_tls_in"
+connect = "tcp_src"
+params = {
+  addr = "0.0.0.0", port = 9000,
+  framing = "line",
+  tls = { enabled = true, cert = "certs/server.pem", key = "certs/server.key", ca = "certs/client-ca.pem" }
+}
+
+# TCP sink（客户端）启用 TLS，校验服务端证书
+[[sink_group.sinks]]
+name = "tcp_tls_out"
+connect = "tcp_sink"
+params = {
+  addr = "127.0.0.1", port = 9000,
+  framing = "line",
+  tls = { enabled = true, ca = "certs/ca.pem", server_name = "localhost" }
+}
+```
+
+> 证书为 PEM 格式；`tls.cert` 与 `tls.key` 必须成对；source 的 `ca`（mTLS）与 sink 的
+> `insecure` / `cert` / `key` 均为可选。
 
 ## 配置示例
 

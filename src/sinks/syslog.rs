@@ -253,6 +253,7 @@ impl AsyncRawDataSink for SyslogSink {
             let tag = match self.writer.transport {
                 Transport::Udp(_) => "udp",
                 Transport::Tcp(_) => "tcp",
+                Transport::Tls(_) => "tls",
                 #[cfg(test)]
                 Transport::Null => "null",
             };
@@ -268,6 +269,7 @@ impl AsyncRawDataSink for SyslogSink {
             match self.writer.transport {
                 Transport::Udp(_) => "udp",
                 Transport::Tcp(_) => "tcp",
+                Transport::Tls(_) => "tls",
                 #[cfg(test)]
                 Transport::Null => "null",
             },

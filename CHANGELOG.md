@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-09-23
+
+### Added
+
+- **TCP 安全传输（TLS）**：主 `tcp` source（server）与 `tcp` sink（client，含 `arrow`）支持 `tls = { enabled, cert, key, ca, server_name, insecure }` 子配置；基于 `rustls` + `tokio-rustls`（ring），支持双向认证（`ca`）与跳过校验（`insecure`）。TLS 握手带 10s 超时，避免慢客户端阻塞 accept 循环。关联 wp-labs/wp-core-connectors#23。
+
+### Changed
+
+- `syslog` source/sink 适配新增的 `Transport::Tls` 分支，行为不变（syslog 的 TLS 后续单独接入）。
+
+### Documentation
+
+- README 增加 TCP TLS 配置说明（中英）。
+
+### Dependencies
+
+- `rustls`：`0.23`（新增，ring / std / tls12）
+- `tokio-rustls`：`0.26`（新增，ring / tls12）
+- `rcgen`：`0.13`（dev-dependency，新增，测试自签证书）
+
 ## [0.9.0] - 2026-09-19
 
 ### ⚠️ BREAKING CHANGES
