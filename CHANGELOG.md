@@ -9,11 +9,16 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
-- **TCP 安全传输（TLS）**：主 `tcp` source（server）与 `tcp` sink（client，含 `arrow`）支持 `tls = { enabled, cert, key, ca, server_name, insecure }` 子配置；基于 `rustls` + `tokio-rustls`（ring），支持双向认证（`ca`）与跳过校验（`insecure`）。TLS 握手带 10s 超时，避免慢客户端阻塞 accept 循环。关联 wp-labs/wp-core-connectors#23。
+- **TCP 安全传输（TLS）**：主 `tcp` source（server）与 `tcp` sink（client，含 `arrow`）支持 `tls = { enabled, cert, key, ca, server_name, insecure }` 子配置；基于 `rustls` + `tokio-rustls`（ring），支持双向认证（`ca`）与跳过校验（`insecure`）。客户端 `ca` 缺省时回落**系统原生信任库**（`rustls-native-certs`），公网/公共 CA 场景无需显式配 `ca`。TLS 握手带 10s 超时，避免慢客户端阻塞 accept 循环。关联 wp-labs/wp-core-connectors#23。
 
 ### Changed
 
 - `syslog` source/sink 适配新增的 `Transport::Tls` 分支，行为不变（syslog 的 TLS 后续单独接入）。
+- 客户端 `tls` 子配置现在严格拒绝未知字段（如 `cert_`/`insecuree` 拼写错误直接报错，不再静默忽略）。
+
+### Fixed
+
+- 修复客户端 `insecure = true` + `cert`/`key`（mTLS）时客户端证书被静默丢弃的问题：现在两条路径都会应用客户端证书；`cert`/`key` 只给其一（直接构造）也会报错而非静默降级。
 
 ### Documentation
 
@@ -23,6 +28,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 - `rustls`：`0.23`（新增，ring / std / tls12）
 - `tokio-rustls`：`0.26`（新增，ring / tls12）
+- `rustls-native-certs`：`0.8`（新增，客户端缺省信任库）
 - `rcgen`：`0.13`（dev-dependency，新增，测试自签证书）
 
 ## [0.9.0] - 2026-09-19

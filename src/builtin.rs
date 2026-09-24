@@ -167,6 +167,7 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
                 "port".into(),
                 "framing".into(),
                 "protocol".into(),
+                "tls".into(),
             ],
             default_params: params,
             origin: Some("builtin:tcp_sink".into()),
@@ -215,6 +216,7 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
                 "protocol".into(),
                 "data_format".into(),
                 "tag".into(),
+                "tls".into(),
             ],
             default_params: params,
             origin: Some("builtin:tcp_arrow_sink".into()),
@@ -315,6 +317,7 @@ pub fn builtin_source_defs() -> Vec<ConnectorDef> {
                 "tcp_recv_bytes".into(),
                 "instances".into(),
                 "data_format".into(),
+                "tls".into(),
             ],
             default_params: params,
             origin: Some("builtin:tcp_source".into()),
@@ -384,5 +387,21 @@ mod tests {
                 def.id
             );
         }
+    }
+
+    #[test]
+    fn tcp_connectors_allow_tls_override() {
+        for id in ["tcp_sink", "tcp_arrow_sink"] {
+            let def = sink_def(id).expect("builtin tcp sink def");
+            assert!(
+                def.allow_override.iter().any(|k| k == "tls"),
+                "{id} should allow override of 'tls'"
+            );
+        }
+        let src = source_def("tcp_src").expect("builtin tcp source def");
+        assert!(
+            src.allow_override.iter().any(|k| k == "tls"),
+            "tcp_src should allow override of 'tls'"
+        );
     }
 }

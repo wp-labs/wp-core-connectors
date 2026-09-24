@@ -2,8 +2,9 @@
 //!
 //! `tls = { … }` 子对象同时服务两端：
 //! - TCP source（server）：`cert` + `key` 必填；`ca` 可选（开启 mTLS，校验客户端证书）。
-//! - TCP sink（client）：`ca` 用于校验服务端证书；`insecure = true` 跳过校验；`cert`+`key`
-//!   可选（客户端 mTLS 证书）；`server_name` 可选（SNI，缺省取目标主机名）。
+//! - TCP sink（client）：`ca` 用于校验服务端证书，**缺省时回落系统原生信任库**；
+//!   `insecure = true` 跳过校验；`cert`+`key` 可选（客户端 mTLS 证书）；
+//!   `server_name` 可选（SNI，缺省取目标主机名）。
 
 use anyhow::{anyhow, ensure};
 use rustls::pki_types::pem::PemObject;
@@ -17,7 +18,8 @@ pub struct TlsConfig {
     pub cert: Option<String>,
     /// 私钥（PEM 路径），与 `cert` 成对出现。
     pub key: Option<String>,
-    /// CA 证书（PEM 路径）。source：客户端 CA（开启 mTLS）；sink：校验服务端证书。
+    /// CA 证书（PEM 路径）。source：客户端 CA（开启 mTLS）；sink：校验服务端证书，
+    /// 缺省时使用系统原生信任库（rustls-native-certs）。
     pub ca: Option<String>,
     /// SNI / 服务端名（sink 用，缺省取目标主机名）。
     pub server_name: Option<String>,
@@ -41,6 +43,13 @@ impl TlsConfig {
         };
         if !enabled {
             return Ok(None);
+        }
+        const ALLOWED: &[&str] = &["enabled", "cert", "key", "ca", "server_name", "insecure"];
+        if let Some(unknown) = obj.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
+            return Err(anyhow!(
+                "tls 未知字段 '{unknown}'（允许：{}）",
+                ALLOWED.join(", ")
+            ));
         }
         let s = |k: &str| -> anyhow::Result<Option<String>> {
             match obj.get(k) {
@@ -104,27 +113,31 @@ impl TlsConfig {
 
     /// 构建客户端（sink）配置。
     pub fn build_client_config(&self) -> anyhow::Result<Arc<rustls::ClientConfig>> {
-        if self.insecure {
-            let config = rustls::ClientConfig::builder_with_provider(Self::provider())
+        // 客户端 mTLS 证书：成对加载（`from_param` 已保证成对；此处对直接构造也兜底）。
+        let client_auth = match (self.cert.as_deref(), self.key.as_deref()) {
+            (Some(cert), Some(key)) => Some((load_certs(cert)?, load_key(key)?)),
+            (None, None) => None,
+            _ => return Err(anyhow!("tls.cert 与 tls.key 必须成对出现（客户端 mTLS）")),
+        };
+
+        let builder = if self.insecure {
+            rustls::ClientConfig::builder_with_provider(Self::provider())
                 .with_safe_default_protocol_versions()?
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                .with_no_client_auth();
-            return Ok(Arc::new(config));
-        }
-        let ca = self
-            .ca
-            .as_deref()
-            .ok_or_else(|| anyhow!("tls.ca 必填（或设置 tls.insecure = true 跳过校验）"))?;
-        let roots = load_root_store(ca)?;
-        let builder = rustls::ClientConfig::builder_with_provider(Self::provider())
-            .with_safe_default_protocol_versions()?
-            .with_root_certificates(Arc::new(roots));
-        let config = match (self.cert.as_deref(), self.key.as_deref()) {
-            (Some(cert), Some(key)) => {
-                builder.with_client_auth_cert(load_certs(cert)?, load_key(key)?)?
-            }
-            _ => builder.with_no_client_auth(),
+        } else {
+            let roots = match self.ca.as_deref() {
+                Some(ca) => load_root_store(ca)?,
+                None => load_native_root_store()?,
+            };
+            rustls::ClientConfig::builder_with_provider(Self::provider())
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(Arc::new(roots))
+        };
+
+        let config = match client_auth {
+            Some((certs, key)) => builder.with_client_auth_cert(certs, key)?,
+            None => builder.with_no_client_auth(),
         };
         Ok(Arc::new(config))
     }
@@ -152,6 +165,23 @@ fn load_root_store(path: &str) -> anyhow::Result<rustls::RootCertStore> {
     for cert in CertificateDer::pem_file_iter(path)? {
         roots.add(cert?)?;
     }
+    Ok(roots)
+}
+
+/// 加载系统原生信任库（Linux 读系统证书目录，Windows 读系统存储，macOS 读钥匙串），
+/// 受 `SSL_CERT_FILE` / `SSL_CERT_DIR` 环境变量影响。
+fn load_native_root_store() -> anyhow::Result<rustls::RootCertStore> {
+    let result = rustls_native_certs::load_native_certs();
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in result.certs {
+        // 单个无效证书不阻断整体加载
+        let _ = roots.add(cert);
+    }
+    ensure!(
+        !roots.is_empty(),
+        "no native root certificates found in the system trust store (errors: {:?})",
+        result.errors
+    );
     Ok(roots)
 }
 
@@ -332,8 +362,18 @@ mod tests {
     }
 
     #[test]
-    fn client_config_requires_ca_or_insecure() {
-        assert!(TlsConfig::default().build_client_config().is_err());
+    fn client_config_uses_native_roots_when_ca_absent() {
+        // 无 ca、非 insecure：回落系统原生信任库；无系统证书的环境下应报「无原生根证书」而非旧「ca 必填」。
+        match TlsConfig::default().build_client_config() {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("native root") || msg.contains("trust store"),
+                    "unexpected error: {msg}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -413,5 +453,105 @@ mod tests {
         );
 
         let _ = server.await;
+    }
+
+    #[test]
+    fn from_param_rejects_unknown_field() {
+        let v = json!({ "enabled": true, "cert_": "/c.pem" });
+        let err = TlsConfig::from_param(Some(&v)).unwrap_err().to_string();
+        assert!(err.contains("未知字段"), "unexpected error: {err}");
+        assert!(err.contains("cert_"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn from_param_ignores_unknown_when_disabled() {
+        // disabled 时整块忽略，未知字段不报错（向后兼容的宽松语义）
+        let v = json!({ "enabled": false, "typo_field": "x" });
+        assert!(TlsConfig::from_param(Some(&v)).unwrap().is_none());
+    }
+
+    #[test]
+    fn server_name_uses_explicit() {
+        let cfg = TlsConfig {
+            server_name: Some("wparse.example.com".into()),
+            ..Default::default()
+        };
+        let sn = cfg.server_name("default-host").unwrap();
+        assert_eq!(sn.to_str(), "wparse.example.com");
+    }
+
+    #[test]
+    fn client_config_rejects_partial_cert_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, _) = write_self_signed(&dir, "localhost");
+        // 直接构造只给 cert 不给 key（绕过 from_param 的成对校验）也应报错
+        let cfg = TlsConfig {
+            cert: Some(cert),
+            key: None,
+            ..Default::default()
+        };
+        let err = cfg.build_client_config().unwrap_err().to_string();
+        assert!(err.contains("成对"), "unexpected error: {err}");
+    }
+
+    /// 客户端 `insecure = true`（跳过服务端校验）+ 客户端证书（mTLS）时，客户端证书仍应被
+    /// 呈现——服务端用 CA 开启 mTLS，只有客户端确实提交了证书握手才成功。
+    #[tokio::test]
+    async fn client_insecure_with_mtls_presents_client_cert() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 自建 CA
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, ca_cert.pem().as_bytes()).unwrap();
+
+        // 服务端证书（由 CA 签发）
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
+        let server_cert_path = dir.path().join("server.pem");
+        let server_key_path = dir.path().join("server.key");
+        std::fs::write(&server_cert_path, server_cert.pem().as_bytes()).unwrap();
+        std::fs::write(&server_key_path, server_key.serialize_pem().as_bytes()).unwrap();
+
+        // 客户端证书（由同一 CA 签发）
+        let client_key = rcgen::KeyPair::generate().unwrap();
+        let client_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let client_cert = client_params.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
+        let client_cert_path = dir.path().join("client.pem");
+        let client_key_path = dir.path().join("client.key");
+        std::fs::write(&client_cert_path, client_cert.pem().as_bytes()).unwrap();
+        std::fs::write(&client_key_path, client_key.serialize_pem().as_bytes()).unwrap();
+
+        // 服务端：mTLS（要求并校验客户端证书）
+        let server_tls = TlsConfig {
+            cert: Some(server_cert_path.to_string_lossy().into_owned()),
+            key: Some(server_key_path.to_string_lossy().into_owned()),
+            ca: Some(ca_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls.build_server_config().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(stream).await.expect("server mTLS handshake");
+        });
+
+        // 客户端：insecure（跳过服务端校验）+ 客户端证书
+        let client_tls = TlsConfig {
+            insecure: true,
+            cert: Some(client_cert_path.to_string_lossy().into_owned()),
+            key: Some(client_key_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let _writer = NetWriter::connect_tcp_tls(&addr.to_string(), "localhost", &client_tls)
+            .await
+            .expect("client should present its cert even with insecure=true");
+
+        server.await.unwrap();
     }
 }
