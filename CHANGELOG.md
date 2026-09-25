@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] - 2026-09-25
+
+### Added
+
+- **tcp / file sink 压缩与加密（`compression` / `encryption`）**：`tcp`（含 `arrow`）与 `file` sink 新增两个子配置，复用 `wp-connector-utils` 的 `codec`（先压缩后加密、自描述帧头、GCM 认证）：
+  - `[params.compression] enabled = true, algo = "gzip"|"zstd", level = 3`
+  - `[params.encryption] enabled = true, algo = "aes-256-gcm"|"sm4-gcm", key = "<hex>"`
+  写入路径在底层传输前 `encode`，关闭时 `finish` 冲刷压缩尾块（< 64KiB 的末段数据不丢）。
+
+### Changed
+
+- `NetWriter` 增加可选 `codec`（`with_codec`），并在 `shutdown` 前冲刷 codec 尾块。
+- `tcp` / `file` 的 connector 定义新增 `compression` / `encryption` 可覆盖字段。
+
+### Dependencies
+
+- 升级 `wp-connector-utils` `0.4` → `0.4.1`（补齐 `Encoder`/`Decoder` 的 `Sync` 上界，使 codec 可被持有在 `Send + Sync` 的 sink 结构体里）。
+
 ## [0.9.1] - 2026-09-23
 
 ### Added

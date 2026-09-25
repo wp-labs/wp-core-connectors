@@ -108,9 +108,14 @@ impl SinkFactory for FileFactory {
                 let path = resolved.resolve_path(ctx);
                 let fmt = resolved.text_fmt();
                 let sync = resolved.sync();
+                let codec = resolved
+                    .codec()
+                    .build_encoder()
+                    .map_err(|e| SinkReason::Sink.to_err().with_detail(e.to_string()))?;
                 let sink = AsyncFileSink::with_sync(&path, sync)
                     .await
-                    .source_err(SinkReason::Sink, "file sink open")?;
+                    .source_err(SinkReason::Sink, "file sink open")?
+                    .with_codec(codec);
                 Box::new(FormattedFileSink::new(fmt, sink))
             }
             other => {

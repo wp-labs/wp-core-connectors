@@ -13,9 +13,12 @@ use wp_connector_api::{
     AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, SinkBuildCtx, SinkReason, SinkResult,
     SinkSpec as ResolvedSinkSpec,
 };
+use wp_connector_utils::codec::Encoder;
 use wp_data_fmt::{FormatType, RecordFormatter};
 use wp_model_core::model::DataRecord;
 use wp_model_core::model::fmt_def::TextFmt;
+
+use crate::net::CodecConfig;
 
 use super::arrow_conv::{
     data_record_to_batch, data_records_to_batch, encode_ipc_frame_multi, infer_schema_from_record,
@@ -49,6 +52,7 @@ pub struct FileSinkSpec {
     base: String,
     file_name: String,
     sync: bool,
+    codec: CodecConfig,
 }
 
 impl FileSinkSpec {
@@ -85,11 +89,17 @@ impl FileSinkSpec {
             .get("sync")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let codec = CodecConfig::from_params(&spec.params)
+            .map_err(|e| SinkReason::core_conf().to_err().with_detail(e.to_string()))?;
+        codec
+            .validate()
+            .map_err(|e| SinkReason::core_conf().to_err().with_detail(e.to_string()))?;
         Ok(Self {
             fmt,
             base,
             file_name,
             sync,
+            codec,
         })
     }
 
@@ -99,6 +109,10 @@ impl FileSinkSpec {
 
     pub fn sync(&self) -> bool {
         self.sync
+    }
+
+    pub fn codec(&self) -> &CodecConfig {
+        &self.codec
     }
 
     pub fn resolve_path(&self, _ctx: &SinkBuildCtx) -> String {
@@ -156,6 +170,7 @@ pub struct AsyncFileSink {
     out_io: tokio::fs::File,
     sync: bool,
     lock_released: bool,
+    codec: Option<Box<dyn Encoder>>,
 }
 
 impl Drop for AsyncFileSink {
@@ -188,7 +203,14 @@ impl AsyncFileSink {
             out_io,
             sync,
             lock_released: !out_path.ends_with(".lock"),
+            codec: None,
         })
+    }
+
+    /// 附加压缩/加密编码器；后续写入会先 `encode` 再落盘。
+    pub fn with_codec(mut self, codec: Option<Box<dyn Encoder>>) -> Self {
+        self.codec = codec;
+        self
     }
 
     fn unlock_lockfile(&mut self) -> std::io::Result<()> {
@@ -213,11 +235,53 @@ impl AsyncFileSink {
             Ok(())
         }
     }
+
+    /// 统一写入入口：有 codec 先编码再写文件，`sync` 时逐次 `sync_all`。
+    async fn write_bytes(&mut self, data: &[u8]) -> SinkResult<()> {
+        if let Some(codec) = &mut self.codec {
+            let mut encoded = Vec::new();
+            codec
+                .encode(data, &mut encoded)
+                .map_err(|e| sink_err("codec encode fail", e))?;
+            if !encoded.is_empty() {
+                self.out_io
+                    .write_all(&encoded)
+                    .await
+                    .map_err(|e| sink_err("file out fail", e))?;
+            }
+        } else {
+            self.out_io
+                .write_all(data)
+                .await
+                .map_err(|e| sink_err("file out fail", e))?;
+        }
+        if self.sync {
+            self.out_io
+                .sync_all()
+                .await
+                .map_err(|e| sink_err("file sync fail", e))?;
+            record_sync_all_call();
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl AsyncCtrl for AsyncFileSink {
     async fn stop(&mut self) -> SinkResult<()> {
+        // 冲刷 codec 尾部（压缩层未达块阈值的残留），否则丢末段数据
+        if let Some(codec) = &mut self.codec {
+            let mut tail = Vec::new();
+            codec
+                .finish(&mut tail)
+                .map_err(|e| sink_err("codec finish fail", e))?;
+            if !tail.is_empty() {
+                self.out_io
+                    .write_all(&tail)
+                    .await
+                    .map_err(|e| sink_err("file out fail", e))?;
+            }
+        }
         self.out_io
             .sync_all()
             .await
@@ -236,19 +300,7 @@ impl AsyncCtrl for AsyncFileSink {
 #[async_trait]
 impl AsyncRawDataSink for AsyncFileSink {
     async fn sink_bytes(&mut self, data: &[u8]) -> SinkResult<()> {
-        self.out_io
-            .write_all(data)
-            .await
-            .map_err(|e| sink_err("file out fail", e))?;
-
-        if self.sync {
-            self.out_io
-                .sync_all()
-                .await
-                .map_err(|e| sink_err("file sync fail", e))?;
-            record_sync_all_call();
-        }
-        Ok(())
+        self.write_bytes(data).await
     }
 
     async fn sink_str(&mut self, data: &str) -> SinkResult<()> {
@@ -283,20 +335,7 @@ impl AsyncRawDataSink for AsyncFileSink {
             }
         }
 
-        self.out_io
-            .write_all(&buffer)
-            .await
-            .map_err(|e| sink_err("file out fail", e))?;
-
-        if self.sync {
-            self.out_io
-                .sync_all()
-                .await
-                .map_err(|e| sink_err("file sync fail", e))?;
-            record_sync_all_call();
-        }
-
-        Ok(())
+        self.write_bytes(&buffer).await
     }
 
     async fn sink_bytes_batch(&mut self, data: Vec<&[u8]>) -> SinkResult<()> {
@@ -320,20 +359,7 @@ impl AsyncRawDataSink for AsyncFileSink {
             }
         }
 
-        self.out_io
-            .write_all(&buffer)
-            .await
-            .map_err(|e| sink_err("file out fail", e))?;
-
-        if self.sync {
-            self.out_io
-                .sync_all()
-                .await
-                .map_err(|e| sink_err("file sync fail", e))?;
-            record_sync_all_call();
-        }
-
-        Ok(())
+        self.write_bytes(&buffer).await
     }
 }
 
@@ -705,6 +731,70 @@ mod tests {
         sink.stop().await.map_err(|e| anyhow::anyhow!("{e}"))?;
         let body = fs::read_to_string(path)?;
         assert!(body.trim_start().starts_with('{'));
+        Ok(())
+    }
+
+    /// file sink 的 `compression` + `encryption`：写入小于压缩块阈值的多行，`stop()` 冲刷尾部，
+    /// 读回字节后经 `build_decoder` 还原明文；密文里不应出现明文。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_sink_encrypt_compress_roundtrip() -> anyhow::Result<()> {
+        use wp_connector_api::{AsyncCtrl, AsyncRawDataSink};
+        use wp_connector_utils::codec::{
+            Cipher, CompressConfig, CompressionAlgo, EncryptConfig, build_decoder, build_encoder,
+        };
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("wp_file_codec_{}.dat", ts));
+
+        let compress = CompressConfig {
+            algo: CompressionAlgo::Zstd,
+            level: 3,
+        };
+        let encrypt = EncryptConfig {
+            cipher: Cipher::Aes256Gcm,
+            key: (0u8..32).collect(),
+        };
+        let encoder = build_encoder(Some(&compress), Some(&encrypt)).unwrap();
+        let mut sink = AsyncFileSink::new(path.to_string_lossy().as_ref())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_codec(Some(encoder));
+
+        AsyncRawDataSink::sink_str(&mut sink, "hello codec")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncRawDataSink::sink_str(&mut sink, "second line")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncCtrl::stop(&mut sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let wire = fs::read(&path)?;
+        assert!(!wire.is_empty(), "encoded file should not be empty");
+        assert!(
+            !wire
+                .windows(b"hello codec".len())
+                .any(|w| w == b"hello codec"),
+            "ciphertext should not contain plaintext"
+        );
+
+        let mut decoder = build_decoder(Some(&compress), Some(&encrypt)).unwrap();
+        let mut plain = Vec::new();
+        decoder
+            .decode(&wire, &mut plain)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        decoder
+            .finish(&mut plain)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let text = String::from_utf8_lossy(&plain);
+        assert!(text.contains("hello codec\n"));
+        assert!(text.contains("second line\n"));
+
+        let _ = fs::remove_file(&path);
         Ok(())
     }
 

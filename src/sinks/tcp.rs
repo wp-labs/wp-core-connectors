@@ -7,14 +7,14 @@ use orion_error::conversion::{SourceErr, ToStructError};
 use wp_connector_api::SinkReason;
 use wp_connector_api::SinkResult;
 use wp_connector_api::{
-    AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, BatchMeta, ConnectorDef, SinkBuildCtx,
+    AsyncCtrl, AsyncRawDataSink, AsyncRecordSink, BatchMeta, ConnectorDef, ParamMap, SinkBuildCtx,
     SinkDefProvider, SinkFactory, SinkHandle, SinkSpec as ResolvedSinkSpec,
 };
 use wp_data_fmt::{FormatType, RecordFormatter};
 use wp_model_core::model::fmt_def::TextFmt;
 
-use crate::net::TlsConfig;
 use crate::net::transport::{BackoffMode, NetSendPolicy, NetWriter, net_backoff_adaptive};
+use crate::net::{CodecConfig, TlsConfig};
 
 use super::arrow_conv::{
     data_record_to_batch, data_records_to_batch, encode_batch_ipc_stream, encode_ipc_frame,
@@ -35,6 +35,7 @@ struct TcpSinkSpec {
     framing: Framing,
     fmt: TextFmt,
     tls: Option<TlsConfig>,
+    codec: CodecConfig,
 }
 
 impl TcpSinkSpec {
@@ -74,6 +75,7 @@ impl TcpSinkSpec {
         Self::ensure_bool(spec, "sendq_backpressure")?;
         let tls = TlsConfig::from_param(spec.params.get("tls"))
             .map_err(|e| SinkReason::core_conf().to_err().with_detail(e.to_string()))?;
+        let codec = parse_codec(&spec.params)?;
         let fmt = spec
             .params
             .get("fmt")
@@ -86,6 +88,7 @@ impl TcpSinkSpec {
             framing,
             fmt,
             tls,
+            codec,
         })
     }
 
@@ -105,6 +108,17 @@ impl TcpSinkSpec {
     }
 }
 
+/// 解析并校验 `compression` / `encryption` 子配置（含密钥长度 / 压缩级别），
+/// 失败即 `core_conf` 配置错误。
+fn parse_codec(params: &ParamMap) -> SinkResult<CodecConfig> {
+    let codec = CodecConfig::from_params(params)
+        .map_err(|e| SinkReason::core_conf().to_err().with_detail(e.to_string()))?;
+    codec
+        .validate()
+        .map_err(|e| SinkReason::core_conf().to_err().with_detail(e.to_string()))?;
+    Ok(codec)
+}
+
 // Max seconds to wait for kernel TCP send-queue to drain at shutdown
 const TCP_DRAIN_MAX_SECS: u64 = 10;
 
@@ -117,6 +131,7 @@ pub struct TcpSink {
     fmt: TextFmt,
     sent_cnt: u64,
     tls: Option<TlsConfig>,
+    codec: CodecConfig,
 }
 
 impl TcpSink {
@@ -130,7 +145,7 @@ impl TcpSink {
         } else {
             BackoffMode::ForceOff
         };
-        let writer = match &spec.tls {
+        let mut writer = match &spec.tls {
             Some(tls) => NetWriter::connect_tcp_tls(&target, &spec.addr, tls)
                 .await
                 .source_err(SinkReason::Sink, "tcp sink connect tls")?,
@@ -145,10 +160,16 @@ impl TcpSink {
             .await
             .source_err(SinkReason::Sink, "tcp sink connect tcp")?,
         };
+        writer = writer.with_codec(
+            spec.codec
+                .build_encoder()
+                .map_err(|e| SinkReason::Sink.to_err().with_detail(e.to_string()))?,
+        );
         log::info!(
-            "tcp sink connected: target={} tls={}",
+            "tcp sink connected: target={} tls={} codec={}",
             target,
-            spec.tls.is_some()
+            spec.tls.is_some(),
+            spec.codec.is_enabled()
         );
         Ok(Self {
             writer,
@@ -159,6 +180,7 @@ impl TcpSink {
             fmt: spec.fmt,
             sent_cnt: 0,
             tls: spec.tls.clone(),
+            codec: spec.codec.clone(),
         })
     }
 }
@@ -176,7 +198,7 @@ impl AsyncCtrl for TcpSink {
     }
     async fn reconnect(&mut self) -> SinkResult<()> {
         let _ = self.writer.shutdown().await;
-        let writer = match &self.tls {
+        let mut writer = match &self.tls {
             Some(tls) => NetWriter::connect_tcp_tls(&self.target_addr, &self.host, tls)
                 .await
                 .source_err(SinkReason::Sink, "tcp sink reconnect tls")?,
@@ -198,6 +220,11 @@ impl AsyncCtrl for TcpSink {
                 .source_err(SinkReason::Sink, "tcp sink reconnect tcp")?
             }
         };
+        writer = writer.with_codec(
+            self.codec
+                .build_encoder()
+                .map_err(|e| SinkReason::Sink.to_err().with_detail(e.to_string()))?,
+        );
         log::info!("tcp sink reconnected: target={}", self.target_addr);
         self.writer = writer;
         Ok(())
@@ -404,6 +431,7 @@ impl SinkFactory for TcpFactory {
                 if let Err(e) = TlsConfig::from_param(spec.params.get("tls")) {
                     return Err(SinkReason::core_conf().to_err().with_detail(e.to_string()));
                 }
+                parse_codec(&spec.params)?;
                 Ok(())
             }
             "txt" | "" => {
@@ -508,6 +536,7 @@ pub struct TcpArrowSink {
     /// Stream tag embedded in each wp_arrow frame (only used when `framed`).
     tag: String,
     tls: Option<TlsConfig>,
+    codec: CodecConfig,
 }
 
 impl TcpArrowSink {
@@ -542,6 +571,7 @@ impl TcpArrowSink {
             .to_string();
         let tls = TlsConfig::from_param(spec.params.get("tls"))
             .map_err(|e| SinkReason::core_conf().to_err().with_detail(e.to_string()))?;
+        let codec = parse_codec(&spec.params)?;
 
         let target = format!("{addr}:{port}");
         let mode = if rate_limit_rps == 0 {
@@ -549,7 +579,7 @@ impl TcpArrowSink {
         } else {
             BackoffMode::ForceOff
         };
-        let writer = match &tls {
+        let mut writer = match &tls {
             Some(t) => NetWriter::connect_tcp_tls(&target, addr, t)
                 .await
                 .source_err(SinkReason::Sink, "tcp_arrow connect tls")?,
@@ -564,10 +594,16 @@ impl TcpArrowSink {
             .await
             .source_err(SinkReason::Sink, "tcp_arrow connect tcp")?,
         };
+        writer = writer.with_codec(
+            codec
+                .build_encoder()
+                .map_err(|e| SinkReason::Sink.to_err().with_detail(e.to_string()))?,
+        );
 
         log::info!(
-            "tcp_arrow sink connected: target={target} tls={}",
-            tls.is_some()
+            "tcp_arrow sink connected: target={target} tls={} codec={}",
+            tls.is_some(),
+            codec.is_enabled()
         );
 
         Ok(Self {
@@ -582,6 +618,7 @@ impl TcpArrowSink {
             framed,
             tag,
             tls,
+            codec,
         })
     }
 
@@ -599,7 +636,7 @@ impl TcpArrowSink {
 
     async fn connect_writer(&self) -> SinkResult<NetWriter> {
         let target = format!("{}:{}", self.host, self.port);
-        match &self.tls {
+        let mut writer = match &self.tls {
             Some(t) => NetWriter::connect_tcp_tls(&target, &self.host, t)
                 .await
                 .source_err(SinkReason::Sink, "tcp_arrow reconnect tls"),
@@ -620,7 +657,13 @@ impl TcpArrowSink {
                 .await
                 .source_err(SinkReason::Sink, "tcp_arrow reconnect tcp")
             }
-        }
+        }?;
+        writer = writer.with_codec(
+            self.codec
+                .build_encoder()
+                .map_err(|e| SinkReason::Sink.to_err().with_detail(e.to_string()))?,
+        );
+        Ok(writer)
     }
 
     fn enter_disconnected(&mut self) {
@@ -954,6 +997,91 @@ mod tests {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let body = srv.await.unwrap();
         assert_eq!(body, b"5 hello");
+        Ok(())
+    }
+
+    /// tcp sink 的 `compression` + `encryption`：写入多行，`stop()` 冲刷尾部，接收端读回
+    /// 原始字节后经 `build_decoder` 还原明文。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_sink_encrypt_compress_roundtrip() -> anyhow::Result<()> {
+        use wp_connector_api::AsyncCtrl;
+        use wp_connector_utils::codec::{
+            Cipher, CompressConfig, CompressionAlgo, EncryptConfig, build_decoder,
+        };
+
+        if std::env::var("WP_NET_TESTS").unwrap_or_default() != "1" {
+            return Ok(());
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let srv = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = s.read(&mut buf).await.unwrap();
+            buf[..n].to_vec()
+        });
+
+        let mut compression = toml::map::Map::new();
+        compression.insert("enabled".into(), toml::Value::Boolean(true));
+        compression.insert("algo".into(), toml::Value::String("zstd".into()));
+        let mut encryption = toml::map::Map::new();
+        encryption.insert("enabled".into(), toml::Value::Boolean(true));
+        encryption.insert("algo".into(), toml::Value::String("aes-256-gcm".into()));
+        encryption.insert(
+            "key".into(),
+            toml::Value::String(
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".into(),
+            ),
+        );
+
+        let mut params = toml::map::Map::new();
+        params.insert("addr".into(), toml::Value::String("127.0.0.1".into()));
+        params.insert("port".into(), toml::Value::Integer(port as i64));
+        params.insert("framing".into(), toml::Value::String("line".into()));
+        params.insert("compression".into(), toml::Value::Table(compression));
+        params.insert("encryption".into(), toml::Value::Table(encryption));
+
+        let fac = TcpFactory;
+        let spec = wp_connector_api::SinkSpec {
+            group: String::new(),
+            name: "t".into(),
+            kind: "tcp".into(),
+            connector_id: String::new(),
+            params: wp_connector_api::parammap_from_toml_map(params),
+            filter: None,
+        };
+        let ctx = wp_connector_api::SinkBuildCtx::new(std::env::current_dir().unwrap());
+        let mut h = fac
+            .build(&spec, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncRawDataSink::sink_str(h.sink.as_mut(), "hello codec")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // 冲刷 codec 尾部（压缩层未达块阈值）+ 发送 FIN
+        AsyncCtrl::stop(h.sink.as_mut())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let wire = srv.await.unwrap();
+        assert!(!wire.is_empty());
+
+        let compress = CompressConfig {
+            algo: CompressionAlgo::Zstd,
+            level: 3,
+        };
+        let encrypt = EncryptConfig {
+            cipher: Cipher::Aes256Gcm,
+            key: (0u8..32).collect(),
+        };
+        let mut decoder = build_decoder(Some(&compress), Some(&encrypt)).unwrap();
+        let mut plain = Vec::new();
+        decoder
+            .decode(&wire, &mut plain)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        decoder
+            .finish(&mut plain)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(String::from_utf8_lossy(&plain), "hello codec\n");
         Ok(())
     }
 

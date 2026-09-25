@@ -1,6 +1,6 @@
 [package]
 name = "wp-core-connectors"
-version = "0.9.1" #@gxl:set(version)
+version = "0.9.2" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 authors = ["WarpParse Dev Team"]
@@ -40,7 +40,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-native-certs = "0.8"
 wp-connector-api = "0.13"
-wp-connector-utils = "0.3"
+wp-connector-utils = "0.4.1"
 wf-connector-api =  "0.3"
 wp-model-core = "0.10"
 wp-conf-base = "0.6"

@@ -8,6 +8,7 @@ use wp_connector_api::{SinkReason, SinkResult};
 
 use super::config::*; // reuse constants/policy/adaptive toggles
 use crate::net::TlsConfig;
+use wp_connector_utils::codec::Encoder as CodecEncoder;
 
 // further split for readability: platform ops, probe, backoff, logging, nodelay
 mod backoff;
@@ -28,6 +29,8 @@ pub enum Transport {
 pub struct NetWriter {
     pub transport: Transport,
     pub sent_cnt: u64,
+    /// 可选：压缩/加密编码器（仅 tcp/file sink 使用）。
+    pub(crate) codec: Option<Box<dyn CodecEncoder>>,
     /// 可选：启用发送队列感知的退让。
     pub backpressure: Option<BackpressureCfg>,
     /// 最近一段时间单次写入大小（指数滑动平均，字节）。仅用于探测节流，不改变水位/睡眠策略。
@@ -81,6 +84,7 @@ impl NetWriter {
         Ok(Self {
             transport: Transport::Udp(socket),
             sent_cnt: 0,
+            codec: None,
             backpressure: None,
             avg_write_len: 0.0,
             bytes_since_probe: 0,
@@ -113,6 +117,7 @@ impl NetWriter {
         Ok(Self {
             transport: Transport::Tcp(stream),
             sent_cnt: 0,
+            codec: None,
             backpressure: None,
             avg_write_len: 0.0,
             bytes_since_probe: 0,
@@ -183,6 +188,7 @@ impl NetWriter {
         Ok(Self {
             transport: Transport::Tls(Box::new(tls_stream)),
             sent_cnt: 0,
+            codec: None,
             backpressure: None,
             avg_write_len: 0.0,
             bytes_since_probe: 0,
@@ -205,7 +211,13 @@ impl NetWriter {
         })
     }
 
-    /// 写入原始字节（UDP 发送单报文；TCP write_all）
+    /// 设置压缩/加密编码器（sink 侧可选）。
+    pub fn with_codec(mut self, codec: Option<Box<dyn CodecEncoder>>) -> Self {
+        self.codec = codec;
+        self
+    }
+
+    /// 写入原始字节（UDP 发送单报文；TCP write_all）；有 codec 时先编码。
     pub async fn write(&mut self, bytes: &[u8]) -> SinkResult<()> {
         if matches!(self.transport, Transport::Tcp(_)) && self.backpressure.is_some() {
             // 仅统计累加，真正计算与退让在观测点执行
@@ -220,6 +232,23 @@ impl NetWriter {
                 self.handle_large_probe().await;
             }
         }
+
+        let mut encoded = Vec::new();
+        let out: &[u8] = if let Some(codec) = &mut self.codec {
+            codec.encode(bytes, &mut encoded).map_err(|e| {
+                SinkReason::Sink
+                    .to_err()
+                    .with_detail(format!("codec encode error: {e}"))
+            })?;
+            &encoded
+        } else {
+            bytes
+        };
+        self.write_transport(out).await
+    }
+
+    /// 直接写底层 transport（不含 codec / backpressure 处理）。
+    async fn write_transport(&mut self, bytes: &[u8]) -> SinkResult<()> {
         match &mut self.transport {
             Transport::Udp(sock) => {
                 sock.send(bytes)
@@ -262,6 +291,18 @@ impl NetWriter {
 
     /// 尝试优雅关闭 TCP 写端，促使对端尽快读取完所有已提交数据并收到 FIN。
     pub async fn shutdown(&mut self) -> SinkResult<()> {
+        // 冲刷 codec 尾部（压缩层未达 64KiB 阈值的残留块），否则关闭时会丢末段数据。
+        let mut tail = Vec::new();
+        if let Some(codec) = &mut self.codec {
+            codec.finish(&mut tail).map_err(|e| {
+                SinkReason::Sink
+                    .to_err()
+                    .with_detail(format!("codec finish error: {e}"))
+            })?;
+        }
+        if !tail.is_empty() {
+            self.write_transport(&tail).await?;
+        }
         match &mut self.transport {
             Transport::Tcp(stream) => {
                 stream
@@ -305,6 +346,7 @@ impl NetWriter {
         Self {
             transport: Transport::Null,
             sent_cnt: 0,
+            codec: None,
             backpressure: None,
             avg_write_len: 0.0,
             bytes_since_probe: 0,
