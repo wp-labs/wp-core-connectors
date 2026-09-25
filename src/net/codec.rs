@@ -42,6 +42,11 @@ impl CodecConfig {
         self.compression.is_some() || self.encryption.is_some()
     }
 
+    /// 是否启用了加密层（仅加密，不含压缩）。用于在日志等观测面屏蔽明文内容。
+    pub fn has_encryption(&self) -> bool {
+        self.encryption.is_some()
+    }
+
     /// 构建编码器（sink 侧）。未启用返回 `None`。
     pub fn build_encoder(&self) -> anyhow::Result<Option<Box<dyn Encoder>>> {
         if !self.is_enabled() {

@@ -263,12 +263,21 @@ impl AsyncRawDataSink for TcpSink {
     async fn sink_str(&mut self, data: &str) -> SinkResult<()> {
         let payload = build_payload_bytes(data.as_bytes(), self.framing);
         if self.sent_cnt == 0 {
-            log::info!(
-                "tcp sink first-send: framing={:?} msg_len={} preview='{}'",
-                self.framing,
-                payload.len(),
-                data.chars().take(64).collect::<String>()
-            );
+            if self.codec.has_encryption() {
+                // 启用加密时不落明文预览，避免日志泄露机密内容
+                log::info!(
+                    "tcp sink first-send: framing={:?} msg_len={} encryption=true (preview suppressed)",
+                    self.framing,
+                    payload.len(),
+                );
+            } else {
+                log::info!(
+                    "tcp sink first-send: framing={:?} msg_len={} preview='{}'",
+                    self.framing,
+                    payload.len(),
+                    data.chars().take(64).collect::<String>()
+                );
+            }
         }
         self.writer.write(&payload).await?;
         self.sent_cnt = self.sent_cnt.saturating_add(1);
