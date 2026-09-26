@@ -18,7 +18,8 @@ use anyhow::anyhow;
 use serde_json::Value;
 use wp_connector_api::ParamMap;
 use wp_connector_utils::codec::{
-    Cipher, CompressConfig, CompressionAlgo, Encoder, EncryptConfig, build_encoder,
+    Cipher, CompressConfig, CompressionAlgo, Decoder, Encoder, EncryptConfig, build_decoder,
+    build_encoder,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -53,6 +54,17 @@ impl CodecConfig {
             return Ok(None);
         }
         Ok(Some(build_encoder(
+            self.compression.as_ref(),
+            self.encryption.as_ref(),
+        )?))
+    }
+
+    /// 构建解码器（source 侧）。未启用返回 `None`。
+    pub fn build_decoder(&self) -> anyhow::Result<Option<Box<dyn Decoder>>> {
+        if !self.is_enabled() {
+            return Ok(None);
+        }
+        Ok(Some(build_decoder(
             self.compression.as_ref(),
             self.encryption.as_ref(),
         )?))

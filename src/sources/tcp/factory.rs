@@ -74,6 +74,7 @@ impl SourceFactory for TcpSourceFactory {
                     conf.framing,
                     connection_registry.clone(),
                     reader_reg_rx,
+                    conf.codec.clone(),
                 )
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -380,5 +381,133 @@ mod tests {
             .broadcast(wp_connector_api::ControlEvent::Stop)
             .await;
         accept_task.await.unwrap();
+    }
+
+    /// sink + source 端到端：`tcp_sink`（zstd + sm4-gcm 编码）→ `tcp_src`（对称解码）→ 还原明文。
+    /// 覆盖完整的「压缩→加密→TCP→解密→解压」链路。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sink_source_codec_roundtrip() -> anyhow::Result<()> {
+        use crate::sinks::tcp::TcpFactory;
+        use wp_connector_api::{AsyncCtrl, AsyncRawDataSink, SinkBuildCtx, SinkFactory, SinkSpec};
+
+        if std::env::var("WP_NET_TESTS").unwrap_or_default() != "1" {
+            return Ok(());
+        }
+
+        // 1. 预留一个空闲端口
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        // 2. 构造 source 参数（compression=zstd + encryption=sm4-gcm）
+        let codec_params = |params: &mut toml::map::Map<String, toml::Value>| {
+            let mut compression = toml::map::Map::new();
+            compression.insert("enabled".into(), toml::Value::Boolean(true));
+            compression.insert("algo".into(), toml::Value::String("zstd".into()));
+            compression.insert("level".into(), toml::Value::Integer(3));
+            let mut encryption = toml::map::Map::new();
+            encryption.insert("enabled".into(), toml::Value::Boolean(true));
+            encryption.insert("algo".into(), toml::Value::String("sm4-gcm".into()));
+            encryption.insert(
+                "key".into(),
+                toml::Value::String("000102030405060708090a0b0c0d0e0f".into()),
+            );
+            params.insert("compression".into(), toml::Value::Table(compression));
+            params.insert("encryption".into(), toml::Value::Table(encryption));
+        };
+
+        let mut src_params = toml::map::Map::new();
+        src_params.insert("addr".into(), toml::Value::String("127.0.0.1".into()));
+        src_params.insert("port".into(), toml::Value::Integer(port as i64));
+        src_params.insert("framing".into(), toml::Value::String("line".into()));
+        codec_params(&mut src_params);
+
+        let fac = TcpSourceFactory;
+        let src_spec = ResolvedSourceSpec {
+            name: "tcp_gm_e2e".into(),
+            kind: "tcp".into(),
+            connector_id: String::new(),
+            params: wp_connector_api::parammap_from_toml_map(src_params),
+            tags: vec![],
+        };
+        let src_ctx = SourceBuildCtx::new(std::env::current_dir().unwrap());
+        let mut svc = fac.build(&src_spec, &src_ctx).await.unwrap();
+
+        // 3. 启动 acceptor（绑定端口并 accept）与 reader 实例
+        let mut acceptor_handle = svc.acceptor.take().expect("tcp acceptor present");
+        let (accept_stop_tx, accept_stop_rx) =
+            async_broadcast::broadcast::<wp_connector_api::ControlEvent>(8);
+        let accept_task = tokio::spawn(async move {
+            acceptor_handle
+                .acceptor
+                .accept_connection(accept_stop_rx)
+                .await
+                .expect("accept loop should exit cleanly");
+        });
+        let mut handles = svc.sources;
+        for handle in handles.iter_mut() {
+            let (_tx, rx) = async_broadcast::broadcast::<wp_connector_api::ControlEvent>(1);
+            handle.source.start(rx).await.unwrap();
+        }
+
+        // 4. 构造 sink（对称 codec），带重试连接（等待 acceptor 绑定完成）
+        let mut sink_params = toml::map::Map::new();
+        sink_params.insert("addr".into(), toml::Value::String("127.0.0.1".into()));
+        sink_params.insert("port".into(), toml::Value::Integer(port as i64));
+        sink_params.insert("framing".into(), toml::Value::String("line".into()));
+        codec_params(&mut sink_params);
+
+        let sink_fac = TcpFactory;
+        let sink_spec = SinkSpec {
+            group: String::new(),
+            name: "s".into(),
+            kind: "tcp".into(),
+            connector_id: String::new(),
+            params: wp_connector_api::parammap_from_toml_map(sink_params),
+            filter: None,
+        };
+        let sink_ctx = SinkBuildCtx::new(std::env::current_dir().unwrap());
+        let mut sink_handle = loop {
+            match sink_fac.build(&sink_spec, &sink_ctx).await {
+                Ok(h) => break h,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        };
+
+        // 5. sink 发送 + 停止（冲刷压缩尾块 + 发送 FIN）
+        AsyncRawDataSink::sink_str(sink_handle.sink.as_mut(), "hello gm e2e")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncCtrl::stop(sink_handle.sink.as_mut())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // 6. source 接收并验证明文
+        let batch = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            handles[0].source.receive(),
+        )
+        .await
+        .expect("source receive timeout")
+        .unwrap();
+        assert_eq!(batch.len(), 1, "应还原出一条消息");
+        let got = match &batch[0].payload {
+            RawData::String(s) => s.clone(),
+            RawData::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+            RawData::ArcBytes(b) => String::from_utf8_lossy(b).into_owned(),
+        };
+        assert_eq!(got, "hello gm e2e");
+
+        // 7. 清理
+        for handle in handles.iter_mut() {
+            handle.source.close().await.unwrap();
+        }
+        let _ = accept_stop_tx
+            .broadcast(wp_connector_api::ControlEvent::Stop)
+            .await;
+        accept_task.await.unwrap();
+        Ok(())
     }
 }

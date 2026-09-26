@@ -332,6 +332,8 @@ pub fn builtin_source_defs() -> Vec<ConnectorDef> {
                 "instances".into(),
                 "data_format".into(),
                 "tls".into(),
+                "compression".into(),
+                "encryption".into(),
             ],
             default_params: params,
             origin: Some("builtin:tcp_source".into()),

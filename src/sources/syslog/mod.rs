@@ -237,6 +237,7 @@ mod tests {
             crate::sources::tcp::FramingMode::Line,
             pool,
             rx,
+            crate::net::CodecConfig::default(),
         )
         .unwrap();
         let result =

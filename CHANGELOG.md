@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] - 2026-09-26
+
+### Added
+
+- **`tcp_src` 支持压缩/加密解码（`compression` / `encryption`）**：与 sink 侧对称，source 侧用 `build_decoder`（先解密后解压）把 codec 帧还原成明文再按 framing 分帧。新增 `StreamDecoder`（`src/sources/tcp/codec.rs`）：按 `magic + length` 边界切帧，半帧留在缓冲等下次读（`Decoder::decode` 只接受完整帧）；带 64 MiB 单帧上限防异常长度声明。
+- 补充 source 侧 codec 单元测试（分帧边界/超限/坏头、SM4/AES/gzip/zstd/加密-only/压缩-only 往返、多帧、错误路径）与 sink↔source 端到端测试。
+
+### Changed
+
+- `CodecConfig` 新增 `build_decoder()`，与 `build_encoder()` 对称。
+- `TcpSourceSpec` / `TcpSource` / `TcpConnection` / `BatchBuilder` 贯穿 codec 配置；`drain_messages` 在分帧前先解码。
+- `tcp_src` 的 connector 定义新增 `compression` / `encryption` 可覆盖字段。
+
 ## [0.9.2] - 2026-09-25
 
 ### Added

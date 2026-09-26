@@ -1,4 +1,6 @@
+use crate::net::CodecConfig;
 use crate::sources::event_id::next_event_id;
+use crate::sources::tcp::codec::StreamDecoder;
 use crate::sources::tcp::framing::{FramingExtractor, FramingMode};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::VecDeque;
@@ -82,6 +84,7 @@ struct BatchBuilder {
     pending_bytes: usize,
     max_batch_bytes: usize,
     max_pending_bytes: usize,
+    codec: Option<StreamDecoder>,
 }
 
 impl TcpConnection {
@@ -92,8 +95,17 @@ impl TcpConnection {
         base_tags: Tags,
         tcp_recv_bytes: usize,
         source_key: String,
+        codec: CodecConfig,
     ) -> Self {
         let capacity = tcp_recv_bytes.max(1024);
+        let stream_decoder = match StreamDecoder::new(&codec) {
+            Ok(sd) => sd,
+            Err(e) => {
+                // 配置已在 from_params 校验过，此处失败属异常；降级为不启用 codec 并告警。
+                log::error!("tcp source codec init failed (codec disabled): {e}");
+                None
+            }
+        };
         let conn = Self {
             stream,
             client_addr,
@@ -105,6 +117,7 @@ impl TcpConnection {
                 DEFAULT_BATCH_CAPACITY,
                 MAX_BATCH_BYTES,
                 MAX_PENDING_BYTES,
+                stream_decoder,
             ),
         };
         debug_data!(
@@ -137,7 +150,7 @@ impl TcpConnection {
                         self.client_addr.ip(),
                         &mut produced,
                         &mut produced_bytes,
-                    );
+                    )?;
                     self.batcher
                         .fill_batch_from_pending(&mut produced, &mut produced_bytes);
                     if !produced.is_empty() {
@@ -164,7 +177,7 @@ impl TcpConnection {
                         self.client_addr.ip(),
                         &mut produced,
                         &mut produced_bytes,
-                    );
+                    )?;
                     if !produced.is_empty() {
                         return Ok(ReadOutcome::Produced(produced));
                     }
@@ -219,7 +232,7 @@ impl TcpConnection {
                         self.client_addr.ip(),
                         &mut produced,
                         &mut produced_bytes,
-                    );
+                    )?;
                     self.batcher
                         .fill_batch_from_pending(&mut produced, &mut produced_bytes);
                     if !produced.is_empty() {
@@ -246,7 +259,7 @@ impl TcpConnection {
                         self.client_addr.ip(),
                         &mut produced,
                         &mut produced_bytes,
-                    );
+                    )?;
                     if !produced.is_empty() {
                         return Ok(ReadOutcome::Produced(produced));
                     }
@@ -292,6 +305,7 @@ impl BatchBuilder {
         batch_capacity: usize,
         max_batch_bytes: usize,
         max_pending_bytes: usize,
+        codec: Option<StreamDecoder>,
     ) -> Self {
         Self {
             buffer,
@@ -302,6 +316,7 @@ impl BatchBuilder {
             pending_bytes: 0,
             max_batch_bytes,
             max_pending_bytes,
+            codec,
         }
     }
 
@@ -381,7 +396,7 @@ impl BatchBuilder {
         peer_ip: IpAddr,
         batch: &mut SourceBatch,
         produced_bytes: &mut usize,
-    ) {
+    ) -> SourceResult<()> {
         if self.pending_bytes >= self.max_pending_bytes {
             debug_data!(
                 "TCP source '{}' stop draining buffer on pending byte cap: pending_events={} pending_bytes={} cap={}",
@@ -390,9 +405,24 @@ impl BatchBuilder {
                 self.pending_bytes,
                 self.max_pending_bytes
             );
-            return;
+            return Ok(());
         }
-        while let Some(payload) = extract_message(framing, &mut self.buffer) {
+        // 若启用 codec：先把 buffer 里的完整帧解码成明文（不完整帧留在 buffer）
+        if let Some(codec) = &mut self.codec {
+            codec.decode(&mut self.buffer)?;
+        }
+        loop {
+            // 从明文（codec）或原始（无 codec）缓冲取一条消息；借用只在本块内有效，
+            // 避免与后续 `self.build_event`/`push_pending_back` 的借用冲突。
+            let payload = {
+                let buf = if let Some(codec) = self.codec.as_mut() {
+                    codec.plain_mut()
+                } else {
+                    &mut self.buffer
+                };
+                extract_message(framing, buf)
+            };
+            let Some(payload) = payload else { break };
             let event = self.build_event(payload, peer_ip);
             let event_size = event_payload_len(&event);
             let would_exceed = *produced_bytes + event_size > self.max_batch_bytes;
@@ -447,6 +477,7 @@ impl BatchBuilder {
                 break;
             }
         }
+        Ok(())
     }
 
     fn pending_len(&self) -> usize {
@@ -534,6 +565,7 @@ mod tests {
             Tags::new(),
             8192,
             "test".into(),
+            crate::net::CodecConfig::default(),
         );
         writer.await.unwrap();
 
@@ -610,6 +642,7 @@ mod tests {
             Tags::new(),
             128,
             "test".into(),
+            crate::net::CodecConfig::default(),
         );
 
         // Core regression: the FIRST read must be bounded. Pre-fix a single
@@ -721,6 +754,7 @@ mod tests {
             Tags::new(),
             4096,
             "test".into(),
+            crate::net::CodecConfig::default(),
         );
         // Drain concurrently with the writer: awaiting the writer first would
         // deadlock once the backlog exceeds the socket buffers (1MiB > default).
@@ -806,6 +840,7 @@ mod tests {
             Tags::new(),
             8192,
             "test_len".into(),
+            crate::net::CodecConfig::default(),
         );
 
         writer.await.unwrap();
@@ -859,6 +894,7 @@ mod tests {
             Tags::new(),
             8192,
             "test_auto".into(),
+            crate::net::CodecConfig::default(),
         );
 
         writer.await.unwrap();
@@ -890,6 +926,7 @@ mod tests {
             10,
             64 * 1024,
             MAX_PENDING_BYTES,
+            None,
         );
 
         // Fill buffer with data
@@ -909,6 +946,7 @@ mod tests {
             10,
             64 * 1024,
             MAX_PENDING_BYTES,
+            None,
         );
 
         batcher2.buffer.clear();
@@ -926,6 +964,7 @@ mod tests {
             10,
             100, // Small byte limit for testing
             MAX_PENDING_BYTES,
+            None,
         );
 
         // Create pending events that exceed byte limit
@@ -959,12 +998,15 @@ mod tests {
             1,
             MAX_BATCH_BYTES,
             10,
+            None,
         );
         let mut batch = SourceBatch::new();
         let mut produced_bytes = 0;
         let peer_ip = "127.0.0.1".parse().unwrap();
 
-        batcher.drain_messages(FramingMode::Line, peer_ip, &mut batch, &mut produced_bytes);
+        batcher
+            .drain_messages(FramingMode::Line, peer_ip, &mut batch, &mut produced_bytes)
+            .unwrap();
 
         assert_eq!(batch.len(), 1, "首条消息应先进入当前 batch");
         assert_eq!(batcher.pending_len(), 1, "溢出的下一条消息应进入 pending");
@@ -1050,6 +1092,7 @@ mod tests {
             Tags::new(),
             8192,
             "tls_test".to_string(),
+            crate::net::CodecConfig::default(),
         );
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), conn.read_batch())

@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 pub mod acceptor;
+pub mod codec;
 pub mod config;
 pub mod conn;
 pub mod factory;

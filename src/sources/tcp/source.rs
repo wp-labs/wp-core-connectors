@@ -6,6 +6,8 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use wp_connector_api::{CtrlRx, DataSource, SourceBatch, SourceReason, SourceResult, Tags};
 
+use crate::net::CodecConfig;
+
 use super::ConnectionRegistry;
 use super::conn::connection::{ReadOutcome, TcpConnection, batch_bytes};
 use super::framing::FramingMode;
@@ -206,6 +208,7 @@ pub struct TcpSource {
     base_tags: Tags,
     framing: FramingMode,
     tcp_recv_bytes: usize,
+    codec: CodecConfig,
     registry: ConnectionRegistry,
     connection_rx: mpsc::Receiver<ConnectionRegistration>,
     connections: HashMap<u64, TcpConnection>,
@@ -215,6 +218,7 @@ pub struct TcpSource {
 }
 
 impl TcpSource {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         key: String,
         tags: Tags,
@@ -223,6 +227,7 @@ impl TcpSource {
         framing: FramingMode,
         registry: ConnectionRegistry,
         connection_rx: mpsc::Receiver<ConnectionRegistration>,
+        codec: CodecConfig,
     ) -> SourceResult<Self> {
         let mut base_tags = Tags::new();
         for (k, v) in tags.iter() {
@@ -233,6 +238,7 @@ impl TcpSource {
             base_tags,
             framing,
             tcp_recv_bytes,
+            codec,
             registry,
             connection_rx,
             connections: HashMap::new(),
@@ -254,6 +260,7 @@ impl TcpSource {
             self.base_tags.clone(),
             self.tcp_recv_bytes,
             self.key.clone(),
+            self.codec.clone(),
         );
         self.registry.lock().unwrap().insert(reg.connection_id);
         self.connections.insert(reg.connection_id, connection);
@@ -422,6 +429,7 @@ mod tests {
             FramingMode::Line,
             registry,
             rx,
+            crate::net::CodecConfig::default(),
         );
         assert!(source.is_ok());
     }
@@ -441,6 +449,7 @@ mod tests {
             FramingMode::Line,
             registry.clone(),
             reg_rx,
+            crate::net::CodecConfig::default(),
         )
         .unwrap();
         let (_ctrl_tx, ctrl_rx) = async_broadcast::broadcast(1);
@@ -488,6 +497,7 @@ mod tests {
             FramingMode::Line,
             registry.clone(),
             reg_rx,
+            crate::net::CodecConfig::default(),
         )
         .unwrap();
         let (_ctrl_tx, ctrl_rx) = async_broadcast::broadcast(1);

@@ -6,6 +6,7 @@
 use super::config::{Protocol, SyslogSourceSpec};
 use super::tcp_source::TcpSyslogSource;
 use super::udp_source::UdpSyslogSource;
+use crate::net::CodecConfig;
 use crate::sources::tcp::{FramingMode, TcpAcceptor, TcpSource, tcp_reader_batch_channel_cap};
 use orion_conf::{ErrorWith, ToStructError};
 use std::collections::HashSet;
@@ -114,6 +115,7 @@ impl SourceFactory for SyslogSourceFactory {
                             framing,
                             connection_registry.clone(),
                             reader_reg_rx,
+                            CodecConfig::default(),
                         )
                         .map_err(|e| anyhow::anyhow!("{}", e))?;
                         let syslog = TcpSyslogSource::new(

@@ -410,6 +410,7 @@ mod tests {
             crate::sources::tcp::FramingMode::Line,
             pool,
             rx,
+            crate::net::CodecConfig::default(),
         )
         .unwrap();
         let tcp_syslog = TcpSyslogSource::new(
@@ -463,6 +464,7 @@ mod tests {
             crate::sources::tcp::FramingMode::Line,
             pool,
             rx,
+            crate::net::CodecConfig::default(),
         )
         .unwrap();
         let tcp_syslog = TcpSyslogSource::new(
@@ -514,6 +516,7 @@ mod tests {
             crate::sources::tcp::FramingMode::Line,
             pool,
             rx,
+            crate::net::CodecConfig::default(),
         )
         .unwrap();
         let tcp_syslog = TcpSyslogSource::new(
@@ -552,6 +555,7 @@ mod tests {
             crate::sources::tcp::FramingMode::Line,
             pool,
             rx,
+            crate::net::CodecConfig::default(),
         )
         .unwrap();
         let source = TcpSyslogSource::new(
@@ -589,6 +593,7 @@ mod tests {
             crate::sources::tcp::FramingMode::Line,
             pool,
             rx,
+            crate::net::CodecConfig::default(),
         )
         .unwrap();
         // strip_header=true, attach_meta_tags=false, fast_strip=true → 触发快路径
@@ -626,6 +631,7 @@ mod tests {
             crate::sources::tcp::FramingMode::Line,
             pool,
             rx,
+            crate::net::CodecConfig::default(),
         )
         .unwrap();
         let source = TcpSyslogSource::new(
@@ -683,6 +689,7 @@ mod tests {
             crate::sources::tcp::FramingMode::Line,
             pool,
             rx,
+            crate::net::CodecConfig::default(),
         )
         .unwrap();
         let source = TcpSyslogSource::new(
