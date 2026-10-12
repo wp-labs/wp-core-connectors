@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-10-12
+
+### Fixed
+
+- **补齐 `wf-connector-api` 0.3 → 0.4**：0.10.0 的 orion-error 0.9 世代升级漏掉了这条依赖（仍写 `^0.3`）。`wf-connector-api` 的 0.9 对齐是以 0.4 发布的，`^0.3` 消费方取不到，于是 `BatchSource` 边界会同时出现 0.8 与 0.9 两个 `StructError` 类型。本次对齐到 `^0.4`。
+
 ## [0.10.0] - 2026-10-12
 
 ### Changed
