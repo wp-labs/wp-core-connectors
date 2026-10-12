@@ -511,7 +511,9 @@ mod tests {
         // 服务端证书（由 CA 签发）
         let server_key = rcgen::KeyPair::generate().unwrap();
         let server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
         let server_cert_path = dir.path().join("server.pem");
         let server_key_path = dir.path().join("server.key");
         std::fs::write(&server_cert_path, server_cert.pem().as_bytes()).unwrap();
@@ -520,7 +522,9 @@ mod tests {
         // 客户端证书（由同一 CA 签发）
         let client_key = rcgen::KeyPair::generate().unwrap();
         let client_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let client_cert = client_params.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
+        let client_cert = client_params
+            .signed_by(&client_key, &ca_cert, &ca_key)
+            .unwrap();
         let client_cert_path = dir.path().join("client.pem");
         let client_key_path = dir.path().join("client.key");
         std::fs::write(&client_cert_path, client_cert.pem().as_bytes()).unwrap();
@@ -538,7 +542,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let _ = acceptor.accept(stream).await.expect("server mTLS handshake");
+            let _ = acceptor
+                .accept(stream)
+                .await
+                .expect("server mTLS handshake");
         });
 
         // 客户端：insecure（跳过服务端校验）+ 客户端证书
