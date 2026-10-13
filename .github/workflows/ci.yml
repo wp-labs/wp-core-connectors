@@ -49,6 +49,12 @@ jobs:
   security:
     name: Security Audit
     runs-on: ubuntu-latest
+    # rustsec/audit-check 需创建 check-run / PR 注释；缺权限时会在 push 事件上报
+    # “Resource not accessible by integration”（审计本身通过）。
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v6
       - run: cargo generate-lockfile
