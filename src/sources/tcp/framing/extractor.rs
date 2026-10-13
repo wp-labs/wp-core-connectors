@@ -1,6 +1,8 @@
 use bytes::{Buf, Bytes, BytesMut};
 use memchr::memchr;
 
+use super::{MAX_FRAME_BYTES, MAX_LEN_DIGITS};
+
 /// Message framing extractor (line, length-prefixed RFC6587)
 pub struct FramingExtractor;
 
@@ -27,16 +29,25 @@ impl FramingExtractor {
     /// Extract length-prefixed message from buffer: "<len><SP><payload>"
     pub fn extract_length_prefixed_message(buf: &mut BytesMut) -> Option<Bytes> {
         let mut pos = 0;
-        let mut len = 0;
-        while pos < buf.len() && pos < 10 && buf[pos].is_ascii_digit() {
-            len = len * 10 + (buf[pos] - b'0') as usize;
+        let mut len: usize = 0;
+        while pos < buf.len() && pos < MAX_LEN_DIGITS && buf[pos].is_ascii_digit() {
+            // 用 checked 运算：避免 32 位平台上 10 位数长度前缀的 `len*10` 溢出（debug panic /
+            // release 回绕）。溢出即视为非法前缀，返回 None。
+            len = len
+                .checked_mul(10)?
+                .checked_add((buf[pos] - b'0') as usize)?;
             pos += 1;
         }
         if pos == 0 || pos >= buf.len() || buf[pos] != b' ' {
             return None;
         }
+        // 长度上限：拒绝超大前缀（合法帧不会超过 MAX_FRAME_BYTES），交给上层
+        // 的缓冲上限守卫注销该连接，避免缓冲无界增长。
+        if len >= MAX_FRAME_BYTES {
+            return None;
+        }
         pos += 1;
-        if pos + len > buf.len() {
+        if pos.checked_add(len)? > buf.len() {
             return None;
         }
         buf.advance(pos);
@@ -62,6 +73,31 @@ impl FramingExtractor {
 
     pub fn has_newline(buf: &BytesMut) -> bool {
         buf.contains(&b'\n')
+    }
+
+    /// 缓冲起始处是否是一个「完整但非法」的长度前缀（溢出，或 ≥ `MAX_FRAME_BYTES`）。
+    /// 「完整」= 已出现 `<digits><SP>`。尚未出现空格（未收齐）或非数字开头 → `false`。
+    ///
+    /// 用于 `Len` 框架下立即断开畸形/超大前缀的连接，而不必等缓冲涨到上限。
+    pub fn leading_length_prefix_invalid(buf: &BytesMut) -> bool {
+        let mut pos = 0usize;
+        let mut val: usize = 0;
+        let mut overflow = false;
+        while pos < buf.len() && pos < MAX_LEN_DIGITS && buf[pos].is_ascii_digit() {
+            match val
+                .checked_mul(10)
+                .and_then(|v| v.checked_add((buf[pos] - b'0') as usize))
+            {
+                Some(v) => val = v,
+                None => overflow = true,
+            }
+            pos += 1;
+        }
+        if pos == 0 || pos >= buf.len() || buf[pos] != b' ' {
+            // 位数已到上限、下一个仍是数字 → 前缀过长（畸形）。
+            return pos == MAX_LEN_DIGITS && pos < buf.len() && buf[pos].is_ascii_digit();
+        }
+        overflow || val >= MAX_FRAME_BYTES
     }
 }
 
@@ -207,5 +243,48 @@ mod tests {
         let msg2 = FramingExtractor::extract_line_message(&mut buf).unwrap();
         assert_eq!(msg2, Bytes::from("world"));
         assert_eq!(buf.len(), 0);
+    }
+
+    /// O：超大 / 溢出的长度前缀必须被拒绝（返回 None）且不消费任何字节，
+    /// 避免「帧永不完成」导致缓冲无限增长，也避免 32 位平台上 `len*10` 溢出。
+    #[test]
+    fn rejects_oversized_and_overflow_prefix() {
+        use super::super::MAX_FRAME_BYTES;
+        // 一个「完整」但恰好达到上限的帧：旧实现会切出这 10MB；新实现按上限拒绝，
+        // 且不消费任何字节。
+        let header = format!("{MAX_FRAME_BYTES} ");
+        let mut buf = BytesMut::with_capacity(header.len() + MAX_FRAME_BYTES);
+        buf.extend_from_slice(header.as_bytes());
+        buf.extend_from_slice(&vec![b'x'; MAX_FRAME_BYTES]);
+        let total = buf.len();
+        assert!(FramingExtractor::extract_length_prefixed_message(&mut buf).is_none());
+        assert_eq!(buf.len(), total, "oversized frame must not be consumed");
+
+        // 10 位超大前缀（32 位平台上 checked 运算会溢出）→ 不 panic、返回 None
+        let mut buf2 = BytesMut::from("9999999999 ");
+        assert!(FramingExtractor::extract_length_prefixed_message(&mut buf2).is_none());
+        assert_eq!(buf2.len(), 11, "overflowing prefix must not be consumed");
+    }
+
+    /// O：#4 依赖的 `leading_length_prefix_invalid` 能识别「超标」与「位数超长」前缀。
+    #[test]
+    fn leading_length_prefix_invalid_detects_overlong_and_oversized() {
+        use super::super::MAX_FRAME_BYTES;
+        // 合法短前缀 → false
+        assert!(!FramingExtractor::leading_length_prefix_invalid(
+            &BytesMut::from("100 ")
+        ));
+        // 未收齐（无空格）→ false
+        assert!(!FramingExtractor::leading_length_prefix_invalid(
+            &BytesMut::from("100")
+        ));
+        // 恰好等/超上限 → true
+        assert!(FramingExtractor::leading_length_prefix_invalid(
+            &BytesMut::from(format!("{MAX_FRAME_BYTES} ").as_bytes())
+        ));
+        // 数字位数超限（> MAX_LEN_DIGITS）→ true
+        assert!(FramingExtractor::leading_length_prefix_invalid(
+            &BytesMut::from("12345678901 ")
+        ));
     }
 }

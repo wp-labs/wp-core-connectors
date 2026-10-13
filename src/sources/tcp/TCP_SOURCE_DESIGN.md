@@ -2,178 +2,100 @@
 
 ## 设计目标
 
-### 1. 高性能零拷贝TCP数据接收
-- **零拷贝架构**: 使用 `Arc<[u8]>` 避免数据复制，从网络直接到处理流水线
-- **分离式架构**: 连接管理与数据读取分离，提高并发性能
-- **配置驱动**: 支持动态配置监听地址、缓冲区大小、连接数限制
+### 1. 高性能 TCP 数据接收
+- **零拷贝取数**: 直接读入 `BytesMut`，帧切出后以 `Bytes` 承载（`RawData::Bytes`），避免额外拷贝
+- **分离式架构**: 连接接受（Acceptor）与数据读取（TcpSource 实例）分离；`instances` 可配置
+- **配置驱动**: 监听地址、接收缓冲、帧模式、TLS、codec（压缩/加密）均可配置
 
 ### 2. 生产级可靠性
-- **连接生命周期管理**: 自动处理连接建立、维护、清理
-- **错误恢复**: 连接断开自动检测和清理
-- **超时机制**: 连接空闲超时自动回收（默认5分钟）
-- **资源限制**: 最大并发连接数限制（默认1000）
+- **连接生命周期管理**: 自动接受、注销断开/出错的连接
+- **错误隔离**: 单连接读/codec 错误只注销该连接，不拖垮整个 source
+- **资源限制**: 最大并发连接数（`max_connections`）、单帧上限、批/待处理字节上限
+- **公平性**: 多连接轮转，任一连接的半帧不阻塞其它连接
 
 ### 3. 多协议帧支持
-- **行帧模式**: 以 `\n` 为分隔符的消息格式
-- **长度帧模式**: 长度前缀的消息格式
-- **自动检测模式**: 智能检测消息格式（支持优先换行）
+- **行帧模式（Line）**: 以 `\n` 为分隔符
+- **长度帧模式（Len）**: RFC6587 风格 `<len><SP><payload>`（长度上限 + 溢出安全）
+- **自动模式（Auto）**: 优先按长度前缀，回退到按行
 
 ## 当前实现
 
-### 架构设计
+### 架构设计（Acceptor + 多实例 TcpSource）
 
 ```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   TcpSource     │    │ ConnectionWorker │    │ TcpConnection   │
-│                 │    │                  │    │                 │
-│ DataSource      │◄──►│ 监听 + 连接管理    │◄──►│ 单个TCP连接      │
-│ Interface       │    │                  │    │                 │
-│                 │    │ • 接受新连接      │    │ • 缓冲区管理     │
-│ • recv()        │    │ • 清理死连接      │    │ • 活跃度检测     │
-│ • start()       │    │ • 连接池维护      │    │ • 数据读取       │
-│ • close()       │    │                  │    │                 │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-         │                       │                       │
-         └───────────────────────┼───────────────────────┘
-                                 │
-                    ┌──────────────────┐
-                    │ ConnectionPool   │
-                    │                  │
-                    │ Arc<RwLock<      │
-                    │ HashMap<u64,     │
-                    │ TcpConnection>>>│
-                    └──────────────────┘
+                    ┌─────────────────────────────────────────┐
+   TcpListenerLoop  │ bind(addr)；accept（1ms 超时）           │
+   (Acceptor,       │ TLS 握手（可选，10s 超时）                │
+    worker/)        │ registry.insert(id)  ← 共享计数           │
+                    │ 按轮转分发给某个 TcpSource 实例（mpsc）    │
+                    └───────────────────┬─────────────────────┘
+                                        │ ConnectionRegistration { id, stream, peer }
+        ┌───────────────────────────────┼───────────────────────────────┐
+        ▼                               ▼                               ▼
+ ┌──────────────┐               ┌──────────────┐               ┌──────────────┐
+ │ TcpSource #1 │               │ TcpSource #2 │     ...       │ TcpSource #N │
+ │ DataSource   │               │ DataSource   │               │ DataSource   │
+ └──────┬───────┘               └──────┬───────┘               └──────┬───────┘
+        │  connections: HashMap<u64, TcpConnection>                     │
+        │  connection_order: VecDeque<u64>（轮转，保证公平）             │
+        └─────────────────────────────┬────────────────────────────────┘
+                                      ▼
+                       ┌───────────────────────────────┐
+                       │ TcpConnection                 │
+                       │  ConnStream(Plain|Tls)        │
+                       │  + BatchBuilder(buffer/帧/批) │
+                       └───────────────────────────────┘
 ```
 
-### 核心组件
+- **Acceptor**（`worker/listener_loop.rs`）：`bind` 后 `select!` 在 `listener.accept()` 与停止信号上；accept **立即返回**，TLS 握手（10s 超时）与分发在**独立 task** 中完成（受握手并发上限约束），故慢/恶意握手不阻塞其它连接的 accept，也不延迟 stop。连接 id 写入**共享** `registry`（供 `max_connections` 限流），再经 mpsc 分发给某个实例；id 由**进程内单调计数器**（`AtomicU64`）生成，避免时间戳纳秒碰撞。每个实例 `close()` 只移除**自身拥有**的 id（含已下发未处理的注册），不整体清空共享 registry。
+- **TcpSource**（`source.rs`）：实现 `DataSource`；持有 `connections` 与 `connection_order`。
+- **TcpConnection / BatchBuilder**（`conn/connection.rs`）：单连接读取、分帧、批/待处理上限。
+- **TcpSourceFactory**（`factory.rs`）：解析参数，构建 N 个 `TcpSource` + 1 个 Acceptor。
 
-#### 1. TcpSource (主要接口)
-```rust
-pub struct TcpSource {
-    // 配置参数
-    key: String,
-    address: String,           // 监听地址 (如 "127.0.0.1:19001")
-    tcp_recv_bytes: usize,     // 接收缓冲区大小
-    framing: FramingMode,      // 消息帧模式
+> 不变量：一个 `TcpSource` 的所有连接来自**同一个 acceptor**，故 transport 单一（全明文或全 TLS）；TLS 由 listener 决定、逐连接不变，实例内不存在明文/TLS 混流。
 
-    // 连接管理
-    connection_pool: ConnectionPool,
-    max_connections: usize,
+### 读取：快路径 + 慢路径（修复 #367 队头阻塞）
 
-    // 工作线程管理
-    connection_worker: Option<JoinHandle<SourceResult<()>>>,
-    stop_tx: Option<broadcast::Sender<()>>,
+- **快路径 `drain_ready`**：对 `connection_order` 中每条连接各做一次**非阻塞** `try_read_batch`；任一切出完整帧立即返回。半帧连接被放回队尾，**不阻塞其它连接**。
+- **慢路径 `wait_any_ready`**：所有连接都没有完整帧时，对每条连接**并发**发起阻塞读，用自实现的 `FirstReady`（≈ `select_all`）取最先就绪的一条；`select!` 同时监听**新连接到达**。长记录的半帧只挂起它自己的 future。
+- 服务后 `rotate_connection` 把该连接移到队尾（与快路径一致），避免固定顺序偏好导致饿死。
+- `conn_rx_closed` 在注册通道关闭后置位，避免忙轮询。
 
-    // 状态
-    started: bool,
-}
-```
+### 单连接数据流
 
-**职责**:
-- 实现 `DataSource` trait 接口
-- 管理连接工作线程生命周期
-- 从连接池中读取并解析数据
-- 构造零拷贝 `SourceEvent`
+1. `BoundedBufMut` 把单次 syscall 读**夹到** `MAX_READ_BYTES`（256 KiB），缓冲恒定有界（防 macOS `read()` EINVAL）。明文与 TLS 走同一夹读路径。
+2. 每次读取前先 drain 上次残留的完整帧（F1），避免对端静默时这些帧滞留。
+3. codec（可选）：按 `magic(2)+version+kind+len(4BE)` 切帧 → 解密/解压 → 明文缓冲；再按 framing 切消息。
+4. framing：`Line`（`\n`）/ `Len`（`<len><SP><payload>`）/ `Auto`。
+5. 批上限 `DEFAULT_BATCH_CAPACITY`(128) 与 `MAX_BATCH_BYTES`(64 KiB)；溢出事件进 `pending`（`MAX_PENDING_BYTES` = 256 KiB）。
+6. **EOF**：抽走残余完整帧；**Line** 一律、**Auto** 在残余非长度前缀起点时，把末尾无换行的最后一条也交付（F3）；`Len`（及 `Auto` 的 len 残余）无法补全，丢弃。
 
-#### 2. ConnectionWorker (连接管理)
-```rust
-struct ConnectionWorker {
-    key: String,
-    address: String,           // 监听地址
-    max_connections: usize,
-    tcp_recv_bytes: usize,
-    connection_pool: ConnectionPool,
-    stop_tx: broadcast::Sender<()>,
-}
-```
+### 错误处理与隔离
 
-**职责**:
-- 监听指定TCP端口
-- 接受新连接并加入连接池
-- 定期清理超时/断开的连接
-- 响应停止信号
-
-#### 3. TcpConnection (单个连接)
-```rust
-struct TcpConnection {
-    stream: TcpStream,
-    client_addr: SocketAddr,
-    buffer: BytesMut,          // 接收缓冲区
-    last_activity: Instant,    // 最后活跃时间
-}
-```
-
-**职责**:
-- 维护单个TCP连接状态
-- 管理接收缓冲区
-- 跟踪连接活跃度
-
-### 数据流程
-
-#### 1. 启动流程
-```
-1. TcpSource::new(address, tcp_recv_bytes, framing)
-   ↓
-2. TcpSource::start()
-   ↓
-3. 创建 ConnectionWorker + ConnectionPool
-   ↓
-4. ConnectionWorker::run()
-   ↓
-5. TcpListener::bind(address) - 开始监听指定地址
-   ↓
-6. 进入连接管理循环
-   - 接受新连接 (非阻塞1ms超时)
-   - 清理死连接
-   - 响应停止信号
-```
-
-#### 2. 数据接收流程
-```
-1. TcpSource::recv() 被调用
-   ↓
-2. 遍历所有活跃连接
-   ↓
-3. 对每个连接: connection.try_read()
-   ↓
-4. 如果有数据:
-   - 更新连接活跃度
-   - 调用 FramingExtractor 提取消息
-   ↓
-5. 如果提取到完整消息:
-   - 构造零拷贝 SourceEvent
-   - 设置客户端IP地址
-   - 返回事件
-   ↓
-6. 如果无数据: 短暂休眠1ms后继续循环
-```
-
-#### 3. 消息帧处理
-```rust
-match self.framing {
-    FramingMode::Line => FramingExtractor::extract_line_message(buffer),
-    FramingMode::Len => FramingExtractor::extract_length_prefixed_message(buffer),
-    FramingMode::Auto => {
-        FramingExtractor::extract_length_prefixed_message(buffer)
-            .or_else(|| FramingExtractor::extract_line_message(buffer))
-    }
-}
-```
+- **per-connection** 读错误 / codec 解码错误：记录日志并**注销该连接**，`receive()` **不返回 `Err`**，不影响其它连接。
+- **熔断**：连续单连接错误且期间无任何成功产出（≥ `MAX_CONSECUTIVE_CONN_ERRORS`）→ `receive()` 返回 `Err`，暴露系统性故障（如 codec 误配、上游全坏）；任一次成功产出即重置计数。
+- 仅**结构性**错误（acceptor 注册通道关闭 / 已无连接）才 `receive() -> Err`。
+- **畸形 / 超大长度前缀**：`Len` 框架下前缀非法（溢出或 ≥ `MAX_FRAME_BYTES`）时**立即**注销该连接；兜底：待分帧缓冲超过 `MAX_FRAME_BYTES` + 前缀余量仍分不出帧也注销，避免缓冲无界增长。长度前缀解析用 `checked_*`（32 位平台不溢出）。
+- 当前**无连接空闲超时 / 心跳**（连接随对端关闭或读错误注销）。
 
 ### 配置集成
 
-#### 工厂模式配置解析
-```rust
-// factory.rs - TcpSourceSpec::from_params()
-struct TcpSourceSpec {
-    addr: String,              // 默认: "0.0.0.0"
-    port: u16,                 // 默认: 9000
-    tcp_recv_bytes: usize,     // 默认: DEFAULT_TCP_RECV_BYTES
-    framing: FramingMode,      // 默认: Auto
-}
-```
+#### 工厂模式配置解析（`factory.rs`）
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `addr` | `0.0.0.0` | 监听地址 |
+| `port` | `9000` | 监听端口 |
+| `framing` | `auto` | `line` \| `len` \| `auto` |
+| `tcp_recv_bytes` | `256000` | 接收缓冲 / 单连接初始容量 |
+| `instances` | `1` | TcpSource 实例数 |
+| `tls` | — | `{ enabled, cert, key, ... }` |
+| `compression` | — | `{ enabled, algo = gzip\|zstd, level }` |
+| `encryption` | — | `{ enabled, algo = aes-256-gcm\|sm4-gcm, key }` |
+| `data_format` | `ndjson` | `ndjson` \| `arrow_ipc` \| `arrow_framed` |
 
 #### 使用示例配置
+
 ```toml
 # topology/sources/wpsrc.toml
 [[sources]]
@@ -183,8 +105,9 @@ connect = "tcp_src"
 params = {
     port = 19001,                    # 监听端口
     addr = "127.0.0.1",             # 监听地址
-    tcp_recv_bytes = 8192,           # 缓冲区大小
-    data_format = "ndjson"          # 数据格式：ndjson | arrow_ipc | arrow_framed
+    framing = "auto",               # line | len | auto
+    tcp_recv_bytes = 8192,          # 缓冲区大小
+    data_format = "ndjson"          # ndjson | arrow_ipc | arrow_framed
 }
 ```
 
@@ -207,58 +130,53 @@ params = {
 
 ## 实现特点
 
-### ✅ 已实现特性
+### ✅ 已实现
 
-1. **分离式架构**: ConnectionWorker + TcpSource 分离连接管理和数据读取
-2. **配置驱动**: 完全支持动态配置地址、端口、缓冲区大小
-3. **零拷贝**: 使用 `Arc<[u8]>` 避免数据复制
-4. **连接池管理**: 高效的并发连接管理和清理
-5. **多帧支持**: Line/Len/Auto 三种消息帧模式
-6. **错误恢复**: 自动检测和清理断开连接
-7. **DataSource接口**: 完整实现标准接口
+1. **Acceptor + 多实例 TcpSource**：连接管理与数据读取分离，`instances` 可 > 1
+2. **快/慢两路读取**：任意连接的半帧不阻塞其它连接（#367）
+3. **多帧支持**：Line / Len / Auto；Len 有长度上限且溢出安全
+4. **可选 codec**：压缩（gzip/zstd）与加密（aes-256-gcm/sm4-gcm）往返
+5. **有界读**：单次 syscall ≤ `MAX_READ_BYTES`；批/待处理字节上限
+6. **TLS**：明文或 TLS（逐源单一 transport）
+7. **错误隔离**：per-connection 错误只注销该连接；EOF 尾行交付
+8. **DataSource 接口**：完整实现 `receive` / `start` / `close`
 
 ### ⚠️ 当前限制
 
-1. **try_recv支持有限**: 由于异步/同步桥接限制，`try_recv()` 总是返回 `None`
-2. **配置传递**: `address` 和 `tcp_recv_bytes` 参数通过结构体存储传递（已修复）
-3. **连接超时**: 固定5分钟超时，暂不支持配置
-4. **错误处理**: 连接错误时日志记录但继续处理其他连接
-
-### 🔧 性能优化
-
-1. **非阻塞连接接受**: 使用1ms超时避免阻塞数据读取
-2. **读写分离**: 连接管理与数据读取在不同异步任务中
-3. **缓冲区复用**: 使用 `BytesMut` 高效缓冲区管理
-4. **连接池优化**: 使用 `Arc<RwLock<HashMap>>` 支持并发访问
+1. **`try_receive()` 有限**：受异步/同步桥接限制，恒返回 `None`（`can_try_receive()` 为 `false`）
+2. **无连接空闲超时 / 心跳**：连接仅在关闭或读错误时注销；且 `max_connections` **硬编码 1000**（`factory.rs`），二者均不可配
+3. **单帧上限 10 MB**：超过按该连接错误处理
+4. **两套解析实现并存**：`framing.rs`（`drain_auto_all`/`extract_octet_counted`，syslog 在用）与 `framing/extractor.rs`（`FramingExtractor`，tcp 源在用）；各自有上限但逻辑未合并
+5. **实例未经 `close()` 被直接 drop**：其在共享 `registry` 中的 id 会残留（约定引擎调用 `close`）
 
 ## 测试验证
 
-### 单元测试覆盖
-- ✅ TcpSource 创建和配置
-- ✅ 连接池操作
-- ✅ 消息帧提取和事件构造
-- ✅ try_recv 接口限制文档
-
-### 集成测试场景
-- ✅ Line/Len 帧模式端到端测试
-- ✅ 网络测试默认运行（本地 loopback 127.0.0.1）
-- ⚠️ 多连接并发测试
+### 覆盖范围
+- 帧提取（Line/Len/Auto）、有界读与缓冲上限、超长/溢出前缀
+- 快/慢路径：半帧不阻塞、公平轮转、新连接唤醒、持续就绪不饿死
+- 错误隔离、EOF 尾行交付、连接注销
+- codec 收发往返、TLS 读取
+- 网络测试**默认运行**（本地 loopback `127.0.0.1`，无需 `WP_NET_TESTS`）
 
 ### 性能测试
-- 🔄 高并发连接性能测试
-- 🔄 大数据量吞吐测试
-- 🔄 内存使用优化验证
+- `WP_TCP_BENCH=1` 触发 `throughput_bench`（`conn/connection.rs` / `throughput_bench.rs`）
 
-## 未来改进方向
+## 已知限制与遗留项（记录，未处理）
 
-1. **配置增强**: 支持连接超时、心跳间隔等可配置参数
-2. **性能监控**: 添加连接数、吞吐量等指标
-3. **SSL/TLS支持**: 支持加密连接
-4. **连接池优化**: 实现连接预热、负载均衡等高级特性
-5. **错误恢复**: 支持连接重试、断线重连等机制
+> 以下为本轮修复后仍存在、但判定「不那么重要」的项，先记录备查。
+
+- **A. 空闲超时 / `max_connections` 可配**：见上「当前限制 2」。慢/僵尸连接可长期占槽；`max_connections` 不可配。
+- **B. 熔断阈值与行为**：`MAX_CONSECUTIVE_CONN_ERRORS = 32` 为常量；熔断后再出现「空闲但健康」的连接时会先 `Err` 直到其产出数据（引擎按 `Err` 处理即可）。（`source.rs`）
+- **C. close/drop**：见上「当前限制 5」。
+- **D. 两套解析实现**：见上「当前限制 4」。
+- **E. Acceptor 常量**：accept 错误退避固定 10ms；`MAX_CONCURRENT_HANDSHAKES = 1024`。（`worker/listener_loop.rs`）
+- **F. 小清理（cosmetic）**：`run()` 中 `if let Err(e) = self.handle_accepted(...)` 恒不可达（`handle_accepted` 恒返回 `Ok`）；`framing.rs::drain_by_line` 为 `pub` 但全仓无引用。
+- **G. 整机验证缺口**：本地 `wp-core-connectors 0.10.1` 需 `wp-connector-api 0.14`，当前引擎（wp-motor v1.27）为 `0.13`，端到端 A/B 需引擎升级（wp-motor v1.28+）。
+- **H. `tcp_recv_bytes` 语义**：R3 后单次读一律按 `MAX_READ_BYTES`(256 KiB) 夹取；`tcp_recv_bytes` 只决定初始容量、且会被抬到 ≥ `MAX_READ_BYTES`（默认 `256000 ≈ 256 KiB` 无变化）。
+- **观测（未来）**：连接数、吞吐量、错误率等指标。
 
 ---
 
-**文档状态**: 当前实现 v1.1.6
-**最后更新**: 2025-11-24
-**维护者**: TcpSource开发团队
+**文档状态**: 与当前实现同步
+**最后更新**: 2026-10-14
+**维护者**: TcpSource 开发团队

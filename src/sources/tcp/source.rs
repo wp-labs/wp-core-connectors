@@ -17,6 +17,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// 连续「单连接错误」达到该阈值即触发熔断（`receive` 返回 `Err`），用于暴露系统性故障
+/// （如 codec 误配、上游全坏）。任一次成功产出批次会重置计数，因此只有「长期无一成功」才触发。
+const MAX_CONSECUTIVE_CONN_ERRORS: usize = 32;
+
 /// 轻量 `select_all`：对一组已装箱的 future 依次轮询，返回最先完成的一个及其下标。
 struct FirstReady<F> {
     futures: Vec<F>,
@@ -179,6 +183,8 @@ pub struct TcpSource {
     started: bool,
     awaiting_logged: bool,
     conn_rx_closed: bool,
+    /// 连续单连接错误计数（成功产出后重置）；达到阈值触发熔断。
+    consecutive_errors: usize,
 }
 
 impl TcpSource {
@@ -210,6 +216,7 @@ impl TcpSource {
             started: false,
             awaiting_logged: false,
             conn_rx_closed: false,
+            consecutive_errors: 0,
         })
     }
 
@@ -325,8 +332,12 @@ impl TcpSource {
                 );
                 continue;
             };
-            if let Some(batch) = guard.try_read()? {
-                return Ok(Some(batch));
+            match guard.try_read() {
+                Ok(Some(batch)) => return Ok(Some(batch)),
+                Ok(None) => {}
+                // 单连接错误（读/codec）已在 `try_read` 内记录并注销该连接；隔离错误、
+                // 继续轮询其它连接（并计入熔断计数），不再拖垮整个 source。
+                Err(_) => self.consecutive_errors += 1,
             }
         }
         Ok(None)
@@ -435,7 +446,9 @@ impl TcpSource {
                     e
                 );
                 self.deregister_connection(conn_id, "blocking read error during wait");
-                Err(e)
+                // 错误隔离：只注销出错的连接，不影响其它连接（并计入熔断计数）。
+                self.consecutive_errors += 1;
+                Ok(None)
             }
         }
     }
@@ -469,9 +482,20 @@ impl DataSource for TcpSource {
             // 这样某条连接上的半帧不会再阻塞其它连接的读取。
             if let Some(batch) = self.drain_ready()? {
                 if !batch.is_empty() {
+                    self.consecutive_errors = 0;
                     return Ok(batch);
                 }
                 continue;
+            }
+
+            // 熔断：连续多次单连接错误、期间无任何成功产出 → 系统性故障，返回 Err 让引擎处理。
+            if self.consecutive_errors >= MAX_CONSECUTIVE_CONN_ERRORS {
+                return Err(SourceReason::disconnect(format!(
+                    "TCP source '{}' circuit breaker tripped: {} consecutive connection errors (remaining={})",
+                    self.key,
+                    self.consecutive_errors,
+                    self.connections.len()
+                )));
             }
 
             // 慢路径：当前所有连接都没有完整帧。等待“任意一条连接可读”
@@ -482,6 +506,7 @@ impl DataSource for TcpSource {
             if let Some(batch) = self.wait_any_ready().await?
                 && !batch.is_empty()
             {
+                self.consecutive_errors = 0;
                 return Ok(batch);
             }
         }
@@ -493,7 +518,6 @@ impl DataSource for TcpSource {
 
     fn can_try_receive(&mut self) -> bool {
         false
-        //true
     }
 
     fn identifier(&self) -> String {
@@ -511,15 +535,24 @@ impl DataSource for TcpSource {
     }
 
     async fn close(&mut self) -> SourceResult<()> {
+        // 只移除本实例拥有的连接 id——registry 为多实例共享，不能整体 clear。
+        let owned: Vec<u64> = self.connections.keys().copied().collect();
+        {
+            let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            for id in &owned {
+                registry.remove(id);
+            }
+            // 已下发但尚未被本实例处理的注册也从 registry 移除，避免预算泄漏。
+            while let Ok(reg) = self.connection_rx.try_recv() {
+                registry.remove(&reg.connection_id);
+            }
+        }
         self.connections.clear();
         self.connection_order.clear();
         self.started = false;
         self.awaiting_logged = false;
         self.conn_rx_closed = false;
-        self.registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        self.consecutive_errors = 0;
         info_data!("TCP source '{}' closed", self.key);
         Ok(())
     }
@@ -536,6 +569,12 @@ mod tests {
 
     /// 构造一个已 start 的 TcpSource，返回它和注册通道。
     async fn new_source() -> (TcpSource, mpsc::Sender<ConnectionRegistration>) {
+        new_source_framing(FramingMode::Line).await
+    }
+
+    async fn new_source_framing(
+        framing: FramingMode,
+    ) -> (TcpSource, mpsc::Sender<ConnectionRegistration>) {
         let registry = Arc::new(Mutex::new(HashSet::new()));
         let (reg_tx, reg_rx) = mpsc::channel(16);
         let mut source = TcpSource::new(
@@ -543,7 +582,7 @@ mod tests {
             Tags::default(),
             "127.0.0.1:0".to_string(),
             8192,
-            FramingMode::Line,
+            framing,
             registry,
             reg_rx,
             crate::net::CodecConfig::default(),
@@ -1299,6 +1338,197 @@ mod tests {
         // close（clear registry）同样不能 panic。
         source.close().await.unwrap();
         drop(client);
+        assert!(
+            registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+    }
+
+    /// E（错误隔离）：某条连接的 codec 解码错误只注销该连接，不返回 Err、不影响其它连接。
+    #[tokio::test]
+    async fn per_connection_error_is_isolated_and_keeps_others() {
+        use tokio::io::AsyncWriteExt;
+        // 启用 codec：坏 magic 会触发该连接的解码错误（小数据即可，无需 10MB）。
+        let mut params = wp_connector_api::ParamMap::new();
+        params.insert(
+            "compression".into(),
+            serde_json::json!({ "enabled": true, "algo": "gzip" }),
+        );
+        let codec = crate::net::CodecConfig::from_params(&params).unwrap();
+
+        let registry = Arc::new(Mutex::new(HashSet::new()));
+        let (reg_tx, reg_rx) = mpsc::channel(16);
+        let mut source = TcpSource::new(
+            "test_iso".to_string(),
+            Tags::default(),
+            "127.0.0.1:0".to_string(),
+            8192,
+            FramingMode::Line,
+            registry,
+            reg_rx,
+            codec,
+        )
+        .unwrap();
+        let (_ctrl_tx, ctrl_rx) = async_broadcast::broadcast(1);
+        source.start(ctrl_rx).await.unwrap();
+
+        let (mut client_a, stream_a, peer_a) = connected().await;
+        register(&reg_tx, 1, stream_a, peer_a).await;
+        let (_client_b, stream_b, peer_b) = connected().await;
+        register(&reg_tx, 2, stream_b, peer_b).await;
+        // 先把注册落库（否则 active_connections() 仍为 0）
+        source.drain_new_connections();
+        assert_eq!(source.active_connections(), 2);
+
+        // A 发送坏 codec 帧（错误）；B 保持空闲。
+        client_a.write_all(b"XX-bad-codec-frame").await.unwrap();
+
+        // 驱动 receive 直到出错的连接被注销；期间 receive 绝不应返回 Err（错误隔离）。
+        // （不用固定时序，避免慢机器上偶发。）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while source.active_connections() > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "errored connection was not deregistered in time"
+            );
+            if let Ok(Err(_)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), source.receive()).await
+            {
+                panic!("receive must not error on a per-connection failure");
+            }
+        }
+        assert_eq!(
+            source.active_connections(),
+            1,
+            "the errored connection must be deregistered while others are kept"
+        );
+    }
+
+    /// #5（熔断）：连续多次单连接错误、期间无成功产出 → receive 返回 Err（暴露系统性故障）。
+    #[tokio::test]
+    async fn circuit_breaker_trips_after_consecutive_connection_errors() {
+        use tokio::io::AsyncWriteExt;
+        // Len 框架 + 非法长度前缀 → 每个连接收到即报错（不会产出事件）。
+        let (mut source, reg_tx) = new_source_framing(FramingMode::Len).await;
+        let bad = format!("{} ", crate::sources::tcp::framing::MAX_FRAME_BYTES); // 非法前缀（≥ 上限）
+        let mut clients = Vec::new();
+        for i in 0..(MAX_CONSECUTIVE_CONN_ERRORS + 4) {
+            let (mut c, stream, peer) = connected().await;
+            register(&reg_tx, i as u64 + 1, stream, peer).await;
+            // 及时消费注册，避免 mpsc 通道（cap 16）被填满而阻塞 send
+            source.drain_new_connections();
+            c.write_all(bad.as_bytes()).await.unwrap();
+            clients.push(c);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), source.receive()).await;
+        assert!(
+            matches!(r, Ok(Err(_))),
+            "circuit breaker should trip after {MAX_CONSECUTIVE_CONN_ERRORS}+ consecutive connection errors"
+        );
+    }
+
+    /// #5（熔断）反例：其间有一次成功产出 → 计数重置，不熔断。
+    #[tokio::test]
+    async fn circuit_breaker_resets_on_success() {
+        use tokio::io::AsyncWriteExt;
+        let (mut source, reg_tx) = new_source_framing(FramingMode::Len).await;
+        let bad = format!("{} ", crate::sources::tcp::framing::MAX_FRAME_BYTES);
+        let mut clients = Vec::new();
+        // 先来一批坏连接（少于阈值）
+        for i in 0..(MAX_CONSECUTIVE_CONN_ERRORS - 1) {
+            let (mut c, stream, peer) = connected().await;
+            register(&reg_tx, i as u64 + 1, stream, peer).await;
+            source.drain_new_connections();
+            c.write_all(bad.as_bytes()).await.unwrap();
+            clients.push(c);
+        }
+        // 一个正常连接，产出事件（Len 帧：长度 1，payload "z"）
+        let (mut good, gs, gp) = connected().await;
+        register(&reg_tx, 1000, gs, gp).await;
+        source.drain_new_connections();
+        good.write_all(b"1 z").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 反复 receive，应能拿到成功产出（而非熔断）
+        let mut got = false;
+        for _ in 0..20 {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), source.receive())
+                .await
+            {
+                Ok(Ok(_)) => {
+                    got = true;
+                    break;
+                }
+                Ok(Err(_)) => panic!("should not trip the breaker when a success occurs"),
+                Err(_) => {}
+            }
+        }
+        assert!(
+            got,
+            "the good connection's events should be delivered (no breaker trip)"
+        );
+    }
+
+    /// #3：close() 只移除本实例拥有的连接 id，不清空共享 registry，也不影响其它实例；
+    /// 已下发但尚未处理的注册同样移除（避免预算泄漏）。
+    #[tokio::test]
+    async fn close_removes_only_own_connections() {
+        let registry: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+        let (reg_tx_a, reg_rx_a) = mpsc::channel(8);
+        let (reg_tx_b, reg_rx_b) = mpsc::channel(8);
+
+        let build = |key: &str, rx| {
+            TcpSource::new(
+                key.to_string(),
+                Tags::default(),
+                "127.0.0.1:0".to_string(),
+                8192,
+                FramingMode::Line,
+                registry.clone(),
+                rx,
+                crate::net::CodecConfig::default(),
+            )
+            .unwrap()
+        };
+        let mut a = build("a", reg_rx_a);
+        let mut b = build("b", reg_rx_b);
+        let (_ta, rx_a) = async_broadcast::broadcast(1);
+        a.start(rx_a).await.unwrap();
+        let (_tb, rx_b) = async_broadcast::broadcast(1);
+        b.start(rx_b).await.unwrap();
+
+        // 两个实例各登记一条连接
+        let (_ca, sa, pa) = connected().await;
+        register(&reg_tx_a, 1, sa, pa).await;
+        a.drain_new_connections();
+        let (_cb, sb, pb) = connected().await;
+        register(&reg_tx_b, 2, sb, pb).await;
+        b.drain_new_connections();
+        // 模拟 acceptor：已登记、但尚未被 A 处理的注册（id=7）
+        registry.lock().unwrap_or_else(|e| e.into_inner()).insert(7);
+        let (_cp, sp, pp) = connected().await;
+        register(&reg_tx_a, 7, sp, pp).await;
+
+        assert_eq!(registry.lock().unwrap_or_else(|e| e.into_inner()).len(), 3);
+
+        // A 关闭：只移除 1（自身连接）与 7（自身未处理注册），保留 B 的 2
+        a.close().await.unwrap();
+        {
+            let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!reg.contains(&1), "own connection id must be removed");
+            assert!(
+                !reg.contains(&7),
+                "own undelivered registration must be removed"
+            );
+            assert!(reg.contains(&2), "other instance's id must be kept");
+            assert_eq!(reg.len(), 1);
+        }
+
+        b.close().await.unwrap();
         assert!(
             registry
                 .lock()

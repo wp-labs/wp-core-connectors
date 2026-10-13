@@ -47,6 +47,16 @@ impl StreamDecoder {
         &mut self.plain
     }
 
+    /// 明文缓冲中尚未被 framing 消费的字节数。
+    pub fn plain_len(&self) -> usize {
+        self.plain.len()
+    }
+
+    /// 明文缓冲的只读视图。
+    pub fn plain(&self) -> &BytesMut {
+        &self.plain
+    }
+
     /// 从 `raw` 中尽可能多地切出完整帧并解码追加到 `plain`；不完整帧保留在 `raw`。
     ///
     /// 帧头非法（magic/version 不对）或解码失败时返回 `supplier_error`，上层据此断开连接。

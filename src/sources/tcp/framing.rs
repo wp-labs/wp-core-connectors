@@ -10,13 +10,11 @@ pub const DEFAULT_TCP_RECV_BYTES: usize = 10_485_760; // 10 MiB
 pub const STOP_CHANNEL_CAPACITY: usize = 2;
 
 // Octet-counting 相关限制
-const MAX_LEN_DIGITS: usize = 10; // 长度前缀最多 10 位十进制
-const MAX_FRAME_BYTES: usize = 10_000_000; // 单帧 10MB 上限
+pub(crate) const MAX_LEN_DIGITS: usize = 10; // 长度前缀最多 10 位十进制
+pub(crate) const MAX_FRAME_BYTES: usize = 10_000_000; // 单帧 10MB 上限
 
 /// 事件消息：client-ip + payload
 pub type Message = (Arc<str>, Bytes);
-/// 批消息类型（微批）：使用 Vec，避免引入新依赖
-pub type MessageBatch = Vec<Message>;
 
 /// 分帧模式
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,23 +108,6 @@ pub fn extract_octet_counted(buf: &mut BytesMut) -> Option<Bytes> {
     Some(msg.freeze())
 }
 
-/// 按行持续抽取并发送
-/// 尝试尽可能多地发送按行分帧的消息；通道满时返回首条未发送的消息，交由上层决定处理策略
-// 旧行为（发送版）保留在 drain_* 中；新引入 collect_* 用于批量收集
-pub async fn drain_by_line(
-    buf: &mut BytesMut,
-    client_ip: &Arc<str>,
-    sender: &Sender<Message>,
-) -> Option<Message> {
-    while let Some(line) = extract_newline(buf) {
-        if sender.try_send((client_ip.clone(), line.clone())).is_err() {
-            // 注意：此处 line 已从 buf 中抽取；为避免丢失，将其作为 pending 返回给调用方
-            return Some((client_ip.clone(), line));
-        }
-    }
-    None
-}
-
 /// 按长度前缀持续抽取并发送
 pub async fn drain_by_len(
     buf: &mut BytesMut,
@@ -186,79 +167,6 @@ pub async fn drain_auto_all(
         break;
     }
     Ok(None)
-}
-
-/// 收集按行分帧的消息到 out，最多收集 `max_collect` 条
-pub fn collect_by_line(
-    buf: &mut BytesMut,
-    client_ip: &Arc<str>,
-    out: &mut MessageBatch,
-    max_collect: usize,
-) {
-    while out.len() < max_collect {
-        if let Some(line) = extract_newline(buf) {
-            out.push((client_ip.clone(), line));
-        } else {
-            break;
-        }
-    }
-}
-
-/// 收集按长度前缀分帧的消息到 out，最多收集 `max_collect` 条
-pub fn collect_by_len(
-    buf: &mut BytesMut,
-    client_ip: &Arc<str>,
-    out: &mut MessageBatch,
-    max_collect: usize,
-) {
-    while out.len() < max_collect {
-        if let Some(msg) = extract_octet_counted(buf) {
-            out.push((client_ip.clone(), msg));
-        } else {
-            break;
-        }
-    }
-}
-
-/// auto 模式下尽可能多地收集（受 `max_collect` 限制）
-pub fn collect_auto_all(
-    buf: &mut BytesMut,
-    client_ip: &Arc<str>,
-    out: &mut MessageBatch,
-    max_collect: usize,
-) -> SourceResult<()> {
-    loop {
-        if buf.is_empty() || out.len() >= max_collect {
-            break;
-        }
-        if let Some(msg) = extract_octet_counted(buf) {
-            out.push((client_ip.clone(), msg));
-            continue;
-        }
-        if octet_in_progress(buf) {
-            break;
-        }
-        if let Some(line) = extract_newline(buf) {
-            if !line.is_empty() {
-                out.push((client_ip.clone(), line));
-            }
-            continue;
-        }
-        if buf.len() > MAX_FRAME_BYTES {
-            let preview_len = buf.len().min(256);
-            let preview = String::from_utf8_lossy(&buf[..preview_len]);
-            warn_data!(
-                "syslog framing buffer overflow (peer={}, len={} bytes, preview='{}'); dropping connection",
-                client_ip,
-                buf.len(),
-                preview
-            );
-            buf.clear();
-            return Err(SourceReason::supplier_error("buffer overflow"));
-        }
-        break;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

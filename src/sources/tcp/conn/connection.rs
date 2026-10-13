@@ -1,7 +1,9 @@
 use crate::net::CodecConfig;
 use crate::sources::event_id::next_event_id;
 use crate::sources::tcp::codec::StreamDecoder;
-use crate::sources::tcp::framing::{FramingExtractor, FramingMode};
+use crate::sources::tcp::framing::{
+    FramingExtractor, FramingMode, MAX_FRAME_BYTES, MAX_LEN_DIGITS,
+};
 use bytes::buf::UninitSlice;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::VecDeque;
@@ -157,6 +159,8 @@ impl TcpConnection {
                     // close now, those events are silently dropped (a single
                     // oversized frame like a big conn batch can leave the
                     // smaller auth/dns frames behind).
+                    // F3：EOF 尾处理（Line 一律；Auto 在非长度前缀起点时也按行交付）。
+                    self.flush_eof_line();
                     self.batcher.drain_messages(
                         self.framing,
                         self.client_addr.ip(),
@@ -252,6 +256,8 @@ impl TcpConnection {
                     // EOF — drain any frames still buffered or pending before
                     // closing (see try_read_batch: a batch-cap break leaves the
                     // tail of the stream unprocessed).
+                    // F3：EOF 尾处理（同 try_read_batch）。
+                    self.flush_eof_line();
                     self.batcher.drain_messages(
                         self.framing,
                         self.client_addr.ip(),
@@ -304,6 +310,19 @@ impl TcpConnection {
                     )));
                 }
             }
+        }
+    }
+
+    /// F3：EOF 尾处理。`Line` 一律；`Auto` 在残余**不是**长度前缀起点时也按行交付；
+    /// `Len` 的残余是无法补全的不完整帧，不处理。
+    fn flush_eof_line(&mut self) {
+        let line_like = match self.framing {
+            FramingMode::Line => true,
+            FramingMode::Auto => !self.batcher.starts_with_length_prefix(),
+            FramingMode::Len => false,
+        };
+        if line_like {
+            self.batcher.append_eof_line_delimiter();
         }
     }
 
@@ -539,6 +558,21 @@ impl BatchBuilder {
                 break;
             }
         }
+        // O：Len 框架下，畸形/超大的长度前缀立即断开（不必等缓冲涨到 ~10MB）。
+        // 兜底：待分帧数据超过「单帧上限 + 前缀余量」仍分不出帧（覆盖 Line/Auto/codec）→ 断开。
+        if batch.is_empty() {
+            let invalid_prefix = framing == FramingMode::Len
+                && FramingExtractor::leading_length_prefix_invalid(self.unframed_buf());
+            let oversized = self.unframed_bytes() > MAX_FRAME_BYTES + MAX_LEN_DIGITS + 1;
+            if invalid_prefix || oversized {
+                return Err(SourceReason::disconnect(format!(
+                    "tcp source '{}' unframed buffer rejected (invalid_prefix={invalid_prefix}, unframed={} > {}), dropping connection",
+                    self.source_key,
+                    self.unframed_bytes(),
+                    MAX_FRAME_BYTES + MAX_LEN_DIGITS + 1
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -548,6 +582,39 @@ impl BatchBuilder {
 
     fn pending_bytes(&self) -> usize {
         self.pending_bytes
+    }
+
+    /// 尚未被 framing 消费的待分帧字节数（codec 时含解码后明文与未解码的原始缓冲）。
+    fn unframed_bytes(&self) -> usize {
+        match &self.codec {
+            Some(codec) => codec.plain_len() + self.buffer.len(),
+            None => self.buffer.len(),
+        }
+    }
+
+    /// 待分帧数据的起始缓冲（有 codec 时为解码后的明文，否则为原始缓冲），用于前缀判定。
+    fn unframed_buf(&self) -> &BytesMut {
+        match &self.codec {
+            Some(codec) => codec.plain(),
+            None => &self.buffer,
+        }
+    }
+
+    /// 残余是否以「长度前缀」开头（`<digits><SP>`）；用于 Auto 框架的 EOF 判定。
+    fn starts_with_length_prefix(&self) -> bool {
+        FramingExtractor::has_length_prefix(self.unframed_buf())
+    }
+
+    /// F3：Line 框架 EOF 尾处理——若残余（明文/原始）里有非空白内容，补一个 `'\n'`，
+    /// 使末尾无换行的最后一条记录也能被抽出。Len/Auto 的残余是无法补全的不完整帧，不处理。
+    fn append_eof_line_delimiter(&mut self) {
+        let buf = match &mut self.codec {
+            Some(codec) => codec.plain_mut(),
+            None => &mut self.buffer,
+        };
+        if buf.iter().any(|b| !matches!(b, b'\r' | b' ' | b'\t')) {
+            buf.extend_from_slice(b"\n");
+        }
     }
 
     fn push_pending_back(&mut self, event: SourceEvent, event_size: usize) {
@@ -1464,5 +1531,278 @@ mod tests {
         }
         assert_eq!(total, PAYLOAD);
         client.abort();
+    }
+
+    /// O：长度前缀声明超过单帧上限、且缓冲已积累超过上限时，`drain_messages` 必须
+    /// 返回 Err（交给上层注销该连接），避免超大/畸形前缀导致缓冲无界增长。
+    #[test]
+    fn drain_messages_errors_when_unframed_buffer_exceeds_max_frame() {
+        let mut buf = BytesMut::new();
+        // 声明恰好等于上限的长度（会被提取器拒绝）→ 后续字节全部滞留于缓冲。
+        buf.extend_from_slice(format!("{MAX_FRAME_BYTES} ").as_bytes());
+        buf.extend_from_slice(&vec![b'x'; MAX_FRAME_BYTES + 16]); // 累计 > 上限 + 前缀余量
+        let mut batcher = BatchBuilder::new(
+            buf,
+            Tags::new(),
+            "test_over_frame".into(),
+            DEFAULT_BATCH_CAPACITY,
+            MAX_BATCH_BYTES,
+            MAX_PENDING_BYTES,
+            None,
+        );
+        let mut batch: SourceBatch = Vec::new();
+        let mut produced_bytes = 0usize;
+        let r = batcher.drain_messages(
+            FramingMode::Len,
+            IpAddr::from([127, 0, 0, 1]),
+            &mut batch,
+            &mut produced_bytes,
+        );
+        assert!(
+            r.is_err(),
+            "oversized unframed buffer must error (not grow forever)"
+        );
+        assert!(batch.is_empty());
+    }
+
+    /// O 反例：合法的长度前缀、但 payload 尚未收齐 → 继续等待，不报错。
+    #[test]
+    fn drain_messages_ok_for_in_progress_len_frame() {
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(b"100 "); // 声明 100 字节，仅给 3 字节
+        buf.extend_from_slice(b"abc");
+        let mut batcher = BatchBuilder::new(
+            buf,
+            Tags::new(),
+            "test_in_progress".into(),
+            DEFAULT_BATCH_CAPACITY,
+            MAX_BATCH_BYTES,
+            MAX_PENDING_BYTES,
+            None,
+        );
+        let mut batch: SourceBatch = Vec::new();
+        let mut produced_bytes = 0usize;
+        assert!(
+            batcher
+                .drain_messages(
+                    FramingMode::Len,
+                    IpAddr::from([127, 0, 0, 1]),
+                    &mut batch,
+                    &mut produced_bytes,
+                )
+                .is_ok(),
+            "a legitimate in-progress frame must not error"
+        );
+        assert!(batch.is_empty());
+    }
+
+    /// O：Len 框架下，畸形/超大长度前缀应立即断开（无需等缓冲涨到 ~10MB）。
+    #[test]
+    fn drain_messages_errors_immediately_on_invalid_len_prefix() {
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(format!("{MAX_FRAME_BYTES} ").as_bytes()); // 恰好上限 → 非法
+        buf.extend_from_slice(b"xyz");
+        let mut batcher = BatchBuilder::new(
+            buf,
+            Tags::new(),
+            "test_invalid_prefix".into(),
+            DEFAULT_BATCH_CAPACITY,
+            MAX_BATCH_BYTES,
+            MAX_PENDING_BYTES,
+            None,
+        );
+        let mut batch: SourceBatch = Vec::new();
+        let mut produced_bytes = 0usize;
+        assert!(
+            batcher
+                .drain_messages(
+                    FramingMode::Len,
+                    IpAddr::from([127, 0, 0, 1]),
+                    &mut batch,
+                    &mut produced_bytes,
+                )
+                .is_err(),
+            "an invalid length prefix must be rejected immediately"
+        );
+    }
+
+    /// O 反例：合法帧长度接近上限、尚在收尾（不完整）时，不得被误判为超限报错。
+    #[test]
+    fn drain_messages_ok_for_legit_near_max_frame_in_progress() {
+        let n = MAX_FRAME_BYTES - 1; // 合法帧长度（< 上限）
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(format!("{n} ").as_bytes());
+        buf.extend_from_slice(&vec![b'z'; n - 1]); // 差一字节才收齐
+        let mut batcher = BatchBuilder::new(
+            buf,
+            Tags::new(),
+            "test_legit_frame".into(),
+            DEFAULT_BATCH_CAPACITY,
+            MAX_BATCH_BYTES,
+            MAX_PENDING_BYTES,
+            None,
+        );
+        let mut batch: SourceBatch = Vec::new();
+        let mut produced_bytes = 0usize;
+        assert!(
+            batcher
+                .drain_messages(
+                    FramingMode::Len,
+                    IpAddr::from([127, 0, 0, 1]),
+                    &mut batch,
+                    &mut produced_bytes,
+                )
+                .is_ok(),
+            "a legitimate in-progress frame must not be flagged as oversized"
+        );
+        assert!(batch.is_empty());
+    }
+
+    /// F3：Line 框架下，EOF 时末尾无换行的最后一条记录也应交付（此前被静默丢弃）。
+    #[tokio::test]
+    async fn eof_flushes_trailing_line_without_newline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut conn = TcpConnection::new(
+            ConnStream::Plain(stream),
+            peer,
+            FramingMode::Line,
+            Tags::new(),
+            8192,
+            "test_eof_tail".into(),
+            crate::net::CodecConfig::default(),
+        );
+
+        client.write_all(b"a\nb\nlast-no-newline").await.unwrap();
+        client.shutdown().await.unwrap(); // 触发 EOF
+
+        let mut got: Vec<String> = Vec::new();
+        loop {
+            match conn.try_read_batch().expect("read should not error") {
+                ReadOutcome::Produced(batch) => {
+                    for ev in &batch {
+                        got.push(match &ev.payload {
+                            RawData::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+                            RawData::String(s) => s.clone(),
+                            RawData::ArcBytes(b) => String::from_utf8_lossy(b).into_owned(),
+                        });
+                    }
+                }
+                ReadOutcome::NoData => tokio::task::yield_now().await,
+                ReadOutcome::Closed => break,
+            }
+        }
+        assert_eq!(got, vec!["a", "b", "last-no-newline"]);
+    }
+
+    /// F3 反例：Len 框架下 EOF 的残余是不完整帧，不得被交付。
+    #[tokio::test]
+    async fn eof_does_not_flush_incomplete_len_frame() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut conn = TcpConnection::new(
+            ConnStream::Plain(stream),
+            peer,
+            FramingMode::Len,
+            Tags::new(),
+            8192,
+            "test_eof_len".into(),
+            crate::net::CodecConfig::default(),
+        );
+
+        // 声明长度 10、只给 3 字节 → EOF 时仍未收齐
+        client.write_all(b"10 hel").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut got = 0usize;
+        loop {
+            match conn.try_read_batch().expect("read should not error") {
+                ReadOutcome::Produced(batch) => got += batch.len(),
+                ReadOutcome::NoData => tokio::task::yield_now().await,
+                ReadOutcome::Closed => break,
+            }
+        }
+        assert_eq!(
+            got, 0,
+            "an incomplete length frame must not be delivered at EOF"
+        );
+    }
+
+    /// F3（Auto）：`Auto` 框架下末行无换行（且非长度前缀起点）时，EOF 也应交付。
+    #[tokio::test]
+    async fn eof_flushes_auto_trailing_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut conn = TcpConnection::new(
+            ConnStream::Plain(stream),
+            peer,
+            FramingMode::Auto,
+            Tags::new(),
+            8192,
+            "test_eof_auto".into(),
+            crate::net::CodecConfig::default(),
+        );
+
+        client.write_all(b"a\nb\nlast-no-newline").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut got: Vec<String> = Vec::new();
+        loop {
+            match conn.try_read_batch().expect("read should not error") {
+                ReadOutcome::Produced(batch) => {
+                    for ev in &batch {
+                        got.push(match &ev.payload {
+                            RawData::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+                            RawData::String(s) => s.clone(),
+                            RawData::ArcBytes(b) => String::from_utf8_lossy(b).into_owned(),
+                        });
+                    }
+                }
+                ReadOutcome::NoData => tokio::task::yield_now().await,
+                ReadOutcome::Closed => break,
+            }
+        }
+        assert_eq!(got, vec!["a", "b", "last-no-newline"]);
+    }
+
+    /// F3 反例（Auto）：EOF 残余以长度前缀开头（不完整 len 帧）→ 不得按行交付。
+    #[tokio::test]
+    async fn eof_does_not_flush_auto_incomplete_len_frame() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut conn = TcpConnection::new(
+            ConnStream::Plain(stream),
+            peer,
+            FramingMode::Auto,
+            Tags::new(),
+            8192,
+            "test_eof_auto_len".into(),
+            crate::net::CodecConfig::default(),
+        );
+
+        // 起始为 "100 "（长度前缀起点）但 payload 未收齐
+        client.write_all(b"100 abc").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut got = 0usize;
+        loop {
+            match conn.try_read_batch().expect("read should not error") {
+                ReadOutcome::Produced(batch) => got += batch.len(),
+                ReadOutcome::NoData => tokio::task::yield_now().await,
+                ReadOutcome::Closed => break,
+            }
+        }
+        assert_eq!(
+            got, 0,
+            "an incomplete len frame under Auto must not be flushed as a line"
+        );
     }
 }

@@ -204,11 +204,16 @@ mod tests {
             let (_tx, rx) = async_broadcast::broadcast::<wp_connector_api::ControlEvent>(1);
             handle.source.start(rx).await.unwrap();
 
-            // connect 可能早于 accept 循环完成 bind，遇 ConnectionRefused 则重试
+            // connect 可能早于 accept 循环完成 bind，遇 ConnectionRefused 则重试（带超时）
+            let connect_deadline = std::time::Instant::now() + TokioDuration::from_secs(5);
             let mut s = loop {
                 match TcpStream::connect(format!("127.0.0.1:{port}")).await {
                     Ok(s) => break s,
                     Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                        assert!(
+                            std::time::Instant::now() < connect_deadline,
+                            "connect to 127.0.0.1:{port} timed out (acceptor never bound)"
+                        );
                         sleep(TokioDuration::from_millis(20)).await;
                         continue;
                     }
@@ -322,10 +327,15 @@ mod tests {
         use tokio::time::{Duration as TokioDuration, sleep};
         let mut streams = Vec::new();
         for idx in 0..5 {
+            let connect_deadline = std::time::Instant::now() + TokioDuration::from_secs(5);
             let mut stream = loop {
                 match tokio::net::TcpStream::connect(&addr).await {
                     Ok(s) => break s,
                     Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+                        assert!(
+                            std::time::Instant::now() < connect_deadline,
+                            "connect to {addr} timed out (acceptor never bound)"
+                        );
                         sleep(TokioDuration::from_millis(20)).await;
                         continue;
                     }
@@ -461,10 +471,15 @@ mod tests {
             filter: None,
         };
         let sink_ctx = SinkBuildCtx::new(std::env::current_dir().unwrap());
+        let build_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut sink_handle = loop {
             match sink_fac.build(&sink_spec, &sink_ctx).await {
                 Ok(h) => break h,
                 Err(_) => {
+                    assert!(
+                        std::time::Instant::now() < build_deadline,
+                        "sink build kept failing (acceptor never bound)"
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
             }

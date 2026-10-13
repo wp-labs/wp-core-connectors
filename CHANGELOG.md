@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] - 2026-10-14
+
+### Fixed
+
+- **一条连接的半帧/长记录不再阻塞其它连接**（修复 TCP 源队头阻塞）：连接读取改为「非阻塞轮询 + 并发阻塞读」两路，某条连接上的半帧只挂起它自己。
+- **有界读真正生效**：单次读按 `MAX_READ_BYTES` 夹取，避免大 backlog 下单次读把缓冲吹大（此前的容量守卫实际未生效）。
+- **错误隔离 + 熔断**：单连接读/codec 错误只断开该连接、不影响其它连接；长期「只错不成」时熔断并上报，避免系统性故障被静默。
+- **长度前缀更稳健**：`Len` 框架下超长/非法前缀立即断开；长度解析改用 checked 运算（32 位平台不溢出），并加单帧上限兜底。
+- **EOF 尾行不丢**：`Line` 及 `Auto`（非长度前缀残余）在连接结束时交付末尾无换行的最后一条记录。
+- **acceptor 不再被慢握手阻塞**：TLS 握手与分发移出 accept 循环（独立任务 + 并发上限），新连接即时接入、停止信号不被延迟。
+- 多实例下 `close()` 只回收本实例的连接登记，不再清空共享 registry。
+
 ## [0.10.1] - 2026-10-12
 
 ### Fixed
