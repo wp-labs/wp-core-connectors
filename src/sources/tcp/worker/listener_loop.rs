@@ -1,6 +1,7 @@
 use crate::sources::tcp::ConnectionRegistry;
 use crate::sources::tcp::conn::ConnStream;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time;
@@ -10,6 +11,9 @@ use std::net::SocketAddr;
 
 /// TLS 握手超时：避免慢/恶意客户端在握手阶段阻塞 accept 循环。
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 进程内单调递增的 connection id（避免用时间戳纳秒导致碰撞）。
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct ConnectionRegistration {
     pub connection_id: u64,
@@ -93,7 +97,11 @@ impl TcpListenerLoop {
     }
 
     async fn accept_connection(&mut self, listener: &TcpListener) -> SourceResult<()> {
-        let active = self.registry.lock().unwrap().len();
+        let active = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
         if active >= self.max_connections {
             warn_ctrl!(
                 "TCP listener loop '{}' reached max connections ({} >= {}), skip incoming",
@@ -133,11 +141,12 @@ impl TcpListenerLoop {
                     }
                     None => ConnStream::Plain(stream),
                 };
-                let connection_id = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
-                self.registry.lock().unwrap().insert(connection_id);
+                // 单调递增 id（进程内唯一），避免时间戳纳秒碰撞（F6）。
+                let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+                self.registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(connection_id);
 
                 info_ctrl!(
                     "TCP listener loop '{}' accepted peer {} as connection {} (active={})",
@@ -161,7 +170,10 @@ impl TcpListenerLoop {
                             connection_id,
                             e
                         );
-                        self.registry.lock().unwrap().remove(&connection_id);
+                        self.registry
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&connection_id);
                     }
                 } else {
                     error_ctrl!(
@@ -169,7 +181,10 @@ impl TcpListenerLoop {
                         self.key,
                         connection_id
                     );
-                    self.registry.lock().unwrap().remove(&connection_id);
+                    self.registry
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&connection_id);
                 }
             }
             Ok(Err(e)) => {
@@ -187,5 +202,138 @@ impl TcpListenerLoop {
         let idx = self.next_reader_idx % self.instance_reg_txs.len();
         self.next_reader_idx = (self.next_reader_idx + 1) % self.instance_reg_txs.len();
         Some(self.instance_reg_txs[idx].clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sources::tcp::ConnectionRegistry;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    /// F6：两次 accept 得到不同且单调递增的 connection id。
+    #[tokio::test]
+    async fn accepted_connections_get_distinct_monotonic_ids() {
+        let registry: ConnectionRegistry = Arc::new(Mutex::new(HashSet::new()));
+        let (stop_tx, _stop_rx) = broadcast::channel::<()>(8);
+        let (reg_tx, mut reg_rx) = mpsc::channel(8);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut listener_loop = TcpListenerLoop::new(
+            "id_test".to_string(),
+            addr.to_string(),
+            1000,
+            registry.clone(),
+            stop_tx,
+            vec![reg_tx],
+            None,
+        );
+
+        // 连接先建立（进入 accept backlog），再重试 accept 直到拿到注册。
+        let _c1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let r1 = accept_until_registered(&mut listener_loop, &listener, &mut reg_rx).await;
+
+        let _c2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let r2 = accept_until_registered(&mut listener_loop, &listener, &mut reg_rx).await;
+
+        assert_ne!(r1.connection_id, r2.connection_id, "ids must be distinct");
+        assert!(r2.connection_id > r1.connection_id, "ids must be monotonic");
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(reg.contains(&r1.connection_id));
+        assert!(reg.contains(&r2.connection_id));
+    }
+
+    /// F6 强版：连续 accept 多条连接，id 必须两两不同。时间戳纳秒方案在快速连续
+    /// accept 下可能碰撞（id 相同 -> registry/HashMap 互相覆盖、丢连接），
+    /// 单调计数器则不会。
+    #[tokio::test]
+    async fn many_rapid_accepts_get_unique_ids() {
+        const CONNS: usize = 16;
+        let registry: ConnectionRegistry = Arc::new(Mutex::new(HashSet::new()));
+        let (stop_tx, _stop_rx) = broadcast::channel::<()>(8);
+        let (reg_tx, mut reg_rx) = mpsc::channel(8);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut listener_loop = TcpListenerLoop::new(
+            "many_ids".to_string(),
+            addr.to_string(),
+            100000,
+            registry.clone(),
+            stop_tx,
+            vec![reg_tx],
+            None,
+        );
+
+        let mut ids = HashSet::new();
+        let mut clients = Vec::with_capacity(CONNS);
+        for _ in 0..CONNS {
+            clients.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+            let reg = accept_until_registered(&mut listener_loop, &listener, &mut reg_rx).await;
+            assert!(
+                ids.insert(reg.connection_id),
+                "duplicate connection id {}",
+                reg.connection_id
+            );
+        }
+        assert_eq!(ids.len(), CONNS, "every accept must yield a unique id");
+        assert_eq!(
+            registry.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            CONNS
+        );
+    }
+
+    /// P：registry 锁中毒后 accept 路径不应 panic（poison-tolerant）。
+    #[tokio::test]
+    async fn poisoned_registry_lock_does_not_panic_on_accept() {
+        let registry: ConnectionRegistry = Arc::new(Mutex::new(HashSet::new()));
+        // 让锁中毒：持锁线程 panic。
+        let r2 = registry.clone();
+        let h = std::thread::spawn(move || {
+            let _g = r2.lock().unwrap();
+            panic!("poison the registry mutex");
+        });
+        assert!(h.join().is_err());
+        assert!(registry.is_poisoned(), "registry mutex should be poisoned");
+
+        let (stop_tx, _stop_rx) = broadcast::channel::<()>(8);
+        let (reg_tx, mut reg_rx) = mpsc::channel(8);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut listener_loop = TcpListenerLoop::new(
+            "poison_accept".to_string(),
+            addr.to_string(),
+            1000,
+            registry.clone(),
+            stop_tx,
+            vec![reg_tx],
+            None,
+        );
+
+        // accept_connection 会读 registry（max_connections 计数）并写入新 id，
+        // 中毒锁下都必须容错返回数据而不是 panic。
+        let _c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let reg = accept_until_registered(&mut listener_loop, &listener, &mut reg_rx).await;
+        assert!(
+            registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&reg.connection_id)
+        );
+    }
+
+    async fn accept_until_registered(
+        listener_loop: &mut TcpListenerLoop,
+        listener: &TcpListener,
+        reg_rx: &mut mpsc::Receiver<ConnectionRegistration>,
+    ) -> ConnectionRegistration {
+        for _ in 0..200 {
+            listener_loop.accept_connection(listener).await.unwrap();
+            if let Ok(reg) = reg_rx.try_recv() {
+                return reg;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("connection was not accepted within the retry budget");
     }
 }

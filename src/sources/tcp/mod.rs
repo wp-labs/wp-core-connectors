@@ -35,3 +35,6 @@ pub(crate) const TCP_READER_BATCH_CAP_DEFAULT: usize = 32;
 pub(crate) fn tcp_reader_batch_channel_cap() -> usize {
     TCP_READER_BATCH_CAP_DEFAULT
 }
+
+#[cfg(test)]
+mod throughput_bench;

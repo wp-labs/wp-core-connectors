@@ -2,6 +2,7 @@ use crate::net::CodecConfig;
 use crate::sources::event_id::next_event_id;
 use crate::sources::tcp::codec::StreamDecoder;
 use crate::sources::tcp::framing::{FramingExtractor, FramingMode};
+use bytes::buf::UninitSlice;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -24,9 +25,9 @@ const MAX_BATCH_BYTES: usize = 64 * 1024; // soft cap; single payload may exceed
 const MAX_PENDING_BYTES: usize = 256 * 1024;
 // Per-read capacity budget. Reading unbounded into the BytesMut (which grows
 // to the socket backlog size) lets the buffer balloon to GBs under backpressure,
-// after which macOS read() fails with EINVAL (os error 22). Before each read we
-// ensure at least this much spare capacity, so a single read stays in the
-// low-MiB range and the buffer can't balloon.
+// after which macOS read() fails with EINVAL (os error 22). Every read is routed
+// through `BoundedBufMut`, which both guarantees this much spare capacity and
+// clamps a single syscall to at most this many bytes, so the buffer can't balloon.
 const MAX_READ_BYTES: usize = 256 * 1024;
 // When idle and buffer is large, shrink capacity to reduce RSS footprint.
 // Balanced shrink thresholds：空闲时将过大的缓冲收缩到较小基线
@@ -136,6 +137,17 @@ impl TcpConnection {
         if !produced.is_empty() {
             return Ok(ReadOutcome::Produced(produced));
         }
+        // F1：先把上次因 batch cap 未取完、仍留在 buffer 中的完整帧取出，
+        // 否则对端静默时这些帧会一直滞留到下次成功读或 EOF。
+        self.batcher.drain_messages(
+            self.framing,
+            self.client_addr.ip(),
+            &mut produced,
+            &mut produced_bytes,
+        )?;
+        if !produced.is_empty() {
+            return Ok(ReadOutcome::Produced(produced));
+        }
         loop {
             match self.batcher.bounded_try_read(&self.stream) {
                 Ok(0) => {
@@ -193,6 +205,9 @@ impl TcpConnection {
                     }
                 }
                 Err(e) => {
+                    // 读错即注销连接。无需在此 drain 或交付已解码帧：任何可交付帧要么在
+                    // 进入读循环前（顶部 fill/drain），要么在循环内 `Ok(n)` 臂被 drain 并
+                    // 立即返回；能走到这里时 `pending` 已空、`buffer` 只剩半帧。
                     return Err(SourceReason::disconnect(format!(
                         "tcp read error ({}): {}",
                         self.client_addr, e
@@ -218,6 +233,16 @@ impl TcpConnection {
         let mut produced_bytes = 0usize;
         self.batcher
             .fill_batch_from_pending(&mut produced, &mut produced_bytes);
+        if !produced.is_empty() {
+            return Ok(ReadOutcome::Produced(produced));
+        }
+        // F1：先取出 buffer 中上次未取完的完整帧（见 try_read_batch）。
+        self.batcher.drain_messages(
+            self.framing,
+            self.client_addr.ip(),
+            &mut produced,
+            &mut produced_bytes,
+        )?;
         if !produced.is_empty() {
             return Ok(ReadOutcome::Produced(produced));
         }
@@ -271,6 +296,8 @@ impl TcpConnection {
                     continue;
                 }
                 Err(e) => {
+                    // 读错即注销连接。原因同 `try_read_batch`：可交付帧早在顶部或
+                    // `Ok(n)` 臂被 drain 并返回，走到此处 `pending` 为空、`buffer` 只剩半帧。
                     return Err(SourceReason::disconnect(format!(
                         "tcp read error ({}): {}",
                         self.client_addr, e
@@ -294,6 +321,45 @@ impl TcpConnection {
 
     pub fn has_pending(&self) -> bool {
         self.batcher.pending_len() > 0
+    }
+}
+
+/// 把一次 `BufMut` 写入限制在至多 `limit` 字节的适配器。
+///
+/// `try_read_buf`（明文）与 `read_buf`（TLS）都会把 `chunk_mut()` 给出的**全部**空闲
+/// 容量作为单次 syscall 的目标，而 `BytesMut::remaining_mut()` 恒为 `isize::MAX - len`
+/// （永远超大），无法用来判断容量。故这里：① 保证至少有 `limit` 空闲容量；② 只向读取
+/// 方暴露 ≤ `limit` 的空闲容量，把单次 syscall 夹到 `MAX_READ_BYTES`，避免缓冲在背压下膨胀。
+struct BoundedBufMut<'a> {
+    inner: &'a mut BytesMut,
+    remaining: usize,
+}
+
+impl<'a> BoundedBufMut<'a> {
+    fn new(inner: &'a mut BytesMut, limit: usize) -> Self {
+        if inner.spare_capacity_mut().len() < limit {
+            inner.reserve(limit);
+        }
+        let remaining = inner.spare_capacity_mut().len().min(limit);
+        Self { inner, remaining }
+    }
+}
+
+unsafe impl BufMut for BoundedBufMut<'_> {
+    fn remaining_mut(&self) -> usize {
+        self.remaining
+    }
+
+    fn chunk_mut(&mut self) -> &mut UninitSlice {
+        let spare = self.inner.spare_capacity_mut();
+        let cap = spare.len().min(self.remaining);
+        UninitSlice::uninit(&mut spare[..cap])
+    }
+
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        // SAFETY: 读取方保证 `cnt <= chunk_mut().len() <= remaining`，且这 `cnt` 个字节已写入。
+        unsafe { self.inner.advance_mut(cnt) };
+        self.remaining = self.remaining.saturating_sub(cnt);
     }
 }
 
@@ -337,20 +403,16 @@ impl BatchBuilder {
     }
 
     fn try_read_plain(&mut self, stream: &TcpStream) -> std::io::Result<usize> {
-        if self.buffer.remaining_mut() < MAX_READ_BYTES {
-            self.buffer.reserve(MAX_READ_BYTES);
-        }
-        stream.try_read_buf(&mut self.buffer)
+        let mut bounded = BoundedBufMut::new(&mut self.buffer, MAX_READ_BYTES);
+        stream.try_read_buf(&mut bounded)
     }
 
     async fn tls_read(
         &mut self,
         stream: &mut ServerTlsStream<TcpStream>,
     ) -> std::io::Result<usize> {
-        if self.buffer.remaining_mut() < MAX_READ_BYTES {
-            self.buffer.reserve(MAX_READ_BYTES);
-        }
-        stream.read_buf(&mut self.buffer).await
+        let mut bounded = BoundedBufMut::new(&mut self.buffer, MAX_READ_BYTES);
+        stream.read_buf(&mut bounded).await
     }
 
     /// Opportunistically shrink the internal buffer when idle to reclaim memory.
@@ -537,21 +599,63 @@ mod tests {
     use bytes::BufMut;
     use tokio::io::AsyncWriteExt;
 
+    /// 竞态安全地做一次非阻塞读取：先等 socket 可读再调用 `try_read_batch`。
+    /// `try_read_batch` 不阻塞，单次调用可能在字节到达前拿到 `NoData`；这里
+    /// 在 `NoData` 时继续等待下一次可读，直到切出完整帧或被关闭。
+    /// 仅用于明文连接：TLS 的非阻塞读恒为 `NoData`，会在此空转，故直接返回一次。
+    async fn try_read_ready(conn: &mut TcpConnection) -> ReadOutcome {
+        loop {
+            if !matches!(&conn.stream, ConnStream::Plain(_)) {
+                return conn.try_read_batch().expect("try_read_batch");
+            }
+            {
+                if let ConnStream::Plain(stream) = &conn.stream {
+                    stream.readable().await.expect("socket readable");
+                }
+            }
+            match conn.try_read_batch().expect("try_read_batch") {
+                ReadOutcome::NoData => continue,
+                other => return other,
+            }
+        }
+    }
+
+    /// 累积非阻塞读到 `expected` 个事件（或对端关闭 / 超时）。避免多写分片时
+    /// 单次 `try_read_batch` 只拿到部分帧而误判；每次等待都用超时兜底，避免
+    /// 对端保持打开且无数据时无限挂起。
+    async fn read_events_try(conn: &mut TcpConnection, expected: usize) -> SourceBatch {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events: SourceBatch = Vec::new();
+        while events.len() < expected {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, try_read_ready(conn)).await {
+                Ok(ReadOutcome::Produced(batch)) => events.extend(batch),
+                Ok(ReadOutcome::Closed) => break,
+                Ok(ReadOutcome::NoData) => {}
+                Err(_) => break,
+            }
+        }
+        events
+    }
+
     #[tokio::test]
     async fn try_read_batch_respects_payload_budget() {
-        if std::env::var("WP_NET_TESTS").unwrap_or_default() != "1" {
-            return;
-        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
         let addr = listener.local_addr().unwrap();
+        // 发送量必须超过单批字节上限，确保 byte cap 边界被触发。
+        let frame_payload = 4096usize;
+        let frames = MAX_BATCH_BYTES / frame_payload + 2;
         let writer = tokio::spawn(async move {
             let mut client = tokio::net::TcpStream::connect(addr)
                 .await
                 .expect("connect client");
-            let line = vec![b'a'; 4096];
-            for _ in 0..10 {
+            let line = vec![b'a'; frame_payload];
+            for _ in 0..frames {
                 client.write_all(&line).await.unwrap();
                 client.write_all(b"\n").await.unwrap();
             }
@@ -563,32 +667,40 @@ mod tests {
             peer,
             FramingMode::Line,
             Tags::new(),
-            8192,
+            MAX_READ_BYTES, // 单次读能跨过 byte cap，才能真正验证上限
             "test".into(),
             crate::net::CodecConfig::default(),
         );
-        writer.await.unwrap();
 
-        let first = conn.try_read_batch().expect("first batch should succeed");
-        let mut total_bytes = 0usize;
-        if let ReadOutcome::Produced(batch) = first {
-            for ev in &batch {
-                total_bytes += event_payload_len(ev);
+        // 并发读：不要先 await writer——发送量已超过 socket 缓冲，先等写完成会与读互相阻塞。
+        // 逐批读到收满 frames，断言每一批都不超字节上限，且所有帧恰好产出一次；
+        // 同时确认总字节确实超过上限，证明 byte cap 边界被真正触发。
+        let mut produced_bytes = 0usize;
+        let mut produced_events = 0usize;
+        while produced_events < frames {
+            match try_read_ready(&mut conn).await {
+                ReadOutcome::Produced(batch) => {
+                    let batch_bytes: usize = batch.iter().map(event_payload_len).sum();
+                    assert!(
+                        batch_bytes <= MAX_BATCH_BYTES,
+                        "batch exceeded byte limit: {batch_bytes}"
+                    );
+                    produced_bytes += batch_bytes;
+                    produced_events += batch.len();
+                }
+                ReadOutcome::Closed => break,
+                ReadOutcome::NoData => {}
             }
-            assert!(
-                total_bytes <= MAX_BATCH_BYTES,
-                "first batch should not exceed byte limit"
-            );
-        } else {
-            panic!("expected produced outcome");
         }
-
-        let second = conn.try_read_batch().expect("second batch should succeed");
-        if let ReadOutcome::Produced(batch) = second {
-            assert!(!batch.is_empty());
-        } else {
-            panic!("expected remaining data");
-        }
+        writer.await.unwrap();
+        assert_eq!(
+            produced_events, frames,
+            "every frame should be produced exactly once"
+        );
+        assert!(
+            produced_bytes > MAX_BATCH_BYTES,
+            "workload should exceed the batch byte cap"
+        );
     }
 
     #[tokio::test]
@@ -596,11 +708,8 @@ mod tests {
         // Regression for macOS EINVAL (os error 22): an *unbounded* read into
         // the BytesMut under a large socket backlog balloons the buffer to GBs,
         // after which macOS read() fails with EINVAL and the connection dies.
-        // The bounded read (MAX_READ_BYTES/call) must keep the internal buffer
-        // small regardless of backlog size, and must not lose events.
-        if std::env::var("WP_NET_TESTS").unwrap_or_default() != "1" {
-            return;
-        }
+        // The bounded read must clamp a single read to MAX_READ_BYTES regardless
+        // of backlog size, and must not lose events.
         const FRAME_PAYLOAD: usize = 4096;
         const TOTAL_BYTES: usize = 4 * 1024 * 1024; // 4 MiB backlog, >> MAX_READ_BYTES
 
@@ -635,36 +744,33 @@ mod tests {
         let stream = tokio::net::TcpStream::from_std(std_stream).expect("from_std");
         writer.await.unwrap();
 
+        // 大 `tcp_recv_bytes`：让缓冲容量远大于 MAX_READ_BYTES。这正是「单次读必须被
+        // 夹住」才能防御的配置（旧代码 `remaining_mut()` 守卫恒假，单次读会拉进整个 backlog）。
         let mut conn = TcpConnection::new(
             ConnStream::Plain(stream),
             peer,
             FramingMode::Len,
             Tags::new(),
-            128,
+            TOTAL_BYTES,
             "test".into(),
             crate::net::CodecConfig::default(),
         );
 
-        // Core regression: the FIRST read must be bounded. Pre-fix a single
-        // try_read_buf pulled the whole 4 MiB socket backlog into the buffer at
-        // once (→ MBs → macOS read() EINVAL); post-fix it's capped at
-        // MAX_READ_BYTES + one partial frame.
+        // 核心回归：单次 syscall 读必须被夹到 MAX_READ_BYTES。旧代码里
+        // `remaining_mut()` 恒为 `isize::MAX - len`、守卫永不生效，一次 try_read_buf
+        // 会把 ~4MiB backlog 全部拉进 buffer（→ MBs → macOS read() EINVAL）。
+        // 直接在 drain 之前断言原始读入字节数（不经过 drain，无法被“抽帧”掩盖）。
+        let n = conn
+            .batcher
+            .bounded_try_read(&conn.stream)
+            .expect("first bounded read should succeed");
+        assert!(n > 0, "expected the socket backlog to yield bytes");
+        assert!(
+            n <= MAX_READ_BYTES,
+            "a single read must be clamped to MAX_READ_BYTES, got {n}"
+        );
+
         let mut total_payload = 0usize;
-        let first = conn.try_read_batch().expect("first read should succeed");
-        match first {
-            ReadOutcome::Produced(batch) => {
-                assert!(!batch.is_empty(), "first batch should have data");
-                for ev in &batch {
-                    total_payload += event_payload_len(ev);
-                }
-                assert!(
-                    conn.batcher.buffer.len() <= MAX_READ_BYTES + FRAME_PAYLOAD,
-                    "first read must be bounded, got {} bytes in buffer",
-                    conn.batcher.buffer.len()
-                );
-            }
-            _ => panic!("expected produced outcome on first read"),
-        }
         let mut peak_buf = conn.batcher.buffer.len();
         loop {
             match conn.try_read_batch().expect("read should not error") {
@@ -711,9 +817,6 @@ mod tests {
         //   (crosses the 128-event / 64KiB batch caps and the 256KiB pending cap);
         // - the internal buffer must never balloon to the full backlog (the
         //   macOS EINVAL regression this read bounds against).
-        if std::env::var("WP_NET_TESTS").unwrap_or_default() != "1" {
-            return;
-        }
         const LINES: usize = 4000;
         // ~256B per line → total backlog ~1MiB, far above a single read budget.
         let body = "x".repeat(240);
@@ -808,10 +911,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_length_prefixed_framing() {
-        if std::env::var("WP_NET_TESTS").unwrap_or_default() != "1" {
-            return;
-        }
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
@@ -845,30 +944,22 @@ mod tests {
 
         writer.await.unwrap();
 
-        let result = conn.try_read_batch().expect("read should succeed");
-        if let ReadOutcome::Produced(batch) = result {
-            assert_eq!(batch.len(), 4);
+        let batch = read_events_try(&mut conn, 4).await;
+        assert_eq!(batch.len(), 4, "expected produced outcome");
 
-            let payloads: Vec<String> = batch
-                .iter()
-                .map(|ev| match &ev.payload {
-                    RawData::Bytes(b) => String::from_utf8_lossy(b).to_string(),
-                    _ => panic!("expected bytes payload"),
-                })
-                .collect();
+        let payloads: Vec<String> = batch
+            .iter()
+            .map(|ev| match &ev.payload {
+                RawData::Bytes(b) => String::from_utf8_lossy(b).to_string(),
+                _ => panic!("expected bytes payload"),
+            })
+            .collect();
 
-            assert_eq!(payloads, vec!["hello", "world", "length", "prefixed"]);
-        } else {
-            panic!("expected produced outcome");
-        }
+        assert_eq!(payloads, vec!["hello", "world", "length", "prefixed"]);
     }
 
     #[tokio::test]
     async fn test_auto_framing_handles_mixed_modes() {
-        if std::env::var("WP_NET_TESTS").unwrap_or_default() != "1" {
-            return;
-        }
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
@@ -899,22 +990,18 @@ mod tests {
 
         writer.await.unwrap();
 
-        let result = conn.try_read_batch().expect("read should succeed");
-        if let ReadOutcome::Produced(batch) = result {
-            assert_eq!(batch.len(), 4);
+        let batch = read_events_try(&mut conn, 4).await;
+        assert_eq!(batch.len(), 4, "expected produced outcome");
 
-            let payloads: Vec<String> = batch
-                .iter()
-                .map(|ev| match &ev.payload {
-                    RawData::Bytes(b) => String::from_utf8_lossy(b).to_string(),
-                    _ => panic!("expected bytes payload"),
-                })
-                .collect();
+        let payloads: Vec<String> = batch
+            .iter()
+            .map(|ev| match &ev.payload {
+                RawData::Bytes(b) => String::from_utf8_lossy(b).to_string(),
+                _ => panic!("expected bytes payload"),
+            })
+            .collect();
 
-            assert_eq!(payloads, vec!["line1", "hello", "", "message"]);
-        } else {
-            panic!("expected produced outcome");
-        }
+        assert_eq!(payloads, vec!["line1", "hello", "", "message"]);
     }
 
     #[test]
@@ -1113,5 +1200,269 @@ mod tests {
             other => panic!("unexpected payload variant: {:?}", other),
         }
         client.await.unwrap();
+    }
+
+    /// F1：一次突发把数据全部读进内部 buffer、但被 batch cap 截断后，剩余完整帧
+    /// 不应依赖「新的 socket 数据」或 EOF 才交付——下一次读应直接 drain buffer 交出。
+    /// （依赖回环 socket 缓冲能一次性接住突发；与 backlog 回归测试同前提。）
+    #[tokio::test]
+    async fn leftover_buffer_frames_drain_without_new_data() {
+        const FRAME: usize = 4096;
+        const FRAMES: usize = MAX_BATCH_BYTES / FRAME + 2; // 超出单批字节上限
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let line = vec![b'q'; FRAME];
+            for _ in 0..FRAMES {
+                client.write_all(&line).await.unwrap();
+                client.write_all(b"\n").await.unwrap();
+            }
+            // 保持连接打开、且不再发送新数据（不触发 EOF）。
+            std::future::pending::<()>().await;
+        });
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut conn = TcpConnection::new(
+            ConnStream::Plain(stream),
+            peer,
+            FramingMode::Line,
+            Tags::new(),
+            MAX_READ_BYTES, // 让首次读一次吸收整个突发；否则读被 buffer 容量限制、触不到 byte cap
+            "test_leftover".into(),
+            crate::net::CodecConfig::default(),
+        );
+        // 等突发全部落到 socket（此后既无新数据、也无 EOF）。
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let events = read_events_try(&mut conn, FRAMES).await;
+        writer.abort();
+        assert_eq!(
+            events.len(),
+            FRAMES,
+            "leftover buffer frames must be delivered without new data or EOF"
+        );
+        // 只比 len 可能掩盖「丢一帧 + 重复一帧」，故同时校验内容。
+        for ev in &events {
+            match &ev.payload {
+                RawData::Bytes(b) => {
+                    assert_eq!(b.len(), FRAME, "frame truncated");
+                    assert!(b.iter().all(|&x| x == b'q'), "frame corrupted");
+                }
+                _ => panic!("expected bytes payload"),
+            }
+        }
+    }
+
+    /// F1 负例：不完整的尾帧不得被提前交付；补全后才交付一次。
+    #[tokio::test]
+    async fn partial_trailing_frame_withheld_until_complete() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut conn = TcpConnection::new(
+            ConnStream::Plain(stream),
+            peer,
+            FramingMode::Line,
+            Tags::new(),
+            8192,
+            "test_partial".into(),
+            crate::net::CodecConfig::default(),
+        );
+
+        let to_text = |ev: &SourceEvent| match &ev.payload {
+            RawData::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+            RawData::String(s) => s.clone(),
+            RawData::ArcBytes(b) => String::from_utf8_lossy(b).into_owned(),
+        };
+
+        client.write_all(b"a\nb\npart").await.unwrap(); // 末尾无换行
+        let events = read_events_try(&mut conn, 2).await;
+        let seen: Vec<String> = events.iter().map(to_text).collect();
+        assert_eq!(
+            seen,
+            vec!["a", "b"],
+            "the incomplete trailing frame must be withheld"
+        );
+
+        client.write_all(b"\n").await.unwrap(); // 补全尾帧
+        let more = read_events_try(&mut conn, 1).await;
+        let seen2: Vec<String> = more.iter().map(to_text).collect();
+        assert_eq!(seen2, vec!["part"]);
+    }
+
+    /// F1（异步慢路径 `read_batch`）：突发被一次读吸进内部 buffer、又被 batch cap
+    /// 截断后，剩余完整帧必须在**没有新 socket 数据、也没有 EOF** 时被直接 drain 交出。
+    /// 否则 `read_batch` 会阻塞在 `read_chunk().await`（对端静默），使响应发生延迟。
+    /// 与 `leftover_buffer_frames_drain_without_new_data` 同前提，但走阻塞读路径。
+    #[tokio::test]
+    async fn read_batch_drains_leftover_buffer_without_new_data() {
+        const FRAME: usize = 4096;
+        const FRAMES: usize = MAX_BATCH_BYTES / FRAME + 2; // 超出单批字节上限
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let line = vec![b'r'; FRAME];
+            for _ in 0..FRAMES {
+                client.write_all(&line).await.unwrap();
+                client.write_all(b"\n").await.unwrap();
+            }
+            // 保持连接打开、且此后不再发送：既无新数据、也不触发 EOF。
+            std::future::pending::<()>().await;
+        });
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut conn = TcpConnection::new(
+            ConnStream::Plain(stream),
+            peer,
+            FramingMode::Line,
+            Tags::new(),
+            MAX_READ_BYTES, // 首次读一次吸收整个突发；否则读被 buffer 容量限制、触不到 byte cap
+            "test_rb_leftover".into(),
+            crate::net::CodecConfig::default(),
+        );
+        // 等突发全部落到 socket（此后既无新数据、也无 EOF）。
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut events: SourceBatch = Vec::new();
+        while events.len() < FRAMES {
+            // `read_batch` 只在有空闲字节时才会立刻返回；此处等待必须有上界——
+            // 若 F1 缺失，第 3 次调用会永久阻塞在 socket 上而被 timeout 捕获。
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(2), conn.read_batch())
+                    .await
+                    .expect("read_batch blocked: leftover buffer frames not drained (F1 missing?)")
+                    .expect("read_batch should not error");
+            match outcome {
+                ReadOutcome::Produced(batch) => events.extend(batch),
+                ReadOutcome::Closed => break,
+                ReadOutcome::NoData => unreachable!("read_batch never yields NoData"),
+            }
+        }
+        writer.abort();
+        assert_eq!(
+            events.len(),
+            FRAMES,
+            "leftover buffer frames must be delivered by read_batch without new data or EOF"
+        );
+        for ev in &events {
+            match &ev.payload {
+                RawData::Bytes(b) => {
+                    assert_eq!(b.len(), FRAME, "frame truncated");
+                    assert!(b.iter().all(|&x| x == b'r'), "frame corrupted");
+                }
+                _ => panic!("expected bytes payload"),
+            }
+        }
+    }
+
+    /// R3：`BoundedBufMut` 只向读取方暴露 ≤ limit 的空闲容量，把单次读夹住。
+    /// 即便底层 `BytesMut` 空闲容量远大于 limit，暴露的 chunk 也必须等于 limit。
+    #[test]
+    fn bounded_buf_mut_exposes_at_most_limit() {
+        let mut buf = BytesMut::with_capacity(MAX_READ_BYTES * 4);
+        let mut b = BoundedBufMut::new(&mut buf, MAX_READ_BYTES);
+        assert_eq!(b.remaining_mut(), MAX_READ_BYTES);
+        assert_eq!(b.chunk_mut().len(), MAX_READ_BYTES);
+    }
+
+    /// R3：底层空闲容量不足 limit 时，`BoundedBufMut` 会先 reserve 到至少 limit；
+    /// 反之（空闲已足够）则不浪费地 reserve。
+    #[test]
+    fn bounded_buf_mut_reserves_when_spare_below_limit() {
+        let mut buf = BytesMut::with_capacity(16);
+        {
+            let b = BoundedBufMut::new(&mut buf, MAX_READ_BYTES);
+            assert_eq!(b.remaining_mut(), MAX_READ_BYTES);
+        }
+        assert!(buf.spare_capacity_mut().len() >= MAX_READ_BYTES);
+    }
+
+    /// R3：经适配器写入应正确落到 inner，且 `remaining` 随写入递减（回归 unsafe 路径）。
+    #[test]
+    fn bounded_buf_mut_writes_through_to_inner() {
+        let mut buf = BytesMut::new();
+        {
+            let mut b = BoundedBufMut::new(&mut buf, MAX_READ_BYTES);
+            b.put_slice(b"hello world");
+            assert_eq!(b.remaining_mut(), MAX_READ_BYTES - 11);
+            // chunk_mut 应给出剩余可用（≥ limit-11，因 limit 远大于 11）
+            assert_eq!(b.chunk_mut().len(), MAX_READ_BYTES - 11);
+        }
+        assert_eq!(&buf[..], b"hello world");
+    }
+
+    /// R3：TLS 路径经 `BoundedBufMut` 读入，验证其每次读不超过 MAX_READ_BYTES，且超过
+    /// 单次上限的大载荷分多次读完后无丢失（明文与 TLS 夹读一致）。
+    /// 注：rustls 每次至多返回一个 TLS record，故本测试不能「回归触发」无界读
+    /// （那由 `bounded_read_keeps_buffer_bounded_under_backlog_burst` 覆盖），
+    /// 它保证的是 TLS 侧的契约与不丢失。
+    #[tokio::test]
+    async fn tls_read_is_clamped_to_max_read_bytes() {
+        const PAYLOAD: usize = MAX_READ_BYTES * 2; // > 单次读上限
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem().as_bytes()).unwrap();
+        std::fs::write(&key_path, certified.key_pair.serialize_pem().as_bytes()).unwrap();
+        let server_tls = crate::net::TlsConfig {
+            cert: Some(cert_path.to_string_lossy().into_owned()),
+            key: Some(key_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls.build_server_config().unwrap());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_tls = crate::net::TlsConfig {
+            insecure: true,
+            ..Default::default()
+        };
+        let connector = tokio_rustls::TlsConnector::from(client_tls.build_client_config().unwrap());
+        let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+        let payload = vec![b't'; PAYLOAD];
+        let client = tokio::spawn(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut tls = connector.connect(server_name, tcp).await.unwrap();
+            tls.write_all(&payload).await.unwrap();
+            tls.flush().await.unwrap();
+            // 保持连接，避免 EOF 干扰读取。
+            std::future::pending::<()>().await;
+        });
+
+        let (stream, peer) = listener.accept().await.unwrap();
+        let tls_stream = acceptor.accept(stream).await.unwrap();
+        let mut conn = TcpConnection::new(
+            ConnStream::Tls(Box::new(tls_stream)),
+            peer,
+            FramingMode::Line,
+            Tags::new(),
+            8192,
+            "tls_clamp".to_string(),
+            crate::net::CodecConfig::default(),
+        );
+
+        let mut total = 0usize;
+        while total < PAYLOAD {
+            let ConnStream::Tls(tls) = &mut conn.stream else {
+                unreachable!("expected TLS stream")
+            };
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                conn.batcher.tls_read(tls.as_mut()),
+            )
+            .await
+            .expect("tls_read timed out")
+            .expect("tls_read error");
+            assert!(n > 0, "unexpected EOF before all payload read");
+            assert!(
+                n <= MAX_READ_BYTES,
+                "tls_read must be clamped to MAX_READ_BYTES, got {n}"
+            );
+            total += n;
+        }
+        assert_eq!(total, PAYLOAD);
+        client.abort();
     }
 }

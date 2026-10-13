@@ -923,9 +923,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn tcp_sink_sends_line() -> anyhow::Result<()> {
-        if std::env::var("WP_NET_TESTS").unwrap_or_default() != "1" {
-            return Ok(());
-        }
         // server
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
@@ -972,9 +969,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn tcp_sink_sends_len() -> anyhow::Result<()> {
-        if std::env::var("WP_NET_TESTS").unwrap_or_default() != "1" {
-            return Ok(());
-        }
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let srv = tokio::spawn(async move {
@@ -1018,9 +1012,6 @@ mod tests {
             Cipher, CompressConfig, CompressionAlgo, EncryptConfig, build_decoder,
         };
 
-        if std::env::var("WP_NET_TESTS").unwrap_or_default() != "1" {
-            return Ok(());
-        }
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let srv = tokio::spawn(async move {
