@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.2] - 2026-10-28
+
+### Changed
+
+- **升级 `wp-connector-utils 0.5.1`**：`zstd` 随之升到 0.14.3 / `zstd-safe` 8.2.0，修复 `RUSTSEC-2026-0391` / `0398` / `0403`（流复用、seekable 越界、旧格式解压未初始化内存）。codec 配置与行为不变。
+
 ## [0.11.1] - 2026-10-28
 
 ### Changed
