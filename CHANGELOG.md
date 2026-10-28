@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.3] - 2026-10-28
+
+### Fixed
+
+- **`max_size` 字符串写法被模板默认值拦住**：内置文件型 connector 不再在 `default_params` 里给 `max_size = 0` / `roll_compress = "none"`，只保留在 `allow_override`。`merge_params` 要求覆盖值类型与默认值一致，默认成整数后 `max_size = "10MB"`（文档推荐写法）会被判为类型错误。不配默认值等价于不滚动。
+
 ## [0.11.2] - 2026-10-28
 
 ### Changed

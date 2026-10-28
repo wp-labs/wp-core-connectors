@@ -25,9 +25,8 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
         params.insert("base".into(), json!("./data/out_dat"));
         params.insert("file".into(), json!("default.json"));
         params.insert("sync".into(), json!(false));
-        // 0 = 不限容量（不滚动）；滚动保留个数由 max_rolls 控制（默认 3）
-        params.insert("max_size".into(), json!(0));
-        params.insert("roll_compress".into(), json!("none"));
+        // max_size / max_rolls / roll_compress 只列入 allow_override，不能在 default_params 里给默认值：
+        // merge_params 要求覆盖值类型与默认值一致，默认成整数 0 会让 max_size = "10MB" 被类型校验拒绝。
         defs.push(ConnectorDef {
             id: "file_json_sink".into(),
             kind: "file".into(),
@@ -55,8 +54,6 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
         params.insert("base".into(), json!("./data/out_dat"));
         params.insert("file".into(), json!("default.pbtxt"));
         params.insert("sync".into(), json!(false));
-        params.insert("max_size".into(), json!(0));
-        params.insert("roll_compress".into(), json!("none"));
         defs.push(ConnectorDef {
             id: "file_proto_text_sink".into(),
             kind: "file".into(),
@@ -84,8 +81,6 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
         params.insert("base".into(), json!("./data/out_dat"));
         params.insert("file".into(), json!("default.dat"));
         params.insert("sync".into(), json!(false));
-        params.insert("max_size".into(), json!(0));
-        params.insert("roll_compress".into(), json!("none"));
         defs.push(ConnectorDef {
             id: "file_proto_sink".into(),
             kind: "file".into(),
@@ -113,8 +108,6 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
         params.insert("base".into(), json!("./data/out_dat"));
         params.insert("file".into(), json!("default.kv"));
         params.insert("sync".into(), json!(false));
-        params.insert("max_size".into(), json!(0));
-        params.insert("roll_compress".into(), json!("none"));
         defs.push(ConnectorDef {
             id: "file_kv_sink".into(),
             kind: "file".into(),
@@ -142,8 +135,6 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
         params.insert("base".into(), json!("./data/out_dat"));
         params.insert("file".into(), json!("default.raw"));
         params.insert("sync".into(), json!(false));
-        params.insert("max_size".into(), json!(0));
-        params.insert("roll_compress".into(), json!("none"));
         defs.push(ConnectorDef {
             id: "file_raw_sink".into(),
             kind: "file".into(),
@@ -413,11 +404,11 @@ mod tests {
     #[test]
     fn file_sink_defs_expose_rolling_params() {
         let def = sink_def("file_json_sink").expect("file_json_sink builtin def");
-        assert_eq!(
-            def.default_params.get("max_size").and_then(|v| v.as_u64()),
-            Some(0),
-            "max_size defaults to 0 (rolling disabled)"
-        );
+        // 滚动参数只允许覆盖、不给默认值：否则 merge_params 的类型校验会把
+        // max_size = "10MB" 这类字符串覆盖当成类型错误。
+        assert!(!def.default_params.contains_key("max_size"));
+        assert!(!def.default_params.contains_key("max_rolls"));
+        assert!(!def.default_params.contains_key("roll_compress"));
         assert!(def.allow_override.iter().any(|key| key == "max_size"));
         assert!(def.allow_override.iter().any(|key| key == "max_rolls"));
         assert!(def.allow_override.iter().any(|key| key == "roll_compress"));
