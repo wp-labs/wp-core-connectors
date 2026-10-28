@@ -171,6 +171,22 @@ Supporting transport and protocol helpers live in:
 - `src/net/transport/`
 - `src/protocol/syslog/`
 
+#### File sink: size-based rolling and archive compression
+
+Text file sinks (`protocol = "txt"`, the default) can rotate the active file by size:
+
+| Param | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `max_size` | int \| string | unset | Max bytes per file (`0` / unset = no rolling); size strings like `10MB` / `1GiB` are accepted |
+| `max_rolls` | int | `3` | Rotated files to keep, excluding the active file; `0` drops the old file on roll |
+| `roll_compress` | string \| bool | `none` | Archive compression: `none` / `gzip` / `zip` (`true` = `gzip`) |
+
+- Rotated files are numbered newest-first: `out.dat.1`, then `out.dat.1.gz` / `out.dat.1.zip` when compression is on; the oldest file beyond `max_rolls` is deleted.
+- Every rotation flushes and rebuilds the codec stream for the new file, so each archive can be decrypted/decompressed on its own.
+- Archive compression runs on a blocking thread; on failure the sink falls back to an uncompressed archive instead of losing data.
+- `max_rolls` / `roll_compress` require `max_size > 0`; only the `txt` protocol rolls (`protocol = "arrow"` rejects the rolling params).
+- When shipping a connector definition, list the three params in `allow_override` but **do not** give them default values: overrides are type-checked against the default, so `max_size = 0` (integer) would reject `max_size = "10MB"`.
+
 ## Minimal Usage
 
 ```rust
@@ -320,6 +336,21 @@ Licensed under [Apache License 2.0](./LICENSE).
 - 文本文件输出格式：`json`、`csv`、`show`、`kv`、`raw`、`proto-text`
 
 需要注意的是：当前仓库里已经实现的是 sink runtime/factory；source 侧在这里主要提供 builtin 定义，具体 runtime 工厂可以通过同一套注册表接口由外部注册。
+
+### 文件 Sink：容量滚动与归档压缩
+
+文本文件 Sink（`protocol = "txt"`，默认）支持按容量滚动：
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `max_size` | int/string | 不设置 | 单文件最大字节数（`0` / 不设置 = 不滚动）；支持 `10MB` / `1GiB` 这类写法 |
+| `max_rolls` | int | `3` | 保留的滚动文件个数（不含当前文件）；`0` 表示滚动时丢弃旧文件 |
+| `roll_compress` | string/bool | `none` | 归档压缩：`none` / `gzip` / `zip`（`true` 等价 `gzip`） |
+
+- 历史文件按序号命名，越小越新：`out.dat.1`，开启压缩后为 `out.dat.1.gz` / `out.dat.1.zip`；超出 `max_rolls` 的最旧文件被删除。
+- 每次滚动都会收尾并重建 codec 流，因此每个归档都能独立解密解压；归档压缩在阻塞线程执行，失败时回退为不压缩归档，不丢数据。
+- `max_rolls` / `roll_compress` 必须配合 `max_size > 0`；只有 `txt` 协议支持滚动，`protocol = "arrow"` 配这三个参数会直接报错。
+- 自建连接器时：三个参数只放进 `allow_override`，**不要**给默认值——覆盖值类型必须与默认值一致，默认成整数 `0` 会让 `max_size = "10MB"` 被拒绝。
 
 ### Source 数据格式（`data_format`）
 
