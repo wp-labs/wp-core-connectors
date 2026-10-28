@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] - 2026-10-28
+
+### Changed
+
+- **`zip` 依赖 8.6 → 9.1**：滚动归档的 zip 写入改用已修复 `ZipArchive::extract` 相关公告（RUSTSEC-2026-0367 / 0368 / 0369）的 9.x，并且只启用 `deflate-flate2`（不再引入 zopfli）。本项目只用写入 API，但升级后下游 `cargo audit` 不再因此报警。
+
 ## [0.11.0] - 2026-10-28
 
 ### Added
