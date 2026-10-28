@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-10-28
+
+### Added
+
+- **文件 Sink 支持按容量滚动**：新增 `max_size`（单文件最大字节数，支持 `10MB` / `1GiB` 这类写法，`0` = 不限容量）与 `max_rolls`（保留的历史文件个数，默认 `3`）。写入前检查容量，超限时先滚动再写，历史文件依次为 `out.dat.1` / `.2` / `.3`，超出保留个数的最旧文件自动删除。滚动时会收尾压缩/加密流并为新文件重建编码器，因此每个历史文件都能独立解压解密。目前仅支持 `protocol = "txt"`（默认）。
+- **滚动归档压缩**：新增 `roll_compress`（`none` / `gzip` / `zip`，默认 `none`，`true` 等价 `gzip`）。历史文件可归档为可直接解压的 `out.dat.1.gz` 或标准 `out.dat.1.zip`；压缩在阻塞线程执行，失败时自动回退为不压缩归档，不丢数据。
+- 内置 `file_json_sink` / `file_proto_text_sink` / `file_proto_sink` / `file_kv_sink` / `file_raw_sink` 的默认参数新增 `max_size = 0` / `roll_compress = "none"`，并允许覆盖 `max_size` / `max_rolls` / `roll_compress`。
+
+### Note
+
+- 自建 connector 需把 `max_size` / `max_rolls` / `roll_compress` 加入 `allow_override` 才能覆盖。
+
 ## [0.10.2] - 2026-10-14
 
 ### Fixed

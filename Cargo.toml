@@ -1,6 +1,6 @@
 [package]
 name = "wp-core-connectors"
-version = "0.10.2" #@gxl:set(version)
+version = "0.11.0" #@gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 authors = ["WarpParse Dev Team"]
@@ -22,6 +22,7 @@ async-trait = "0.1"
 base64 = "0.23"
 bytes = "1.11"
 chrono = "0.4"
+flate2 = "1.1"
 glob = "0.3"
 hostname = "0.4"
 hex = "0.4"
@@ -32,6 +33,7 @@ log = "0.4"
 memchr = "2.7"
 socket2 = "0.6"
 toml = "1.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 orion_conf = "0.8"
 orion-error = { version = "0.9", features = ["anyhow"] }
 thiserror = "2"

@@ -1,4 +1,5 @@
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::ipc::writer::StreamWriter;
@@ -19,6 +20,59 @@ use wp_model_core::model::DataRecord;
 use wp_model_core::model::fmt_def::TextFmt;
 
 use crate::net::CodecConfig;
+
+/// 滚动文件默认保留个数（不含当前正在写入的文件）。
+pub const DEFAULT_MAX_ROLLS: u32 = 3;
+/// 滚动文件个数上限，防止误配置写出过多历史文件。
+pub const MAX_ROLLS_LIMIT: u32 = 1024;
+
+/// 滚动文件的归档压缩方式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RollCompress {
+    /// 不压缩：`out.dat.1`
+    #[default]
+    None,
+    /// gzip：`out.dat.1.gz`
+    Gzip,
+    /// zip（Deflate）：`out.dat.1.zip`
+    Zip,
+}
+
+impl RollCompress {
+    /// 归档文件扩展名（含前导点；不压缩时为空）。
+    pub fn extension(self) -> &'static str {
+        match self {
+            RollCompress::None => "",
+            RollCompress::Gzip => ".gz",
+            RollCompress::Zip => ".zip",
+        }
+    }
+
+    pub(crate) fn parse(value: Option<&serde_json::Value>) -> SinkResult<Self> {
+        let Some(value) = value else {
+            return Ok(Self::None);
+        };
+        if value.is_null() {
+            return Ok(Self::None);
+        }
+        match value {
+            // 布尔开关：true 等价于 gzip
+            serde_json::Value::Bool(true) => Ok(Self::Gzip),
+            serde_json::Value::Bool(false) => Ok(Self::None),
+            serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "" | "none" | "off" | "false" => Ok(Self::None),
+                "gzip" | "gz" => Ok(Self::Gzip),
+                "zip" => Ok(Self::Zip),
+                other => Err(SinkReason::core_conf().to_err().with_detail(format!(
+                    "invalid roll_compress: '{other}'; allowed: none,gzip,zip"
+                ))),
+            },
+            other => Err(SinkReason::core_conf().to_err().with_detail(format!(
+                "roll_compress must be \"none\"/\"gzip\"/\"zip\" or a bool (got {other})"
+            ))),
+        }
+    }
+}
 
 use super::arrow_conv::{
     data_record_to_batch, data_records_to_batch, encode_ipc_frame_multi, infer_schema_from_record,
@@ -53,6 +107,12 @@ pub struct FileSinkSpec {
     file_name: String,
     sync: bool,
     codec: CodecConfig,
+    /// 单文件最大字节数；`None` 表示不限制、不滚动。
+    max_size: Option<u64>,
+    /// 保留的滚动文件个数（不含当前文件）；`0` 表示滚动时直接丢弃旧文件。
+    max_rolls: u32,
+    /// 滚动归档压缩方式；`None` 表示不压缩。
+    roll_compress: RollCompress,
 }
 
 impl FileSinkSpec {
@@ -94,12 +154,23 @@ impl FileSinkSpec {
         codec
             .validate()
             .map_err(|e| SinkReason::core_conf().to_err().with_detail(e.to_string()))?;
+        let max_size = parse_max_size(spec.params.get("max_size"))?;
+        let max_rolls = parse_max_rolls(spec.params.get("max_rolls"), max_size.is_some())?;
+        let roll_compress = RollCompress::parse(spec.params.get("roll_compress"))?;
+        if roll_compress != RollCompress::None && max_size.is_none() {
+            return Err(SinkReason::core_conf().to_err().with_detail(
+                "roll_compress requires max_size > 0; set max_size to enable file rolling",
+            ));
+        }
         Ok(Self {
             fmt,
             base,
             file_name,
             sync,
             codec,
+            max_size,
+            max_rolls,
+            roll_compress,
         })
     }
 
@@ -115,11 +186,114 @@ impl FileSinkSpec {
         &self.codec
     }
 
+    /// 单文件最大字节数；`None` 表示不限容量、不滚动。
+    pub fn max_size(&self) -> Option<u64> {
+        self.max_size
+    }
+
+    /// 保留的滚动文件个数（不含当前文件）。
+    pub fn max_rolls(&self) -> u32 {
+        self.max_rolls
+    }
+
+    /// 滚动归档压缩方式。
+    pub fn roll_compress(&self) -> RollCompress {
+        self.roll_compress
+    }
+
     pub fn resolve_path(&self, _ctx: &SinkBuildCtx) -> String {
         resolve_output_path(&self.base, &self.file_name, _ctx)
             .display()
             .to_string()
     }
+}
+
+/// 解析 `max_size`：支持整数字节数或带单位的字符串（`10MB` / `512k` / `1GiB`）。
+/// `0` 视为不限制（返回 `None`）。
+pub(crate) fn parse_max_size(value: Option<&serde_json::Value>) -> SinkResult<Option<u64>> {
+    let Some(value) = value else { return Ok(None) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let bytes = match value {
+        serde_json::Value::Number(n) => n.as_u64().ok_or_else(|| {
+            SinkReason::core_conf()
+                .to_err()
+                .with_detail(format!("max_size must be a non-negative integer (got {n})"))
+        })?,
+        serde_json::Value::String(s) => parse_size_str(s)?,
+        other => {
+            return Err(SinkReason::core_conf().to_err().with_detail(format!(
+                "max_size must be an integer or a size string like '10MB' (got {other})"
+            )));
+        }
+    };
+    Ok(if bytes == 0 { None } else { Some(bytes) })
+}
+
+/// 解析 `<数字><单位>` 形式的容量，单位按 1024 进制，大小写不敏感。
+fn parse_size_str(raw: &str) -> SinkResult<u64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(size_conf_err(raw));
+    }
+    let digits_end = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    let (num, unit) = s.split_at(digits_end);
+    let base: f64 = num.parse().map_err(|_| size_conf_err(raw))?;
+    let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" | "kib" => 1024.0,
+        "m" | "mb" | "mib" => 1024.0 * 1024.0,
+        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return Err(size_conf_err(raw)),
+    };
+    let bytes = base * mult;
+    if !bytes.is_finite() || bytes < 0.0 {
+        return Err(size_conf_err(raw));
+    }
+    Ok(bytes as u64)
+}
+
+fn size_conf_err(raw: &str) -> wp_connector_api::SinkError {
+    SinkReason::core_conf().to_err().with_detail(format!(
+        "invalid max_size: '{raw}'; expect bytes or a size string like '10MB'"
+    ))
+}
+
+/// 解析 `max_rolls`：未配置默认 [`DEFAULT_MAX_ROLLS`]；
+/// 显式配置时必须同时启用 `max_size`，否则配置非法。
+pub(crate) fn parse_max_rolls(
+    value: Option<&serde_json::Value>,
+    size_enabled: bool,
+) -> SinkResult<u32> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_MAX_ROLLS);
+    };
+    if value.is_null() {
+        return Ok(DEFAULT_MAX_ROLLS);
+    }
+    let rolls = match value.as_u64() {
+        Some(n) if n <= u64::from(MAX_ROLLS_LIMIT) => n as u32,
+        Some(n) => {
+            return Err(SinkReason::core_conf()
+                .to_err()
+                .with_detail(format!("max_rolls must be <= {MAX_ROLLS_LIMIT} (got {n})")));
+        }
+        None => {
+            return Err(SinkReason::core_conf().to_err().with_detail(format!(
+                "max_rolls must be a non-negative integer (got {value})"
+            )));
+        }
+    };
+    if !size_enabled {
+        return Err(SinkReason::core_conf()
+            .to_err()
+            .with_detail("max_rolls requires max_size > 0; set max_size to enable file rolling"));
+    }
+    Ok(rolls)
 }
 
 pub(crate) fn resolve_output_path(
@@ -165,12 +339,135 @@ fn shard_file_name(file_name: &str, replica_idx: usize) -> String {
     }
 }
 
+async fn open_append(path: &str) -> SinkResult<tokio::fs::File> {
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)
+        .await
+        .source_err(SinkReason::Sink, "open output file")
+}
+
+/// 第 `index` 个历史文件的路径（带归档压缩扩展名）：`a.dat` -> `a.dat.1.gz`。
+pub(crate) fn rolled_path_with(path: &Path, index: u32, compress: RollCompress) -> PathBuf {
+    let base = rolled_base_path(path, index);
+    let ext = compress.extension();
+    if ext.is_empty() {
+        return base;
+    }
+    let file_name = base
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out.dat.1");
+    match file_name.strip_suffix(".lock") {
+        Some(inner) => base.with_file_name(format!("{inner}{ext}.lock")),
+        None => base.with_file_name(format!("{file_name}{ext}")),
+    }
+}
+
+fn rolled_base_path(path: &Path, index: u32) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out.dat");
+    let (stem, lock) = match file_name.strip_suffix(".lock") {
+        Some(inner) => (inner, ".lock"),
+        None => (file_name, ""),
+    };
+    path.with_file_name(format!("{stem}.{index}{lock}"))
+}
+
+/// 已存在的历史文件可能来自不同压缩方式（用户改过配置），轮转时按变体各自处理。
+const ROLL_VARIANTS: [RollCompress; 3] =
+    [RollCompress::None, RollCompress::Gzip, RollCompress::Zip];
+
+/// 删除各变体最旧的文件，并把 `.{n}` 依次后移一位（`.{n}` -> `.{n+1}`）。
+fn shift_archives(path: &Path, max_rolls: u32) -> std::io::Result<()> {
+    for variant in ROLL_VARIANTS {
+        remove_if_exists(&rolled_path_with(path, max_rolls, variant))?;
+        for idx in (1..max_rolls).rev() {
+            rename_if_exists(
+                &rolled_path_with(path, idx, variant),
+                &rolled_path_with(path, idx + 1, variant),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// 把已关闭的活动文件归档为第 `index` 个历史文件；成功时删除原文件。
+/// 失败时由调用方回退为不压缩归档，避免丢数据。
+fn archive_file(src: &Path, dst: &Path, compress: RollCompress) -> std::io::Result<()> {
+    match compress {
+        RollCompress::None => return fs::rename(src, dst),
+        RollCompress::Gzip => {
+            let mut input = BufReader::new(fs::File::open(src)?);
+            let out = fs::File::create(dst)?;
+            let mut encoder =
+                flate2::write::GzEncoder::new(BufWriter::new(out), flate2::Compression::default());
+            std::io::copy(&mut input, &mut encoder)?;
+            let writer = encoder.finish()?;
+            let file = writer.into_inner().map_err(|err| err.into_error())?;
+            file.sync_all()?;
+        }
+        RollCompress::Zip => {
+            let mut input = BufReader::new(fs::File::open(src)?);
+            let out = fs::File::create(dst)?;
+            let mut writer = zip::ZipWriter::new(BufWriter::new(out));
+            let name = src
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("out.dat")
+                .to_string();
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file(name, options).map_err(zip_to_io)?;
+            std::io::copy(&mut input, &mut writer)?;
+            let inner = writer.finish().map_err(zip_to_io)?;
+            let file = inner.into_inner().map_err(|err| err.into_error())?;
+            file.sync_all()?;
+        }
+    }
+    remove_if_exists(src)
+}
+
+fn zip_to_io(err: zip::result::ZipError) -> std::io::Error {
+    std::io::Error::other(err)
+}
+
+fn remove_if_exists(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn rename_if_exists(from: &Path, to: &Path) -> std::io::Result<()> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 pub struct AsyncFileSink {
     path: String,
-    out_io: tokio::fs::File,
+    /// 当前活动文件句柄；滚动时先关闭再重命名（Windows 不允许重命名已打开文件）。
+    out_io: Option<tokio::fs::File>,
     sync: bool,
     lock_released: bool,
     codec: Option<Box<dyn Encoder>>,
+    /// 保留 codec 配置，滚动后用于重建编码器（压缩/加密流不能跨文件）。
+    codec_cfg: Option<CodecConfig>,
+    /// 单文件最大字节数；`None` 表示不限制、不滚动。
+    max_size: Option<u64>,
+    /// 保留的滚动文件个数（不含当前文件）。
+    max_rolls: u32,
+    /// 滚动归档的压缩方式。
+    roll_compress: RollCompress,
+    /// 当前文件已写入（编码后）字节数。
+    written: u64,
 }
 
 impl Drop for AsyncFileSink {
@@ -192,25 +489,200 @@ impl AsyncFileSink {
         {
             fs::create_dir_all(parent).source_err(SinkReason::Sink, "create output dir")?;
         }
-        let out_io = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(out_path)
-            .await
-            .source_err(SinkReason::Sink, "open output file")?;
+        let out_io = open_append(out_path).await?;
+        // 续写已有文件时，容量从当前大小起算。
+        let written = out_io.metadata().await.map(|m| m.len()).unwrap_or(0);
         Ok(Self {
             path: out_path.to_string(),
-            out_io,
+            out_io: Some(out_io),
             sync,
             lock_released: !out_path.ends_with(".lock"),
             codec: None,
+            codec_cfg: None,
+            max_size: None,
+            max_rolls: DEFAULT_MAX_ROLLS,
+            roll_compress: RollCompress::None,
+            written,
         })
     }
 
+    /// 设置滚动归档的压缩方式（`none` / `gzip` / `zip`）。
+    pub fn with_roll_compress(mut self, roll_compress: RollCompress) -> Self {
+        self.roll_compress = roll_compress;
+        self
+    }
+
+    /// 配置容量上限与滚动保留个数；`max_size = None` 表示不限容量。
+    pub fn with_roll(mut self, max_size: Option<u64>, max_rolls: u32) -> Self {
+        self.max_size = max_size.filter(|v| *v > 0);
+        self.max_rolls = max_rolls;
+        self
+    }
+
     /// 附加压缩/加密编码器；后续写入会先 `encode` 再落盘。
+    ///
+    /// 注意：仅注入编码器无法在滚动时重建（压缩/加密流不能跨文件），
+    /// 需要滚动时请用 [`Self::with_codec_config`]。
     pub fn with_codec(mut self, codec: Option<Box<dyn Encoder>>) -> Self {
         self.codec = codec;
+        self.codec_cfg = None;
         self
+    }
+
+    /// 按 codec 配置构建编码器并保留配置，使滚动后能重新开一个完整编码流。
+    pub fn with_codec_config(mut self, cfg: CodecConfig) -> SinkResult<Self> {
+        self.codec = cfg
+            .build_encoder()
+            .map_err(|e| sink_err("codec build fail", e))?;
+        self.codec_cfg = Some(cfg);
+        Ok(self)
+    }
+
+    /// 单文件最大字节数；`None` 表示不限容量。
+    pub fn max_size(&self) -> Option<u64> {
+        self.max_size
+    }
+
+    /// 保留的滚动文件个数（不含当前文件）。
+    pub fn max_rolls(&self) -> u32 {
+        self.max_rolls
+    }
+
+    /// 滚动归档的压缩方式。
+    pub fn roll_compress(&self) -> RollCompress {
+        self.roll_compress
+    }
+
+    fn file_mut(&mut self) -> SinkResult<&mut tokio::fs::File> {
+        self.out_io.as_mut().ok_or_else(|| {
+            sink_err(
+                "file sink closed",
+                std::io::Error::new(ErrorKind::BrokenPipe, "file sink handle closed"),
+            )
+        })
+    }
+
+    /// 写入 `incoming` 字节后是否会超过单文件上限（空文件不滚动，避免小上限下反复空转）。
+    fn should_roll(&self, incoming: u64) -> bool {
+        match self.max_size {
+            Some(max) if self.written > 0 => self.written.saturating_add(incoming) > max,
+            _ => false,
+        }
+    }
+
+    /// 滚动：收尾当前文件 → 按序号挪动历史文件 → 重建活动文件与编码流。
+    async fn rotate(&mut self) -> SinkResult<()> {
+        // 1. 冲刷 codec 尾部，让本文件成为完整的压缩/加密流
+        if let Some(codec) = &mut self.codec {
+            if self.codec_cfg.is_none() {
+                return Err(SinkReason::core_conf().to_err().with_detail(
+                    "file sink rolling requires codec config (use with_codec_config)",
+                ));
+            }
+            let mut tail = Vec::new();
+            codec
+                .finish(&mut tail)
+                .map_err(|e| sink_err("codec finish fail", e))?;
+            if !tail.is_empty() {
+                self.file_mut()?
+                    .write_all(&tail)
+                    .await
+                    .map_err(|e| sink_err("file out fail", e))?;
+            }
+        }
+
+        // 2. 关闭句柄后再重命名，兼容 Windows 的文件占用语义
+        if let Some(file) = self.out_io.take() {
+            file.sync_all()
+                .await
+                .map_err(|e| sink_err("file sync before roll fail", e))?;
+            drop(file);
+        }
+
+        // 3. 历史文件轮转：out.dat -> out.dat.1 -> out.dat.2 ...
+        //    配置了 roll_compress 时归档为 out.dat.1.gz / out.dat.1.zip
+        if let Err(err) = self.rotate_archives().await {
+            // 轮转失败不能让 sink 永久失活：尽力重新打开活动文件并校正字节计数
+            match open_append(&self.path).await {
+                Ok(file) => {
+                    self.written = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                    self.out_io = Some(file);
+                }
+                Err(reopen_err) => {
+                    log::error!(
+                        "file sink reopen after roll failure failed path='{}': {}",
+                        self.path,
+                        reopen_err
+                    );
+                }
+            }
+            return Err(err);
+        }
+
+        // 4. 重新打开空的活动文件，并重建 codec（新文件需要一个新流）
+        let file = open_append(&self.path).await?;
+        self.out_io = Some(file);
+        if let Some(cfg) = &self.codec_cfg {
+            self.codec = cfg
+                .build_encoder()
+                .map_err(|e| sink_err("codec build fail", e))?;
+        }
+        let rolled_bytes = self.written;
+        self.written = 0;
+        if self.max_rolls == 0 {
+            log::debug!(
+                "file sink rolled path='{}' bytes={} (max_rolls=0, old file discarded)",
+                self.path,
+                rolled_bytes
+            );
+        } else {
+            log::debug!(
+                "file sink rolled path='{}' archive='{}' bytes={} compress={:?}",
+                self.path,
+                rolled_path_with(Path::new(&self.path), 1, self.roll_compress).display(),
+                rolled_bytes,
+                self.roll_compress
+            );
+        }
+        Ok(())
+    }
+
+    /// 历史文件轮转 + （可选）归档压缩。
+    async fn rotate_archives(&mut self) -> SinkResult<()> {
+        let path = PathBuf::from(&self.path);
+        if self.max_rolls == 0 {
+            remove_if_exists(&path).map_err(|e| sink_err("file roll fail", e))?;
+            return Ok(());
+        }
+        shift_archives(&path, self.max_rolls).map_err(|e| sink_err("file roll fail", e))?;
+
+        if self.roll_compress == RollCompress::None {
+            return rename_if_exists(&path, &rolled_path_with(&path, 1, RollCompress::None))
+                .map_err(|e| sink_err("file roll fail", e));
+        }
+
+        let compress = self.roll_compress;
+        let dst = rolled_path_with(&path, 1, compress);
+        let (src_bg, dst_bg) = (path.clone(), dst.clone());
+        // 大文件压缩是阻塞 IO，放到 blocking 线程池，不卡异步运行时
+        let result =
+            tokio::task::spawn_blocking(move || archive_file(&src_bg, &dst_bg, compress)).await;
+        let plain_fallback = |cause: &dyn std::fmt::Display| -> SinkResult<()> {
+            // 压缩失败不能丢数据：回退为不压缩归档
+            log::warn!(
+                "file sink compress rolled file '{}' failed: {}; fallback to plain archive",
+                dst.display(),
+                cause
+            );
+            let _ = remove_if_exists(&dst);
+            rename_if_exists(&path, &rolled_path_with(&path, 1, RollCompress::None))
+                .map_err(|e| sink_err("file roll fallback fail", e))
+        };
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => plain_fallback(&err),
+            Err(err) => plain_fallback(&err),
+        }
     }
 
     fn unlock_lockfile(&mut self) -> std::io::Result<()> {
@@ -236,27 +708,30 @@ impl AsyncFileSink {
         }
     }
 
-    /// 统一写入入口：有 codec 先编码再写文件，`sync` 时逐次 `sync_all`。
+    /// 统一写入入口：有 codec 先编码再写文件；超过单文件上限时先滚动。
     async fn write_bytes(&mut self, data: &[u8]) -> SinkResult<()> {
-        if let Some(codec) = &mut self.codec {
-            let mut encoded = Vec::new();
-            codec
-                .encode(data, &mut encoded)
-                .map_err(|e| sink_err("codec encode fail", e))?;
-            if !encoded.is_empty() {
-                self.out_io
-                    .write_all(&encoded)
-                    .await
-                    .map_err(|e| sink_err("file out fail", e))?;
+        let mut encoded = Vec::new();
+        let payload: &[u8] = match &mut self.codec {
+            Some(codec) => {
+                codec
+                    .encode(data, &mut encoded)
+                    .map_err(|e| sink_err("codec encode fail", e))?;
+                &encoded
             }
-        } else {
-            self.out_io
-                .write_all(data)
+            None => data,
+        };
+        if !payload.is_empty() {
+            if self.should_roll(payload.len() as u64) {
+                self.rotate().await?;
+            }
+            self.file_mut()?
+                .write_all(payload)
                 .await
                 .map_err(|e| sink_err("file out fail", e))?;
+            self.written = self.written.saturating_add(payload.len() as u64);
         }
         if self.sync {
-            self.out_io
+            self.file_mut()?
                 .sync_all()
                 .await
                 .map_err(|e| sink_err("file sync fail", e))?;
@@ -276,13 +751,13 @@ impl AsyncCtrl for AsyncFileSink {
                 .finish(&mut tail)
                 .map_err(|e| sink_err("codec finish fail", e))?;
             if !tail.is_empty() {
-                self.out_io
+                self.file_mut()?
                     .write_all(&tail)
                     .await
                     .map_err(|e| sink_err("file out fail", e))?;
             }
         }
-        self.out_io
+        self.file_mut()?
             .sync_all()
             .await
             .map_err(|e| sink_err("file sync on stop fail", e))?;
@@ -898,6 +1373,429 @@ mod tests {
             lock_path,
             PathBuf::from("/tmp/demo/data/out_dat/sink/default-r2.dat.lock")
         );
+    }
+
+    fn tmp_dir(label: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("wp_file_{label}_{ts}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mk_file_spec(params: &[(&str, serde_json::Value)]) -> ResolvedSinkSpec {
+        let mut map = wp_connector_api::ParamMap::new();
+        for (k, v) in params {
+            map.insert((*k).to_string(), v.clone());
+        }
+        ResolvedSinkSpec {
+            group: "g".into(),
+            name: "file_demo".into(),
+            kind: "file".into(),
+            connector_id: "file_json_sink".into(),
+            params: map,
+            filter: None,
+        }
+    }
+
+    /// 无归档压缩时的历史文件路径。
+    fn rolled(path: &Path, index: u32) -> PathBuf {
+        rolled_path_with(path, index, RollCompress::None)
+    }
+
+    #[test]
+    fn file_spec_parses_roll_params() {
+        let spec = mk_file_spec(&[
+            ("max_size", serde_json::json!("10MB")),
+            ("max_rolls", serde_json::json!(5)),
+        ]);
+        let resolved = FileSinkSpec::from_resolved("file", &spec).expect("valid roll params");
+        assert_eq!(resolved.max_size(), Some(10 * 1024 * 1024));
+        assert_eq!(resolved.max_rolls(), 5);
+
+        // 未配置容量：不限制，滚动个数仍是默认值
+        let plain = FileSinkSpec::from_resolved("file", &mk_file_spec(&[])).unwrap();
+        assert_eq!(plain.max_size(), None);
+        assert_eq!(plain.max_rolls(), DEFAULT_MAX_ROLLS);
+
+        // max_size = 0 等价于不限制
+        let unlimited = FileSinkSpec::from_resolved(
+            "file",
+            &mk_file_spec(&[("max_size", serde_json::json!(0))]),
+        )
+        .unwrap();
+        assert_eq!(unlimited.max_size(), None);
+    }
+
+    #[test]
+    fn file_spec_rejects_invalid_roll_params() {
+        let bad_size = FileSinkSpec::from_resolved(
+            "file",
+            &mk_file_spec(&[("max_size", serde_json::json!("10XB"))]),
+        );
+        assert!(bad_size.is_err(), "unknown size unit should be rejected");
+
+        let no_size = FileSinkSpec::from_resolved(
+            "file",
+            &mk_file_spec(&[("max_rolls", serde_json::json!(3))]),
+        );
+        assert!(
+            no_size.is_err(),
+            "max_rolls without max_size should be rejected"
+        );
+
+        let too_many = FileSinkSpec::from_resolved(
+            "file",
+            &mk_file_spec(&[
+                ("max_size", serde_json::json!(1024)),
+                ("max_rolls", serde_json::json!(MAX_ROLLS_LIMIT + 1)),
+            ]),
+        );
+        assert!(too_many.is_err(), "max_rolls over limit should be rejected");
+    }
+
+    #[test]
+    fn rolled_path_keeps_lock_suffix_last() {
+        assert_eq!(
+            rolled(Path::new("/tmp/a/out.dat"), 1),
+            PathBuf::from("/tmp/a/out.dat.1")
+        );
+        assert_eq!(
+            rolled(Path::new("/tmp/a/out.dat.lock"), 2),
+            PathBuf::from("/tmp/a/out.dat.2.lock")
+        );
+        assert_eq!(
+            rolled_path_with(Path::new("/tmp/a/out.dat.lock"), 3, RollCompress::Gzip),
+            PathBuf::from("/tmp/a/out.dat.3.gz.lock")
+        );
+        assert_eq!(
+            rolled_path_with(Path::new("/tmp/a/out.dat"), 1, RollCompress::Zip),
+            PathBuf::from("/tmp/a/out.dat.1.zip")
+        );
+    }
+
+    /// 8 条 11 字节记录、上限 25 字节：每个文件 2 条，滚动 3 次后只保留 `.1`~`.3`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_sink_rolls_by_size_and_keeps_max_rolls() -> anyhow::Result<()> {
+        use wp_connector_api::{AsyncCtrl, AsyncRawDataSink};
+
+        let dir = tmp_dir("roll_size");
+        let path = dir.join("roll.dat");
+        let mut sink = AsyncFileSink::with_sync(path.to_string_lossy().as_ref(), false)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_roll(Some(25), 3);
+
+        for _ in 0..8 {
+            AsyncRawDataSink::sink_str(&mut sink, "0123456789")
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        AsyncCtrl::stop(&mut sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        assert_eq!(fs::read_to_string(&path)?.lines().count(), 2);
+        let mut total = 2;
+        for idx in 1..=3 {
+            let archived = rolled(&path, idx);
+            let body = fs::read_to_string(&archived)
+                .map_err(|e| anyhow::anyhow!("read {archived:?}: {e}"))?;
+            assert_eq!(body.lines().count(), 2, "{archived:?} should hold 2 lines");
+            total += 2;
+        }
+        assert!(!rolled(&path, 4).exists(), "keep only max_rolls files");
+        assert_eq!(total, 8, "no records lost across rolls");
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_sink_without_max_size_never_rolls() -> anyhow::Result<()> {
+        use wp_connector_api::{AsyncCtrl, AsyncRawDataSink};
+
+        let dir = tmp_dir("no_roll");
+        let path = dir.join("flat.dat");
+        let mut sink = AsyncFileSink::new(path.to_string_lossy().as_ref())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        for _ in 0..50 {
+            AsyncRawDataSink::sink_str(&mut sink, "0123456789")
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        AsyncCtrl::stop(&mut sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        assert_eq!(fs::read_to_string(&path)?.lines().count(), 50);
+        assert!(!rolled(&path, 1).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// 滚动时重建加密流：每个文件都必须能独立解密，且不出现明文。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_sink_roll_restarts_codec_stream() -> anyhow::Result<()> {
+        use wp_connector_api::{AsyncCtrl, AsyncRawDataSink};
+        use wp_connector_utils::codec::Cipher;
+
+        let dir = tmp_dir("roll_codec");
+        let path = dir.join("cipher.dat");
+        let mut params = wp_connector_api::ParamMap::new();
+        params.insert(
+            "encryption".into(),
+            serde_json::json!({"enabled": true, "algo": "aes-256-gcm", "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"}),
+        );
+        let cfg = CodecConfig::from_params(&params)?;
+        let mut sink = AsyncFileSink::with_sync(path.to_string_lossy().as_ref(), false)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_roll(Some(120), 5)
+            .with_codec_config(cfg.clone())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        for i in 0..12 {
+            AsyncRawDataSink::sink_str(&mut sink, &format!("record-{i:02}"))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        AsyncCtrl::stop(&mut sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let encrypt = wp_connector_utils::codec::EncryptConfig {
+            cipher: Cipher::Aes256Gcm,
+            key: (0u8..32).collect(),
+        };
+        let mut seen = Vec::new();
+        for file in [
+            path.clone(),
+            rolled(&path, 1),
+            rolled(&path, 2),
+            rolled(&path, 3),
+            rolled(&path, 4),
+            rolled(&path, 5),
+        ] {
+            let wire = fs::read(&file)?;
+            assert!(!wire.is_empty(), "{file:?} should not be empty");
+            assert!(
+                !wire.windows(b"record-".len()).any(|w| w == b"record-"),
+                "{file:?} should be ciphertext"
+            );
+            let mut decoder = wp_connector_utils::codec::build_decoder(None, Some(&encrypt))?;
+            let mut plain = Vec::new();
+            decoder.decode(&wire, &mut plain)?;
+            decoder.finish(&mut plain)?;
+            let text = String::from_utf8_lossy(&plain);
+            seen.extend(text.lines().map(|s| s.to_string()));
+        }
+        seen.sort();
+        let expected: Vec<String> = (0..12).map(|i| format!("record-{i:02}")).collect();
+        assert_eq!(seen, expected);
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn file_spec_parses_roll_compress() {
+        let spec = |value: serde_json::Value| {
+            mk_file_spec(&[
+                ("max_size", serde_json::json!(1024)),
+                ("roll_compress", value),
+            ])
+        };
+
+        let parse = |value: serde_json::Value| {
+            FileSinkSpec::from_resolved("file", &spec(value))
+                .map(|s| s.roll_compress())
+                .map_err(|_| ())
+        };
+
+        assert_eq!(parse(serde_json::json!("gzip")), Ok(RollCompress::Gzip));
+        assert_eq!(parse(serde_json::json!("GZ")), Ok(RollCompress::Gzip));
+        assert_eq!(parse(serde_json::json!("zip")), Ok(RollCompress::Zip));
+        assert_eq!(parse(serde_json::json!("none")), Ok(RollCompress::None));
+        assert_eq!(parse(serde_json::json!(true)), Ok(RollCompress::Gzip));
+        assert_eq!(parse(serde_json::json!(false)), Ok(RollCompress::None));
+        assert_eq!(parse(serde_json::json!("rar")), Err(()));
+
+        // 未开启滚动时配置归档压缩属于配置错误
+        let no_size = FileSinkSpec::from_resolved(
+            "file",
+            &mk_file_spec(&[("roll_compress", serde_json::json!("gzip"))]),
+        );
+        assert!(no_size.is_err());
+
+        // 默认不压缩
+        let plain = FileSinkSpec::from_resolved("file", &mk_file_spec(&[])).unwrap();
+        assert_eq!(plain.roll_compress(), RollCompress::None);
+    }
+
+    #[test]
+    fn shift_archives_moves_each_variant() {
+        let dir = tmp_dir("shift_variants");
+        let active = dir.join("mix.dat");
+        for variant in ROLL_VARIANTS {
+            fs::File::create(rolled_path_with(&active, 1, variant)).unwrap();
+        }
+
+        shift_archives(&active, 3).unwrap();
+
+        for variant in ROLL_VARIANTS {
+            assert!(!rolled_path_with(&active, 1, variant).exists());
+            assert!(
+                rolled_path_with(&active, 2, variant).exists(),
+                "{variant:?} archive should shift to .2"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 归档压缩为 gzip：历史文件是能直接 `gunzip` 的 `.gz`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_sink_roll_compresses_with_gzip() -> anyhow::Result<()> {
+        use std::io::Read as _;
+        use wp_connector_api::{AsyncCtrl, AsyncRawDataSink};
+
+        let dir = tmp_dir("roll_gzip");
+        let path = dir.join("gz.dat");
+        let mut sink = AsyncFileSink::new(path.to_string_lossy().as_ref())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_roll(Some(25), 2)
+            .with_roll_compress(RollCompress::Gzip);
+
+        for _ in 0..8 {
+            AsyncRawDataSink::sink_str(&mut sink, "0123456789")
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        AsyncCtrl::stop(&mut sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        assert_eq!(fs::read_to_string(&path)?.lines().count(), 2);
+        let mut total = 2;
+        for idx in 1..=2 {
+            let archived = rolled_path_with(&path, idx, RollCompress::Gzip);
+            assert!(archived.exists(), "missing {archived:?}");
+            assert!(
+                !rolled(&path, idx).exists(),
+                "should not leave plain archive"
+            );
+            let mut text = String::new();
+            flate2::read::GzDecoder::new(fs::File::open(&archived)?).read_to_string(&mut text)?;
+            assert_eq!(text.lines().count(), 2);
+            total += 2;
+        }
+        assert_eq!(total, 6, "8 records with keep=2 keeps the newest 6");
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// 归档压缩为 zip：历史文件是标准 zip，内含单个同名条目。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_sink_roll_compresses_with_zip() -> anyhow::Result<()> {
+        use std::io::Read as _;
+        use wp_connector_api::{AsyncCtrl, AsyncRawDataSink};
+
+        let dir = tmp_dir("roll_zip");
+        let path = dir.join("zd.dat");
+        let mut sink = AsyncFileSink::new(path.to_string_lossy().as_ref())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_roll(Some(25), 1)
+            .with_roll_compress(RollCompress::Zip);
+
+        for _ in 0..4 {
+            AsyncRawDataSink::sink_str(&mut sink, "0123456789")
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        AsyncCtrl::stop(&mut sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let archived = rolled_path_with(&path, 1, RollCompress::Zip);
+        assert!(archived.exists(), "missing {archived:?}");
+        let mut zip = zip::ZipArchive::new(fs::File::open(&archived)?)?;
+        assert_eq!(zip.len(), 1);
+        let mut text = String::new();
+        zip.by_index(0)?.read_to_string(&mut text)?;
+        assert_eq!(text.lines().count(), 2);
+        assert!(zip.by_name("zd.dat").is_ok(), "entry keeps the file name");
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// `max_rolls = 0`：滚动时直接丢弃旧文件，不留任何历史。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_sink_max_rolls_zero_discards_old_file() -> anyhow::Result<()> {
+        use wp_connector_api::{AsyncCtrl, AsyncRawDataSink};
+
+        let dir = tmp_dir("roll_zero");
+        let path = dir.join("zero.dat");
+        let mut sink = AsyncFileSink::new(path.to_string_lossy().as_ref())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_roll(Some(25), 0);
+
+        for _ in 0..4 {
+            AsyncRawDataSink::sink_str(&mut sink, "0123456789")
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        AsyncCtrl::stop(&mut sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        assert_eq!(fs::read_to_string(&path)?.lines().count(), 2);
+        for variant in ROLL_VARIANTS {
+            assert!(
+                !rolled_path_with(&path, 1, variant).exists(),
+                "{variant:?} archive should not exist when max_rolls = 0"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// 续写已有文件时，容量从文件现有大小起算，超限先归档旧内容再写。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_sink_resumes_existing_size_for_rolling() -> anyhow::Result<()> {
+        use wp_connector_api::{AsyncCtrl, AsyncRawDataSink};
+
+        let dir = tmp_dir("roll_resume");
+        let path = dir.join("resume.dat");
+        fs::write(&path, "0123456789\n0123456789\n")?;
+
+        let mut sink = AsyncFileSink::new(path.to_string_lossy().as_ref())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_roll(Some(25), 3);
+        AsyncRawDataSink::sink_str(&mut sink, "0123456789")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        AsyncCtrl::stop(&mut sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        assert_eq!(fs::read_to_string(&path)?.lines().count(), 1);
+        assert_eq!(fs::read_to_string(rolled(&path, 1))?.lines().count(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     // ---- ArrowFileSink tests ----

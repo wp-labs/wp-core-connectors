@@ -53,6 +53,17 @@ impl SinkFactory for FileFactory {
                             .to_err()
                             .with_detail("arrow file sink requires 'file' param")
                     })?;
+                // 滚动（max_size/max_rolls/roll_compress）目前只支持 txt 协议
+                let rolling_requested = super::file::parse_max_size(spec.params.get("max_size"))?
+                    .is_some()
+                    || spec.params.contains_key("max_rolls")
+                    || super::file::RollCompress::parse(spec.params.get("roll_compress"))?
+                        != super::file::RollCompress::None;
+                if rolling_requested {
+                    return Err(SinkReason::core_conf().to_err().with_detail(
+                        "max_size/max_rolls/roll_compress rolling is only supported for protocol = \"txt\"",
+                    ));
+                }
                 // Validate data_format if provided
                 if let Some(df) = spec.params.get("data_format").and_then(|v| v.as_str())
                     && !matches!(df, "arrow_framed" | "arrow_ipc")
@@ -108,14 +119,12 @@ impl SinkFactory for FileFactory {
                 let path = resolved.resolve_path(ctx);
                 let fmt = resolved.text_fmt();
                 let sync = resolved.sync();
-                let codec = resolved
-                    .codec()
-                    .build_encoder()
-                    .map_err(|e| SinkReason::Sink.to_err().with_detail(e.to_string()))?;
                 let sink = AsyncFileSink::with_sync(&path, sync)
                     .await
                     .source_err(SinkReason::Sink, "file sink open")?
-                    .with_codec(codec);
+                    .with_roll(resolved.max_size(), resolved.max_rolls())
+                    .with_roll_compress(resolved.roll_compress())
+                    .with_codec_config(resolved.codec().clone())?;
                 Box::new(FormattedFileSink::new(fmt, sink))
             }
             other => {
@@ -137,5 +146,67 @@ impl SinkDefProvider for FileFactory {
 
     fn sink_defs(&self) -> Vec<ConnectorDef> {
         crate::builtin::sink_defs_by_kind(self.kind())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn mk_spec(params: &[(&str, serde_json::Value)]) -> SinkSpec {
+        let mut map = wp_connector_api::ParamMap::new();
+        for (k, v) in params {
+            map.insert((*k).to_string(), v.clone());
+        }
+        SinkSpec {
+            group: "g".into(),
+            name: "file_demo".into(),
+            kind: "file".into(),
+            connector_id: "file_json_sink".into(),
+            params: map,
+            filter: None,
+        }
+    }
+
+    #[test]
+    fn txt_protocol_accepts_rolling_params() {
+        let factory = FileFactory;
+        let spec = mk_spec(&[
+            ("base", json!("./out")),
+            ("file", json!("a.json")),
+            ("max_size", json!("10MB")),
+            ("max_rolls", json!(5)),
+            ("roll_compress", json!("zip")),
+        ]);
+        assert!(factory.validate_spec(&spec).is_ok());
+    }
+
+    #[test]
+    fn arrow_protocol_rejects_rolling_params() {
+        let factory = FileFactory;
+        let base: &[(&str, serde_json::Value)] =
+            &[("protocol", json!("arrow")), ("file", json!("out.arrow"))];
+        assert!(factory.validate_spec(&mk_spec(base)).is_ok());
+
+        for extra in [
+            ("max_size", json!(1024)),
+            ("max_rolls", json!(3)),
+            ("roll_compress", json!("gzip")),
+        ] {
+            let mut params = base.to_vec();
+            params.push(extra.clone());
+            assert!(
+                factory.validate_spec(&mk_spec(&params)).is_err(),
+                "arrow sink should reject {extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn txt_protocol_rejects_roll_compress_without_max_size() {
+        let factory = FileFactory;
+        let spec = mk_spec(&[("file", json!("a.json")), ("roll_compress", json!("gzip"))]);
+        assert!(factory.validate_spec(&spec).is_err());
     }
 }
