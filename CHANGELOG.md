@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.5] - 2026-11-14
+
+### Changed
+
+- 适配新版 clippy 的 `needless_bool` 检查，无行为变化。
+
 ## [0.11.4] - 2026-11-14
 
 ### Fixed

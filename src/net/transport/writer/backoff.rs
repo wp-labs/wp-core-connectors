@@ -50,10 +50,7 @@ impl NetWriter {
             self.emergency_sleep_if_needed(pct, avg, sndbuf_cap).await;
             return true;
         }
-        if avg >= (sndbuf_cap / 8) {
-            return true;
-        }
-        false
+        avg >= (sndbuf_cap / 8)
     }
 
     /// 小包紧急微退让：仅在明显拥塞时触发，避免对端复位/中止。
