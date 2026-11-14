@@ -16,6 +16,8 @@ use wp_model_core::model::fmt_def::TextFmt;
 use crate::net::transport::{BackoffMode, NetSendPolicy, NetWriter, net_backoff_adaptive};
 use crate::net::{CodecConfig, TlsConfig};
 
+use super::link_recovery::{BACKOFF_INITIAL, BACKOFF_MAX, LinkRecovery, RECONNECT_TIMEOUT};
+
 use super::arrow_conv::{
     data_record_to_batch, data_records_to_batch, encode_batch_ipc_stream, encode_ipc_frame,
     infer_schema_from_record,
@@ -132,6 +134,10 @@ pub struct TcpSink {
     sent_cnt: u64,
     tls: Option<TlsConfig>,
     codec: CodecConfig,
+    /// 链路失效后的退避重连状态。
+    recovery: LinkRecovery,
+    /// 单次重连的超时（测试中可缩小）。
+    reconnect_timeout: Duration,
 }
 
 impl TcpSink {
@@ -181,13 +187,58 @@ impl TcpSink {
             sent_cnt: 0,
             tls: spec.tls.clone(),
             codec: spec.codec.clone(),
+            recovery: LinkRecovery::default(),
+            reconnect_timeout: RECONNECT_TIMEOUT,
         })
+    }
+
+    /// 写入一段已在 framing 层编码好的 payload。
+    ///
+    /// 连接失效后（典型场景：接收端重启）不再复用过期的 socket，到期先重建连接再写。
+    async fn send_payload(&mut self, payload: &[u8]) -> SinkResult<()> {
+        if let Some(err) = self.recovery.gate_error() {
+            return Err(err);
+        }
+        if self.recovery.is_down() {
+            <Self as AsyncCtrl>::reconnect(self).await?;
+        }
+
+        match self.writer.write(payload).await {
+            Ok(()) => {
+                if self.recovery.is_down() {
+                    self.recovery.on_connected();
+                    log::info!("tcp sink send recovered: target={}", self.target_addr);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if self.writer.is_broken() {
+                    self.recovery.on_failure();
+                    let retry_ms = self.recovery.backoff().map(|b| b.as_millis()).unwrap_or(0);
+                    log::warn!(
+                        "tcp sink connection lost: target={} retry_in={}ms err={}",
+                        self.target_addr,
+                        retry_ms,
+                        e
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 }
 
 #[async_trait]
 impl AsyncCtrl for TcpSink {
     async fn stop(&mut self) -> SinkResult<()> {
+        // 连接已失效：codec 尾部无法投递，close_notify / 排空也只会再报一次错，直接释放。
+        if self.writer.is_broken() {
+            log::debug!(
+                "tcp sink stop with broken connection: target={}",
+                self.target_addr
+            );
+            return Ok(());
+        }
         // Gracefully shutdown write side so peer can drain
         self.writer.shutdown().await?;
         // Best-effort kernel send-queue drain, capped 10s
@@ -197,36 +248,59 @@ impl AsyncCtrl for TcpSink {
         Ok(())
     }
     async fn reconnect(&mut self) -> SinkResult<()> {
-        let _ = self.writer.shutdown().await;
-        let mut writer = match &self.tls {
-            Some(tls) => NetWriter::connect_tcp_tls(&self.target_addr, &self.host, tls)
-                .await
-                .source_err(SinkReason::Sink, "tcp sink reconnect tls")?,
-            None => {
-                let mode = if self.rate_limit_rps == 0 {
-                    BackoffMode::ForceOn
-                } else {
-                    BackoffMode::ForceOff
-                };
-                NetWriter::connect_tcp_with_policy(
-                    &self.target_addr,
-                    NetSendPolicy {
-                        rate_limit_rps: self.rate_limit_rps,
-                        backoff_mode: mode,
-                        adaptive: net_backoff_adaptive(),
-                    },
-                )
-                .await
-                .source_err(SinkReason::Sink, "tcp sink reconnect tcp")?
+        // 连接已失效时无需再尝试优雅关闭（对端已不在，close_notify 只会再报一次错）。
+        if !self.writer.is_broken() {
+            let _ = self.writer.shutdown().await;
+        }
+        let phase: &'static str = if self.tls.is_some() { "tls" } else { "tcp" };
+        let connect = async {
+            match &self.tls {
+                Some(tls) => NetWriter::connect_tcp_tls(&self.target_addr, &self.host, tls).await,
+                None => {
+                    let mode = if self.rate_limit_rps == 0 {
+                        BackoffMode::ForceOn
+                    } else {
+                        BackoffMode::ForceOff
+                    };
+                    NetWriter::connect_tcp_with_policy(
+                        &self.target_addr,
+                        NetSendPolicy {
+                            rate_limit_rps: self.rate_limit_rps,
+                            backoff_mode: mode,
+                            adaptive: net_backoff_adaptive(),
+                        },
+                    )
+                    .await
+                }
             }
         };
-        writer = writer.with_codec(
-            self.codec
-                .build_encoder()
-                .map_err(|e| SinkReason::Sink.to_err().with_detail(e.to_string()))?,
-        );
+        let mut writer = match tokio::time::timeout(self.reconnect_timeout, connect).await {
+            Ok(Ok(w)) => w,
+            Ok(Err(e)) => {
+                self.recovery.on_failure();
+                return Err::<(), _>(e)
+                    .source_err(SinkReason::Sink, format!("tcp sink reconnect {phase}"));
+            }
+            Err(_) => {
+                self.recovery.on_failure();
+                return Err(SinkReason::Sink.to_err().with_detail(format!(
+                    "tcp sink reconnect {phase} timeout after {}ms",
+                    self.reconnect_timeout.as_millis()
+                )));
+            }
+        };
+        let codec = match self.codec.build_encoder() {
+            Ok(codec) => codec,
+            Err(e) => {
+                // 编解码器构建失败也算本次重连失败，避免每次发送都重新建连。
+                self.recovery.on_failure();
+                return Err(SinkReason::Sink.to_err().with_detail(e.to_string()));
+            }
+        };
+        writer = writer.with_codec(codec);
         log::info!("tcp sink reconnected: target={}", self.target_addr);
         self.writer = writer;
+        self.recovery.on_connected();
         Ok(())
     }
 }
@@ -279,7 +353,7 @@ impl AsyncRawDataSink for TcpSink {
                 );
             }
         }
-        self.writer.write(&payload).await?;
+        self.send_payload(&payload).await?;
         self.sent_cnt = self.sent_cnt.saturating_add(1);
         Ok(())
     }
@@ -292,7 +366,7 @@ impl AsyncRawDataSink for TcpSink {
                 payload.len(),
             );
         }
-        self.writer.write(&payload).await?;
+        self.send_payload(&payload).await?;
         self.sent_cnt = self.sent_cnt.saturating_add(1);
         Ok(())
     }
@@ -323,7 +397,7 @@ impl AsyncRawDataSink for TcpSink {
                 }
 
                 // 一次性发送所有数据
-                self.writer.write(&buffer).await?;
+                self.send_payload(&buffer).await?;
                 self.sent_cnt = self.sent_cnt.saturating_add(1);
             }
             Framing::Len => {
@@ -341,7 +415,7 @@ impl AsyncRawDataSink for TcpSink {
                     combined.extend_from_slice(&buffer);
                 }
 
-                self.writer.write(&combined).await?;
+                self.send_payload(&combined).await?;
                 self.sent_cnt = self.sent_cnt.saturating_add(data.len() as u64);
             }
         }
@@ -372,7 +446,7 @@ impl AsyncRawDataSink for TcpSink {
                     }
                 }
 
-                self.writer.write(&buffer).await?;
+                self.send_payload(&buffer).await?;
                 self.sent_cnt = self.sent_cnt.saturating_add(1);
             }
             Framing::Len => {
@@ -380,7 +454,7 @@ impl AsyncRawDataSink for TcpSink {
                 for bytes_data in &data {
                     combined.extend_from_slice(&build_payload_bytes(bytes_data, self.framing));
                 }
-                self.writer.write(&combined).await?;
+                self.send_payload(&combined).await?;
                 self.sent_cnt = self.sent_cnt.saturating_add(data.len() as u64);
             }
         }
@@ -517,9 +591,6 @@ fn build_payload_bytes(data: &[u8], framing: Framing) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // TcpArrowSink — Arrow IPC Stream over TCP
 // ---------------------------------------------------------------------------
-
-const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
-const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 enum ConnState {
     Connected {
@@ -1000,6 +1071,415 @@ mod tests {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let body = srv.await.unwrap();
         assert_eq!(body, b"5 hello");
+        Ok(())
+    }
+
+    /// 接收端重启（监听器关闭后重新绑定同一端口）后，发送端不重建进程也能自愈。
+    ///
+    /// 回归 `warp-parse#374`：`drop_when_error` 模式下 wp-motor 不会把 sink 交给维护
+    /// 线程重连，若 connector 自身不重建连接，旧 socket 会一直报错。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_sink_reconnects_after_peer_restart() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+
+        // 第一阶段：接收一条数据后关闭连接与监听器，模拟接收端进程退出。
+        let first = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).await.unwrap();
+            let out = buf[..n].to_vec();
+            drop(s);
+            drop(listener);
+            out
+        });
+
+        let spec = TcpSinkSpec {
+            addr: "127.0.0.1".into(),
+            port,
+            framing: Framing::Line,
+            fmt: TextFmt::Raw,
+            tls: None,
+            codec: CodecConfig::default(),
+        };
+        let mut sink = TcpSink::connect(&spec, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        sink.sink_str("first")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(first.await?, b"first\n".to_vec());
+
+        // 旧连接失效：FIN/RST 生效有先后，多写几次直到观测到失败。
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if sink.sink_str("probe").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("peer close should surface as a send error");
+        assert!(
+            sink.recovery.is_down(),
+            "send failure must put the sink into reconnect mode"
+        );
+        let backoff_before = sink.recovery.backoff().expect("backoff must be recorded");
+
+        // 对端仍未恢复：退避到期后的重连失败，保持 down 状态且退避翻倍。
+        sink.recovery.force_due();
+        sink.sink_str("still-down")
+            .await
+            .expect_err("reconnect must fail while the peer is down");
+        assert!(
+            sink.recovery.is_down(),
+            "failed reconnect must keep the sink in recovery state"
+        );
+        let backoff_after = sink.recovery.backoff().expect("backoff must be recorded");
+        assert!(
+            backoff_after > backoff_before,
+            "failed reconnect must grow backoff: {backoff_before:?} -> {backoff_after:?}"
+        );
+        assert!(!sink.recovery.is_due(), "retry must not be due immediately");
+
+        // 第二阶段：接收端在同一端口重新监听。
+        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+        let second = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).await.unwrap();
+            buf[..n].to_vec()
+        });
+
+        // 接收端已恢复，但仍在退避窗口内：不得建连（否则测试里的 server 会先收到 too-early）。
+        sink.recovery.force_delay(Duration::from_secs(60));
+        let early = sink
+            .sink_str("too-early")
+            .await
+            .expect_err("backoff window must reject immediate retry");
+        assert!(
+            early.to_string().contains("reconnect in"),
+            "unexpected error: {early}"
+        );
+
+        // 退避到期：下一次写入先重连再发送，成功后清除重连状态。
+        sink.recovery.force_due();
+        sink.sink_str("after-restart")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(second.await?, b"after-restart\n".to_vec());
+        assert!(
+            !sink.recovery.is_down(),
+            "reconnect should clear retry state"
+        );
+        Ok(())
+    }
+
+    /// TLS 版本：接收端重启后，发送端按退避重建 TLS 连接并继续发送。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_sink_reconnects_over_tls_after_peer_restart() -> anyhow::Result<()> {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem())?;
+        std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+
+        let server_tls = TlsConfig {
+            cert: Some(cert_path.to_string_lossy().into_owned()),
+            key: Some(key_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls.build_server_config()?).clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+
+        let first_acceptor = acceptor.clone();
+        let first = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = first_acceptor.accept(stream).await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).await.unwrap();
+            let out = buf[..n].to_vec();
+            drop(tls);
+            drop(listener);
+            out
+        });
+
+        let spec = TcpSinkSpec {
+            addr: "127.0.0.1".into(),
+            port,
+            framing: Framing::Line,
+            fmt: TextFmt::Raw,
+            tls: Some(TlsConfig {
+                insecure: true,
+                ..Default::default()
+            }),
+            codec: CodecConfig::default(),
+        };
+        let mut sink = TcpSink::connect(&spec, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        sink.sink_str("first")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(first.await?, b"first\n".to_vec());
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if sink.sink_str("probe").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("peer close should surface as a tls send error");
+        assert!(sink.recovery.is_down());
+
+        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+        let second = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).await.unwrap();
+            buf[..n].to_vec()
+        });
+
+        sink.recovery.force_due();
+        sink.sink_str("after-restart")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(second.await?, b"after-restart\n".to_vec());
+        assert!(!sink.recovery.is_down());
+        Ok(())
+    }
+
+    /// TLS 握手被卡住（对端只 accept、不回 ServerHello）时，重连必须按超时失败
+    /// 并继续退避，而不是把发送路径挂死。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_sink_tls_reconnect_times_out_on_stalled_handshake() -> anyhow::Result<()> {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem())?;
+        std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+
+        let server_tls = TlsConfig {
+            cert: Some(cert_path.to_string_lossy().into_owned()),
+            key: Some(key_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls.build_server_config()?).clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+
+        let first_acceptor = acceptor.clone();
+        let first = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = first_acceptor.accept(stream).await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).await.unwrap();
+            let out = buf[..n].to_vec();
+            drop(tls);
+            drop(listener);
+            out
+        });
+
+        let spec = TcpSinkSpec {
+            addr: "127.0.0.1".into(),
+            port,
+            framing: Framing::Line,
+            fmt: TextFmt::Raw,
+            tls: Some(TlsConfig {
+                insecure: true,
+                ..Default::default()
+            }),
+            codec: CodecConfig::default(),
+        };
+        let mut sink = TcpSink::connect(&spec, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        sink.sink_str("first")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(first.await?, b"first\n".to_vec());
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if sink.sink_str("probe").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("peer close should surface as a tls send error");
+
+        // 黑洞对端：accept 后不回 TLS 握手，也不主动关闭，直到测试显式释放。
+        let blackhole = TcpListener::bind(("127.0.0.1", port)).await?;
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let stall = tokio::spawn(async move {
+            let (stream, _) = blackhole.accept().await.unwrap();
+            let _ = release_rx.await;
+            drop(stream);
+            drop(blackhole);
+        });
+
+        sink.reconnect_timeout = Duration::from_millis(100);
+        sink.recovery.force_due();
+        let err = sink
+            .sink_str("stalled")
+            .await
+            .expect_err("stalled TLS handshake must hit the reconnect timeout");
+        assert!(
+            err.to_string().contains("timeout"),
+            "unexpected error: {err}"
+        );
+        assert!(sink.recovery.is_down());
+        assert!(sink.recovery.backoff().is_some());
+
+        // 超时同样要退避，不能立即重新撞黑洞对端。
+        sink.recovery.force_delay(Duration::from_secs(60));
+        let early = sink
+            .sink_str("too-early")
+            .await
+            .expect_err("timeout must still respect backoff");
+        assert!(
+            early.to_string().contains("reconnect in"),
+            "unexpected error: {early}"
+        );
+
+        // 释放黑洞并恢复真实接收端，验证超时后仍能自愈（恢复阶段用默认超时，避免测试受机器负载影响）。
+        sink.reconnect_timeout = RECONNECT_TIMEOUT;
+        let _ = release_tx.send(());
+        stall.await.unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+        let second = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).await.unwrap();
+            buf[..n].to_vec()
+        });
+        sink.recovery.force_due();
+        sink.sink_str("after-restart")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(second.await?, b"after-restart\n".to_vec());
+        assert!(!sink.recovery.is_down());
+        Ok(())
+    }
+
+    /// 批量写入路径（`sink_str_batch`）同样走自动重连，而不是只在单条路径生效。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_sink_batch_recovers_after_peer_restart() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+
+        let first = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).await.unwrap();
+            let out = buf[..n].to_vec();
+            drop(s);
+            drop(listener);
+            out
+        });
+
+        let spec = TcpSinkSpec {
+            addr: "127.0.0.1".into(),
+            port,
+            framing: Framing::Line,
+            fmt: TextFmt::Raw,
+            tls: None,
+            codec: CodecConfig::default(),
+        };
+        let mut sink = TcpSink::connect(&spec, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        sink.sink_str_batch(vec!["a", "b"])
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(first.await?, b"a\nb\n".to_vec());
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if sink.sink_str("probe").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("peer close should surface as a send error");
+
+        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+        let second = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).await.unwrap();
+            buf[..n].to_vec()
+        });
+
+        sink.recovery.force_due();
+        sink.sink_str_batch(vec!["c", "d"])
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert_eq!(second.await?, b"c\nd\n".to_vec());
+        assert!(!sink.recovery.is_down());
+        Ok(())
+    }
+
+    /// 链路已坏时 `stop()` 直接释放，不得因为 close_notify / 排空失败而报错。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_sink_stop_is_ok_when_connection_broken() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+
+        // 接收端只 accept 不读取就关闭：客户端写入会受到 RST/EPIPE。
+        let srv = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            drop(s);
+            drop(listener);
+        });
+
+        let spec = TcpSinkSpec {
+            addr: "127.0.0.1".into(),
+            port,
+            framing: Framing::Line,
+            fmt: TextFmt::Raw,
+            tls: None,
+            codec: CodecConfig::default(),
+        };
+        let mut sink = TcpSink::connect(&spec, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert!(!sink.writer.is_broken());
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if sink.sink_str("probe").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("peer close should surface as a send error");
+        assert!(
+            sink.writer.is_broken(),
+            "failed transport write must mark the writer broken"
+        );
+
+        <TcpSink as AsyncCtrl>::stop(&mut sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        srv.await.unwrap();
         Ok(())
     }
 

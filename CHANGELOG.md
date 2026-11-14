@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.4] - 2026-11-14
+
+### Fixed
+
+- **TCP/TLS sink 在对端重启后不会自动重连**（warp-parse#374）：`NetWriter` 写失败（`tcp send error` / `tls send error`）后旧 socket 已不可用，但 `TcpSink` 之前只在外部维护线程调用 `reconnect()` 时才重建连接；`drop_when_error = true` 时 wp-motor 不会触发该路径，发送端会持续报错并累计丢弃，直到进程重启。现在 `TcpSink` 在传输层写失败后进入退避重连状态（1s 起、指数退避至 30s），下一次发送前自动重建 TCP/TLS 连接（含 codec），恢复后无需重启发送端；重连建连（含 TLS 握手）有 5s 超时，避免网络黑洞把发送路径挂住；链路已坏时 `stop()` 直接释放，不再因 close_notify / 排空失败而报错。新增 `NetWriter::is_broken()`，用于区分连接错误与 codec 编码错误（UDP 无连接语义，不置位）。
+- **`syslog` TCP sink 无法恢复断链**：`SyslogSink::reconnect()` 之前是空实现，`syslog` + TCP + `drop_when_error` 同样会永久失败。现与 `TcpSink` 共用 `LinkRecovery`（退避重连 / 5s 建连超时 / 失效后 `stop()` 直接释放），UDP 保持无连接语义不变。
+- **TCP/TLS 连接开启 keepalive**：空闲 30s 开始探测、间隔 10s，接收端异常消失（半开连接）时由内核探测失败促使后续读写报错，缩短发送端发现链路失效的窗口。
+
 ## [0.11.3] - 2026-10-28
 
 ### Fixed

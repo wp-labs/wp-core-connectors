@@ -2,6 +2,69 @@ use super::NetWriter;
 use super::Transport;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::time::Duration;
+use tokio::net::TcpStream;
+
+/// TCP keepalive 参数：空闲 30s 开始探测，探测间隔 10s，连续 3 次无响应判定断链。
+///
+/// 接收端异常消失（半开连接）时，内核探测失败会让后续读写返回错误，而不是让 socket
+/// 一直“看起来可用”；sink 侧因此能及时触发自动重连。
+#[cfg(unix)]
+#[allow(dead_code)] // 个别 Unix 平台不支持自定义探测间隔
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+#[cfg(unix)]
+#[allow(dead_code)]
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 为 TCP/TLS 的底层连接开启 keepalive；不支持的平台直接返回 `Ok(())`。
+pub(super) fn enable_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let sock = socket2::SockRef::from(stream);
+        #[allow(unused_mut)]
+        let mut keepalive = socket2::TcpKeepalive::new().with_time(KEEPALIVE_IDLE);
+        #[cfg(not(any(
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "nto",
+            target_os = "espidf",
+            target_os = "vita",
+            target_os = "haiku",
+            target_os = "horizon"
+        )))]
+        {
+            keepalive = keepalive.with_interval(KEEPALIVE_INTERVAL);
+        }
+        // TCP_KEEPCNT：探测 3 次无响应即断链（约 30s + 3×10s 内发现半开连接）。
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "emscripten",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "visionos",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "cygwin",
+        ))]
+        {
+            keepalive = keepalive.with_retries(3);
+        }
+        sock.set_tcp_keepalive(&keepalive)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = stream;
+        Ok(())
+    }
+}
 
 impl NetWriter {
     /// Return Some(pending_bytes) if supported, None if unsupported, Err on syscall error.

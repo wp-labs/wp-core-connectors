@@ -58,6 +58,8 @@ pub struct NetWriter {
     // 缓存端点，便于错误日志稳定输出
     pub(crate) peer_addr: Option<String>,
     pub(crate) local_addr: Option<String>,
+    // 底层传输写失败后置位：连接已不可用，后续写入必然失败，需要重建 writer（仅 TCP/TLS）
+    pub(crate) broken: bool,
 }
 
 impl NetWriter {
@@ -104,12 +106,16 @@ impl NetWriter {
             last_probe_at: None,
             peer_addr: peer,
             local_addr: local,
+            broken: false,
         })
     }
 
     /// 建立 TCP 连接
     pub async fn connect_tcp(addr: &str) -> anyhow::Result<Self> {
         let stream = TcpStream::connect(addr).await?;
+        if let Err(e) = os::enable_tcp_keepalive(&stream) {
+            log::warn!("tcp keepalive setup failed: {e}");
+        }
         // 默认保留 Nagle，以提升小包高 EPS 的吞吐（降低 PPS 与系统调用次数）。
         // 同时尽力扩大发送缓冲区，减小对端拥塞造成的写错误风险。
         let peer = stream.peer_addr().ok().map(|a| a.to_string());
@@ -137,6 +143,7 @@ impl NetWriter {
             last_probe_at: None,
             peer_addr: peer,
             local_addr: local,
+            broken: false,
         })
     }
 
@@ -170,6 +177,9 @@ impl NetWriter {
         tls: &TlsConfig,
     ) -> anyhow::Result<Self> {
         let stream = TcpStream::connect(addr).await?;
+        if let Err(e) = os::enable_tcp_keepalive(&stream) {
+            log::warn!("tls keepalive setup failed: {e}");
+        }
         let server_name = tls.server_name(default_host)?;
         let connector = tokio_rustls::TlsConnector::from(tls.build_client_config()?);
         let tls_stream = connector.connect(server_name, stream).await?;
@@ -208,7 +218,16 @@ impl NetWriter {
             last_probe_at: None,
             peer_addr: peer,
             local_addr: local,
+            broken: false,
         })
+    }
+
+    /// 底层传输是否已失效。
+    ///
+    /// 仅 TCP/TLS 写失败（发送错误，不含 codec 编码错误）后置位；此时继续复用该
+    /// writer 只会一直失败，需要由调用方重建连接。UDP 无连接语义，发送失败不改状态。
+    pub fn is_broken(&self) -> bool {
+        self.broken
     }
 
     /// 设置压缩/加密编码器（sink 侧可选）。
@@ -251,6 +270,7 @@ impl NetWriter {
     async fn write_transport(&mut self, bytes: &[u8]) -> SinkResult<()> {
         match &mut self.transport {
             Transport::Udp(sock) => {
+                // 数据报发送失败不代表 socket 失联（无连接语义，错误可能是瞬时的），不置 broken。
                 sock.send(bytes)
                     .await
                     .source_err(SinkReason::Sink, "udp send error")?;
@@ -261,6 +281,7 @@ impl NetWriter {
                 if let Err(e) = stream.write_all(bytes).await {
                     // 发送失败时，记录策略与水位的快照，便于定位“发送过快”或对端复位等问题
                     self.log_tcp_send_error(&e, bytes.len());
+                    self.broken = true;
                     return Err(SinkReason::Sink
                         .to_err()
                         .with_detail("tcp send error")
@@ -271,6 +292,7 @@ impl NetWriter {
             }
             Transport::Tls(stream) => {
                 if let Err(e) = stream.write_all(bytes).await {
+                    self.broken = true;
                     return Err(SinkReason::Sink
                         .to_err()
                         .with_detail("tls send error")
@@ -362,6 +384,7 @@ impl NetWriter {
             last_probe_at: None,
             peer_addr: None,
             local_addr: None,
+            broken: false,
         }
     }
     pub fn test_set_backpressure_enabled(&mut self, enabled: bool) {
@@ -550,6 +573,71 @@ mod tests {
             "unlimited: backoff should be active and sleep > 0ms"
         );
         set_net_backoff_adaptive(true);
+    }
+
+    /// TCP 连接就应开启 keepalive，便于发现半开连接（接收端异常消失）。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_writer_enables_keepalive() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let srv = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let writer = NetWriter::connect_tcp(&addr.to_string()).await?;
+        match &writer.transport {
+            Transport::Tcp(stream) => {
+                let sock = socket2::SockRef::from(stream);
+                assert!(sock.keepalive()?, "tcp keepalive should be enabled");
+            }
+            _ => panic!("expected tcp transport"),
+        }
+        drop(writer);
+        srv.await?;
+        Ok(())
+    }
+
+    /// TLS 连接底层的 TCP 同样要开启 keepalive。
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tls_writer_enables_keepalive() -> anyhow::Result<()> {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+        let dir = tempfile::tempdir()?;
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, certified.cert.pem())?;
+        std::fs::write(&key_path, certified.key_pair.serialize_pem())?;
+
+        let server_tls = crate::net::TlsConfig {
+            cert: Some(cert_path.to_string_lossy().into_owned()),
+            key: Some(key_path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_tls.build_server_config()?);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(stream).await;
+        });
+
+        let client_tls = crate::net::TlsConfig {
+            insecure: true,
+            ..Default::default()
+        };
+        let writer =
+            NetWriter::connect_tcp_tls(&addr.to_string(), "localhost", &client_tls).await?;
+        match &writer.transport {
+            Transport::Tls(tls) => {
+                let sock = socket2::SockRef::from(tls.get_ref().0);
+                assert!(sock.keepalive()?, "tls keepalive should be enabled");
+            }
+            _ => panic!("expected tls transport"),
+        }
+        drop(writer);
+        srv.await?;
+        Ok(())
     }
 }
 

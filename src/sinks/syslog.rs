@@ -15,6 +15,10 @@ use crate::net::transport::{
 };
 use crate::protocol::syslog::{EmitMessage, SyslogEncoder};
 
+use super::link_recovery::{LinkRecovery, RECONNECT_TIMEOUT};
+
+use std::time::Duration;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SyslogProtocol {
     Udp,
@@ -125,6 +129,13 @@ pub struct SyslogSink {
     encoder: SyslogEncoder,
     hostname: String,
     app_name: String,
+    // TCP 重连所需的目标与策略
+    target_addr: String,
+    rate_limit_rps: usize,
+    /// 链路失效后的退避重连状态（UDP 不会进入该状态）。
+    recovery: LinkRecovery,
+    /// 单次重连的超时（测试中可缩小）。
+    reconnect_timeout: Duration,
 }
 
 impl SyslogSink {
@@ -146,7 +157,7 @@ impl SyslogSink {
         } else {
             log::info!("syslog udp sink connected: target={}", addr);
         }
-        Ok(Self::with_writer(writer, app_name))
+        Ok(Self::with_writer(writer, app_name, addr.to_string(), 0))
     }
     async fn tcp(addr: &str, app_name: Option<String>, rate_limit_rps: usize) -> SinkResult<Self> {
         // Align to TcpSink: enable backpressure when unlimited
@@ -166,7 +177,12 @@ impl SyslogSink {
         .await
         .source_err(SinkReason::Sink, "syslog tcp connect")?;
         log::info!("syslog tcp sink connected: target={}", addr);
-        Ok(Self::with_writer(writer, app_name))
+        Ok(Self::with_writer(
+            writer,
+            app_name,
+            addr.to_string(),
+            rate_limit_rps,
+        ))
     }
 
     fn current_process_name() -> String {
@@ -177,7 +193,12 @@ impl SyslogSink {
             .unwrap_or_else(|| "wp-engine".to_string())
     }
 
-    fn with_writer(writer: NetWriter, app_name: Option<String>) -> Self {
+    fn with_writer(
+        writer: NetWriter,
+        app_name: Option<String>,
+        target_addr: String,
+        rate_limit_rps: usize,
+    ) -> Self {
         let hostname = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
@@ -188,6 +209,43 @@ impl SyslogSink {
             encoder: SyslogEncoder::new(),
             hostname,
             app_name: app_name.unwrap_or_else(Self::current_process_name),
+            target_addr,
+            rate_limit_rps,
+            recovery: LinkRecovery::default(),
+            reconnect_timeout: RECONNECT_TIMEOUT,
+        }
+    }
+
+    /// 写一段已编码的 syslog 报文；TCP 链路失联后按退避自动重连再写。
+    async fn send_payload(&mut self, payload: &[u8]) -> SinkResult<()> {
+        if let Some(err) = self.recovery.gate_error() {
+            return Err(err);
+        }
+        if self.recovery.is_down() {
+            <Self as AsyncCtrl>::reconnect(self).await?;
+        }
+
+        match self.writer.write(payload).await {
+            Ok(()) => {
+                if self.recovery.is_down() {
+                    self.recovery.on_connected();
+                    log::info!("syslog sink send recovered: target={}", self.target_addr);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if self.writer.is_broken() {
+                    self.recovery.on_failure();
+                    let retry_ms = self.recovery.backoff().map(|b| b.as_millis()).unwrap_or(0);
+                    log::warn!(
+                        "syslog sink connection lost: target={} retry_in={}ms err={}",
+                        self.target_addr,
+                        retry_ms,
+                        e
+                    );
+                }
+                Err(e)
+            }
         }
     }
 }
@@ -197,6 +255,14 @@ impl AsyncCtrl for SyslogSink {
     async fn stop(&mut self) -> SinkResult<()> {
         // For TCP, try graceful shutdown and drain
         if let Transport::Tcp(_) = &self.writer.transport {
+            // 连接已失效：close_notify / 排空只会再报一次错，直接释放。
+            if self.writer.is_broken() {
+                log::debug!(
+                    "syslog tcp sink stop with broken connection: target={}",
+                    self.target_addr
+                );
+                return Ok(());
+            }
             self.writer.shutdown().await?;
             self.writer
                 .drain_until_empty(std::time::Duration::from_secs(10))
@@ -205,6 +271,43 @@ impl AsyncCtrl for SyslogSink {
         Ok(())
     }
     async fn reconnect(&mut self) -> SinkResult<()> {
+        // UDP 无连接语义，不存在重建连接。
+        if !matches!(self.writer.transport, Transport::Tcp(_)) {
+            return Ok(());
+        }
+        if !self.writer.is_broken() {
+            let _ = self.writer.shutdown().await;
+        }
+        let mode = if self.rate_limit_rps == 0 {
+            BackoffMode::ForceOn
+        } else {
+            BackoffMode::ForceOff
+        };
+        let connect = NetWriter::connect_tcp_with_policy(
+            &self.target_addr,
+            NetSendPolicy {
+                rate_limit_rps: self.rate_limit_rps,
+                backoff_mode: mode,
+                adaptive: net_backoff_adaptive(),
+            },
+        );
+        let writer = match tokio::time::timeout(self.reconnect_timeout, connect).await {
+            Ok(Ok(w)) => w,
+            Ok(Err(e)) => {
+                self.recovery.on_failure();
+                return Err::<(), _>(e).source_err(SinkReason::Sink, "syslog tcp reconnect");
+            }
+            Err(_) => {
+                self.recovery.on_failure();
+                return Err(SinkReason::Sink.to_err().with_detail(format!(
+                    "syslog tcp reconnect timeout after {}ms",
+                    self.reconnect_timeout.as_millis()
+                )));
+            }
+        };
+        log::info!("syslog tcp sink reconnected: target={}", self.target_addr);
+        self.writer = writer;
+        self.recovery.on_connected();
         Ok(())
     }
 }
@@ -276,7 +379,7 @@ impl AsyncRawDataSink for SyslogSink {
             self.sent_cnt + 1,
             payload.len()
         );
-        self.writer.write(payload).await?;
+        self.send_payload(payload).await?;
         self.sent_cnt = self.sent_cnt.saturating_add(1);
         Ok(())
     }
@@ -314,7 +417,7 @@ impl AsyncRawDataSink for SyslogSink {
                 record_cnt,
                 buf.len()
             );
-            self.writer.write(&buf).await?;
+            self.send_payload(&buf).await?;
             self.sent_cnt = self.sent_cnt.saturating_add(1);
         } else {
             // UDP: 每条消息必须是独立数据报，逐条 send()
@@ -325,7 +428,7 @@ impl AsyncRawDataSink for SyslogSink {
                 emit.app_name = Some(self.app_name.as_str());
                 emit.append_newline = false;
                 let msg = self.encoder.encode_rfc3164(&emit);
-                self.writer.write(msg.as_ref()).await?;
+                self.send_payload(msg.as_ref()).await?;
             }
             let record_cnt = data.len();
             log::trace!(
@@ -419,6 +522,20 @@ mod tests {
         }
     }
 
+    async fn read_one_line(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        while !out.contains(&b'\n') {
+            let n = stream.read(&mut buf).await.expect("read");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
     #[test]
     fn syslog_conf_defaults_to_udp_514() {
         let spec = mk_spec(&[("addr", json!("127.0.0.1"))]);
@@ -510,6 +627,99 @@ mod tests {
             "body mismatch: {}",
             text
         );
+    }
+
+    // -- TCP 断链恢复 ------------------------------------------------------
+
+    /// syslog TCP 接收端重启后自动重连（复用 TcpSink 的恢复逻辑）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn syslog_tcp_reconnects_after_peer_restart() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+
+        let first = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let out = read_one_line(&mut stream).await;
+            drop(stream);
+            drop(listener);
+            out
+        });
+
+        let mut sink = SyslogSink::tcp(&format!("127.0.0.1:{port}"), None, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        sink.sink_str("first")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert!(String::from_utf8_lossy(&first.await?).contains("first"));
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if sink.sink_str("probe").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("peer close should surface as a send error");
+        assert!(sink.recovery.is_down());
+
+        // 对端未恢复时重连失败，继续保持退避状态。
+        sink.recovery.force_due();
+        sink.sink_str("still-down")
+            .await
+            .expect_err("reconnect must fail while the peer is down");
+        assert!(sink.recovery.is_down());
+
+        // 接收端恢复后，下一次写入自动重连。
+        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+        let second = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_one_line(&mut stream).await
+        });
+        sink.recovery.force_due();
+        sink.sink_str("after-restart")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert!(String::from_utf8_lossy(&second.await?).contains("after-restart"));
+        assert!(!sink.recovery.is_down());
+        Ok(())
+    }
+
+    /// 链路已坏时 syslog TCP 的 `stop()` 直接释放，不因 close_notify / 排空失败报错。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn syslog_tcp_stop_ok_when_connection_broken() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+            drop(listener);
+        });
+
+        let mut sink = SyslogSink::tcp(&format!("127.0.0.1:{port}"), None, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        assert!(!sink.writer.is_broken());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if sink.sink_str("probe").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("peer close should surface as a send error");
+        assert!(sink.writer.is_broken());
+
+        <SyslogSink as AsyncCtrl>::stop(&mut sink)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        srv.await.unwrap();
+        Ok(())
     }
 
     // -- sink_str_batch tests -----------------------------------------------
