@@ -2,7 +2,7 @@ use crate::net::CodecConfig;
 use crate::sources::event_id::next_event_id;
 use crate::sources::tcp::codec::StreamDecoder;
 use crate::sources::tcp::framing::{
-    FramingExtractor, FramingMode, MAX_FRAME_BYTES, MAX_LEN_DIGITS,
+    FramingExtractor, FramingMode, MAX_FRAME_BYTES, MAX_LEN_DIGITS, octet_in_progress,
 };
 use bytes::buf::UninitSlice;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -643,8 +643,18 @@ fn extract_message(framing: FramingMode, buffer: &mut BytesMut) -> Option<Bytes>
     match framing {
         FramingMode::Line => FramingExtractor::extract_line_message(buffer),
         FramingMode::Len => FramingExtractor::extract_length_prefixed_message(buffer),
-        FramingMode::Auto => FramingExtractor::extract_length_prefixed_message(buffer)
-            .or_else(|| FramingExtractor::extract_line_message(buffer)),
+        FramingMode::Auto => {
+            if let Some(payload) = FramingExtractor::extract_length_prefixed_message(buffer) {
+                return Some(payload);
+            }
+            // 已看到 `<len><SP>` 但 payload 未收齐：此时绝不能回退按行。否则 payload 内部
+            // 的 `\n`（多行日志体）会把半帧切成一条以长度前缀开头的腐坏记录，并让后续
+            // 字节流错位（EOF 场景由 `flush_eof_line` 的同等判据兜底）。
+            if octet_in_progress(buffer) {
+                return None;
+            }
+            FramingExtractor::extract_line_message(buffer)
+        }
     }
 }
 
@@ -1804,5 +1814,101 @@ mod tests {
             got, 0,
             "an incomplete len frame under Auto must not be flushed as a line"
         );
+    }
+
+    /// 回归（#43 的流中对应问题）：Auto 下长度前缀已开始但 payload 未收齐时，
+    /// 即使 payload 片段里含 `\n`，也不得回退按行——否则会吐出一条以长度前缀开头的
+    /// 腐坏记录，并把剩余字节流错位。
+    #[test]
+    fn auto_does_not_fallback_to_line_for_incomplete_len_frame() {
+        let mut buf = BytesMut::from(&b"1234 {\"schema\":\"x\"}\nline-A"[..]);
+        let before = buf.clone();
+        assert!(
+            extract_message(FramingMode::Auto, &mut buf).is_none(),
+            "a half-received len frame must not be emitted as a line"
+        );
+        assert_eq!(
+            buf, before,
+            "a half-received len frame must not consume bytes"
+        );
+
+        // 非长度前缀起始的完整行仍然按行提取（Line/Auto 行为不变）。
+        let mut line_buf = BytesMut::from(&b"plain line\n"[..]);
+        assert_eq!(
+            extract_message(FramingMode::Auto, &mut line_buf).unwrap(),
+            Bytes::from_static(b"plain line")
+        );
+        assert!(line_buf.is_empty());
+    }
+
+    /// Auto 下完整的长度帧（payload 内部含 `\n`）必须整体作为一条消息提取。
+    #[test]
+    fn auto_extracts_complete_len_frame_with_embedded_newline() {
+        let payload = &b"line-A\nline-B"[..];
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(format!("{} ", payload.len()).as_bytes());
+        buf.extend_from_slice(payload);
+        let msg =
+            extract_message(FramingMode::Auto, &mut buf).expect("complete frame must extract");
+        assert_eq!(&msg[..], payload);
+        assert!(buf.is_empty());
+        assert!(
+            extract_message(FramingMode::Auto, &mut buf).is_none(),
+            "a complete frame must yield exactly one message"
+        );
+    }
+
+    /// 回归（连接级）：半帧带内嵌换行时 `drain_messages(Auto)` 必须等待；
+    /// 补齐后恰好交付一条完整的长度帧，字节流不失步。
+    #[test]
+    fn auto_drain_waits_for_incomplete_len_frame_with_embedded_newline() {
+        let payload = &b"line-A\nline-B"[..];
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(format!("{} ", payload.len()).as_bytes());
+        buf.extend_from_slice(&payload[..7]); // "line-A\n"：已跨过内嵌换行，但帧未收齐
+        let mut batcher = BatchBuilder::new(
+            buf,
+            Tags::new(),
+            "test_auto_incomplete_len".into(),
+            DEFAULT_BATCH_CAPACITY,
+            MAX_BATCH_BYTES,
+            MAX_PENDING_BYTES,
+            None,
+        );
+        let mut batch: SourceBatch = Vec::new();
+        let mut produced_bytes = 0usize;
+        batcher
+            .drain_messages(
+                FramingMode::Auto,
+                IpAddr::from([127, 0, 0, 1]),
+                &mut batch,
+                &mut produced_bytes,
+            )
+            .expect("an in-progress len frame must not error");
+        assert!(
+            batch.is_empty(),
+            "a half-received len frame with an embedded newline must not be emitted"
+        );
+
+        // 补齐剩余 payload：恰好一条完整帧。
+        batcher.buffer.extend_from_slice(&payload[7..]); // "line-B"
+        batcher
+            .drain_messages(
+                FramingMode::Auto,
+                IpAddr::from([127, 0, 0, 1]),
+                &mut batch,
+                &mut produced_bytes,
+            )
+            .expect("a complete len frame must drain");
+        assert_eq!(
+            batch.len(),
+            1,
+            "embedded newline must stay inside one message"
+        );
+        match &batch[0].payload {
+            RawData::Bytes(b) => assert_eq!(&b[..], payload),
+            other => panic!("expected bytes payload, got {other:?}"),
+        }
+        assert!(batcher.buffer.is_empty());
     }
 }
