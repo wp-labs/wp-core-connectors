@@ -187,6 +187,23 @@ Text file sinks (`protocol = "txt"`, the default) can rotate the active file by 
 - `max_rolls` / `roll_compress` require `max_size > 0`; only the `txt` protocol rolls (`protocol = "arrow"` rejects the rolling params).
 - When shipping a connector definition, list the three params in `allow_override` but **do not** give them default values: overrides are type-checked against the default, so `max_size = 0` (integer) would reject `max_size = "10MB"`.
 
+#### TCP sink: periodic reconnect for certificate rotation
+
+Text TCP sinks accept an optional connection lifetime:
+
+| Param | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `max_connection_age_secs` | int | TLS: `86400` (24h); plaintext: off | Rebuild the connection before the next write once it is older than this many seconds; `0` disables it for both |
+
+- **TLS sinks default to 24h**, so certificate rotation takes effect without a process restart even when the parameter is omitted. Plaintext TCP sinks stay off by default, since there is no certificate to rotate.
+- The check is lazy: it runs at the start of `send_payload()`, so a healthy idle connection is not touched and no background timer is started.
+- Rotation uses the existing reconnect path, which re-reads `tls.cert` / `tls.key` / `tls.ca` from disk. A sink with a long-lived connection therefore picks up rotated client certificates without a process restart.
+- The write that triggers rotation is not dropped: the sink reconnects first, then sends the current payload. A failed reconnect goes through the normal backoff and returns a sink error.
+- To avoid a thundering herd when many instances restart together, each sink adds a jitter of up to `min(300s, 10% of max_connection_age_secs)` to its effective deadline.
+- The graceful shutdown before reconnecting is bounded to 2s; if the peer is not draining, the sink gives up on the flush and reconnects anyway instead of stalling the send path.
+- Use it for text sinks. Reconnect rebuilds the codec stream; `shutdown()` normally flushes the codec tail first, so a healthy connection does not lose a partial batch (if the 2s shutdown timeout fires, the tail may be dropped). `protocol = "arrow"` does not apply this parameter and logs a warning if it is set.
+- Negative or non-integer values are rejected at config load time (`core_conf`).
+
 ## Minimal Usage
 
 ```rust

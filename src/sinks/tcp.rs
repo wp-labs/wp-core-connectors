@@ -1,5 +1,7 @@
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::builtin;
 use async_trait::async_trait;
@@ -38,6 +40,10 @@ struct TcpSinkSpec {
     fmt: TextFmt,
     tls: Option<TlsConfig>,
     codec: CodecConfig,
+    /// 连接最大存活时长；`None` 表示不按年龄重建。
+    max_connection_age: Option<Duration>,
+    /// 超龄重连的随机抖动，避免多实例同步重连。
+    age_jitter: Duration,
 }
 
 impl TcpSinkSpec {
@@ -77,6 +83,11 @@ impl TcpSinkSpec {
         Self::ensure_bool(spec, "sendq_backpressure")?;
         let tls = TlsConfig::from_param(spec.params.get("tls"))
             .map_err(|e| SinkReason::core_conf().to_err().with_detail(e.to_string()))?;
+        let max_connection_age = Self::parse_max_connection_age(spec, tls.is_some())?;
+        let age_jitter = match max_connection_age {
+            Some(max_age) => random_age_jitter(max_age),
+            None => Duration::ZERO,
+        };
         let codec = parse_codec(&spec.params)?;
         let fmt = spec
             .params
@@ -91,7 +102,27 @@ impl TcpSinkSpec {
             fmt,
             tls,
             codec,
+            max_connection_age,
+            age_jitter,
         })
+    }
+
+    /// `max_connection_age_secs`：不写时 TLS sink 默认 24 小时、纯文本默认关闭；
+    /// `0` 均关闭；正整数为连接最大存活秒数。非整数或负数均为配置错误。
+    fn parse_max_connection_age(
+        spec: &ResolvedSinkSpec,
+        tls_enabled: bool,
+    ) -> SinkResult<Option<Duration>> {
+        match spec.params.get("max_connection_age_secs") {
+            None => Ok(tls_enabled.then_some(DEFAULT_TLS_MAX_CONNECTION_AGE)),
+            Some(v) => match v.as_i64() {
+                Some(0) => Ok(None),
+                Some(n) if n > 0 => Ok(Some(Duration::from_secs(n as u64))),
+                _ => Err(SinkReason::core_conf()
+                    .to_err()
+                    .with_detail("tcp.max_connection_age_secs must be a non-negative integer")),
+            },
+        }
     }
 
     fn ensure_bool(spec: &ResolvedSinkSpec, key: &str) -> SinkResult<()> {
@@ -124,6 +155,21 @@ fn parse_codec(params: &ParamMap) -> SinkResult<CodecConfig> {
 // Max seconds to wait for kernel TCP send-queue to drain at shutdown
 const TCP_DRAIN_MAX_SECS: u64 = 10;
 
+/// TLS sink 未配置 `max_connection_age_secs` 时的默认连接寿命：24 小时。
+/// 纯文本 sink 默认关闭；显式写 `0` 对两者都表示关闭。
+const DEFAULT_TLS_MAX_CONNECTION_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// 超龄重连的随机抖动上限（0..=5 分钟），用于打散多实例的同步重连。
+const AGE_JITTER_MAX_SECS: u64 = 5 * 60;
+/// 超龄重连前优雅关闭的超时；超时则放弃 flush 直接重建，避免挂住发送路径。
+const RECONNECT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 抖动按最大寿命的 10% 取，最多 5 分钟。小年龄不会被抖动完全吞掉。
+fn random_age_jitter(max_age: Duration) -> Duration {
+    let upper = (max_age.as_secs() / 10).min(AGE_JITTER_MAX_SECS);
+    let secs = RandomState::new().hash_one(()) % (upper + 1);
+    Duration::from_secs(secs)
+}
+
 pub struct TcpSink {
     writer: NetWriter,
     target_addr: String,
@@ -138,6 +184,12 @@ pub struct TcpSink {
     recovery: LinkRecovery,
     /// 单次重连的超时（测试中可缩小）。
     reconnect_timeout: Duration,
+    /// 连接最大存活时长；超龄时下一次写入前先重建连接（会重新读取 TLS 材料）。
+    max_connection_age: Option<Duration>,
+    /// 超龄重连的随机抖动。
+    age_jitter: Duration,
+    /// 当前连接的建立时刻（单调钟）。
+    connected_at: Instant,
 }
 
 impl TcpSink {
@@ -189,6 +241,9 @@ impl TcpSink {
             codec: spec.codec.clone(),
             recovery: LinkRecovery::default(),
             reconnect_timeout: RECONNECT_TIMEOUT,
+            max_connection_age: spec.max_connection_age,
+            age_jitter: spec.age_jitter,
+            connected_at: Instant::now(),
         })
     }
 
@@ -201,6 +256,23 @@ impl TcpSink {
         }
         if self.recovery.is_down() {
             <Self as AsyncCtrl>::reconnect(self).await?;
+        }
+
+        // 连接超龄时先重建再写：`reconnect()` 会重新读取磁盘上的 TLS 材料，
+        // 因此证书轮换后无需重启进程。加上抖动，避免多实例同时重连。
+        if let Some(max_age) = self.max_connection_age {
+            let limit = max_age + self.age_jitter;
+            let age = self.connected_at.elapsed();
+            if age >= limit {
+                log::info!(
+                    "event=SinkConnectionAgeExceeded target={} age_s={} max_s={} jitter_s={}",
+                    self.target_addr,
+                    age.as_secs(),
+                    max_age.as_secs(),
+                    self.age_jitter.as_secs()
+                );
+                <Self as AsyncCtrl>::reconnect(self).await?;
+            }
         }
 
         match self.writer.write(payload).await {
@@ -249,8 +321,17 @@ impl AsyncCtrl for TcpSink {
     }
     async fn reconnect(&mut self) -> SinkResult<()> {
         // 连接已失效时无需再尝试优雅关闭（对端已不在，close_notify 只会再报一次错）。
-        if !self.writer.is_broken() {
-            let _ = self.writer.shutdown().await;
+        // 健康连接上则限制关闭时间，避免对端不读时把发送路径挂住。
+        if !self.writer.is_broken()
+            && tokio::time::timeout(RECONNECT_SHUTDOWN_TIMEOUT, self.writer.shutdown())
+                .await
+                .is_err()
+        {
+            log::warn!(
+                "tcp sink graceful shutdown timed out before reconnect: target={} timeout_ms={}",
+                self.target_addr,
+                RECONNECT_SHUTDOWN_TIMEOUT.as_millis()
+            );
         }
         let phase: &'static str = if self.tls.is_some() { "tls" } else { "tcp" };
         let connect = async {
@@ -300,6 +381,7 @@ impl AsyncCtrl for TcpSink {
         writer = writer.with_codec(codec);
         log::info!("tcp sink reconnected: target={}", self.target_addr);
         self.writer = writer;
+        self.connected_at = Instant::now();
         self.recovery.on_connected();
         Ok(())
     }
@@ -621,6 +703,11 @@ pub struct TcpArrowSink {
 
 impl TcpArrowSink {
     pub async fn connect(spec: &ResolvedSinkSpec, rate_limit_rps: usize) -> SinkResult<Self> {
+        if spec.params.contains_key("max_connection_age_secs") {
+            log::warn!(
+                "tcp_arrow sink does not support 'max_connection_age_secs'; parameter is ignored"
+            );
+        }
         let addr = spec
             .params
             .get("addr")
@@ -1101,6 +1188,8 @@ mod tests {
             fmt: TextFmt::Raw,
             tls: None,
             codec: CodecConfig::default(),
+            max_connection_age: None,
+            age_jitter: Duration::ZERO,
         };
         let mut sink = TcpSink::connect(&spec, 0)
             .await
@@ -1218,6 +1307,8 @@ mod tests {
                 ..Default::default()
             }),
             codec: CodecConfig::default(),
+            max_connection_age: None,
+            age_jitter: Duration::ZERO,
         };
         let mut sink = TcpSink::connect(&spec, 0)
             .await
@@ -1300,6 +1391,8 @@ mod tests {
                 ..Default::default()
             }),
             codec: CodecConfig::default(),
+            max_connection_age: None,
+            age_jitter: Duration::ZERO,
         };
         let mut sink = TcpSink::connect(&spec, 0)
             .await
@@ -1398,6 +1491,8 @@ mod tests {
             fmt: TextFmt::Raw,
             tls: None,
             codec: CodecConfig::default(),
+            max_connection_age: None,
+            age_jitter: Duration::ZERO,
         };
         let mut sink = TcpSink::connect(&spec, 0)
             .await
@@ -1455,6 +1550,8 @@ mod tests {
             fmt: TextFmt::Raw,
             tls: None,
             codec: CodecConfig::default(),
+            max_connection_age: None,
+            age_jitter: Duration::ZERO,
         };
         let mut sink = TcpSink::connect(&spec, 0)
             .await
@@ -1805,6 +1902,289 @@ mod tests {
             !received.is_empty(),
             "TLS server should receive Arrow bytes"
         );
+        Ok(())
+    }
+
+    fn base_spec(params: toml::map::Map<String, toml::Value>) -> wp_connector_api::SinkSpec {
+        wp_connector_api::SinkSpec {
+            group: String::new(),
+            name: "t".into(),
+            kind: "tcp".into(),
+            connector_id: String::new(),
+            params: wp_connector_api::parammap_from_toml_map(params),
+            filter: None,
+        }
+    }
+
+    fn tcp_params(port: u16) -> toml::map::Map<String, toml::Value> {
+        let mut params = toml::map::Map::new();
+        params.insert("addr".into(), toml::Value::String("127.0.0.1".into()));
+        params.insert("port".into(), toml::Value::Integer(port as i64));
+        params
+    }
+
+    fn tls_params(port: u16) -> toml::map::Map<String, toml::Value> {
+        let mut params = tcp_params(port);
+        let mut tls = toml::map::Map::new();
+        tls.insert("enabled".into(), toml::Value::Boolean(true));
+        tls.insert("insecure".into(), toml::Value::Boolean(true));
+        params.insert("tls".into(), toml::Value::Table(tls));
+        params
+    }
+
+    #[test]
+    fn max_connection_age_parsing() {
+        // Plain TCP: unset means no age-based reconnect.
+        let plain = TcpSinkSpec::from_resolved(&base_spec(tcp_params(9000))).expect("plain");
+        assert!(
+            plain.max_connection_age.is_none(),
+            "plaintext unset must stay disabled"
+        );
+        assert_eq!(plain.age_jitter, Duration::ZERO);
+
+        // TLS: unset defaults to 24h, with a 0..=5min jitter.
+        let tls = TcpSinkSpec::from_resolved(&base_spec(tls_params(9000))).expect("tls");
+        assert_eq!(
+            tls.max_connection_age,
+            Some(Duration::from_secs(24 * 60 * 60)),
+            "TLS unset must default to 24h"
+        );
+        assert!(tls.age_jitter <= Duration::from_secs(AGE_JITTER_MAX_SECS));
+
+        // Explicit 0 disables even for TLS.
+        let mut params = tls_params(9000);
+        params.insert("max_connection_age_secs".into(), toml::Value::Integer(0));
+        let parsed = TcpSinkSpec::from_resolved(&base_spec(params)).expect("tls zero");
+        assert!(parsed.max_connection_age.is_none(), "0 must disable");
+
+        // Explicit value works for plaintext too.
+        let mut params = tcp_params(9000);
+        params.insert("max_connection_age_secs".into(), toml::Value::Integer(3600));
+        let parsed = TcpSinkSpec::from_resolved(&base_spec(params)).expect("3600");
+        assert_eq!(parsed.max_connection_age, Some(Duration::from_secs(3600)));
+        assert!(parsed.age_jitter <= Duration::from_secs(AGE_JITTER_MAX_SECS));
+
+        for bad in [toml::Value::Integer(-1), toml::Value::String("abc".into())] {
+            let mut params = tcp_params(9000);
+            params.insert("max_connection_age_secs".into(), bad);
+            assert!(
+                TcpSinkSpec::from_resolved(&base_spec(params)).is_err(),
+                "invalid max_connection_age_secs must be a config error"
+            );
+        }
+    }
+
+    #[test]
+    fn age_jitter_is_bounded() {
+        let day = Duration::from_secs(24 * 60 * 60);
+        for _ in 0..100 {
+            assert!(random_age_jitter(day) <= Duration::from_secs(AGE_JITTER_MAX_SECS));
+        }
+        // Small ages get a proportional jitter instead of the 5-minute cap.
+        let minute = Duration::from_secs(60);
+        for _ in 0..100 {
+            assert!(random_age_jitter(minute) <= Duration::from_secs(6));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn arrow_sink_ignores_max_connection_age_param() {
+        let mut params = tcp_params(9000);
+        params.insert("protocol".into(), toml::Value::String("arrow".into()));
+        params.insert("max_connection_age_secs".into(), toml::Value::Integer(60));
+        // The parameter is documented as text-only; the arrow path warns and
+        // keeps working instead of rejecting the config.
+        assert!(TcpFactory.validate_spec(&base_spec(params)).is_ok());
+    }
+
+    fn line_spec(port: u16, max_connection_age: Option<Duration>) -> TcpSinkSpec {
+        line_spec_with(port, max_connection_age, Duration::ZERO)
+    }
+
+    fn line_spec_with(
+        port: u16,
+        max_connection_age: Option<Duration>,
+        age_jitter: Duration,
+    ) -> TcpSinkSpec {
+        TcpSinkSpec {
+            addr: "127.0.0.1".into(),
+            port,
+            framing: Framing::Line,
+            fmt: TextFmt::Raw,
+            tls: None,
+            codec: CodecConfig::default(),
+            max_connection_age,
+            age_jitter,
+        }
+    }
+
+    /// 连接超龄后下一次写入前重建连接：两段 payload 都要到达，且监听端 accept 两次。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_sink_reconnects_when_connection_age_exceeded() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let srv = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for _ in 0..2 {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 64];
+                let n = s.read(&mut buf).await.unwrap();
+                bodies.push(buf[..n].to_vec());
+            }
+            bodies
+        });
+
+        let spec = line_spec(port, Some(Duration::from_millis(100)));
+        let mut sink = TcpSink::connect(&spec, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        sink.sink_str("first")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        sink.sink_str("second")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let bodies = srv.await?;
+        assert_eq!(bodies, vec![b"first\n".to_vec(), b"second\n".to_vec()]);
+        Ok(())
+    }
+
+    /// 未配置年龄时连续写入沿用同一条连接（只 accept 一次）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_sink_without_age_keeps_one_connection() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let spec = line_spec(port, None);
+        let mut sink = TcpSink::connect(&spec, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let (mut s, _) = listener.accept().await?;
+        let reader = tokio::spawn(async move {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 64];
+            loop {
+                let n = s.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(b"two\n".len()).any(|w| w == b"two\n") {
+                    break;
+                }
+            }
+            Ok::<_, std::io::Error>(got)
+        });
+
+        sink.sink_str("one")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        sink.sink_str("two")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let got = reader.await??;
+        assert!(got.starts_with(b"one\n"), "got {got:?}");
+        assert!(
+            got.windows(b"two\n".len()).any(|w| w == b"two\n"),
+            "got {got:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "without max_connection_age the sink must reuse the connection"
+        );
+        Ok(())
+    }
+
+    /// 抖动会把有效截止时间往后推：age=50ms + jitter=2s 时，150ms 后不应重连。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn age_jitter_defers_reconnect() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let spec = line_spec_with(
+            port,
+            Some(Duration::from_millis(50)),
+            Duration::from_secs(10),
+        );
+        let mut sink = TcpSink::connect(&spec, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let (mut s, _) = listener.accept().await?;
+        let reader = tokio::spawn(async move {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 64];
+            loop {
+                let n = s.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(b"second\n".len()).any(|w| w == b"second\n") {
+                    break;
+                }
+            }
+            Ok::<_, std::io::Error>(got)
+        });
+
+        sink.sink_str("first")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        sink.sink_str("second")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let got = reader.await??;
+        assert!(
+            got.windows(b"second\n".len()).any(|w| w == b"second\n"),
+            "got {got:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "jitter must keep the sink on the same connection"
+        );
+        Ok(())
+    }
+
+    /// 超龄重连失败时返回错误并进入退避，不 panic。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn age_reconnect_failure_enters_backoff() -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let spec = line_spec_with(port, Some(Duration::from_millis(50)), Duration::ZERO);
+        let mut sink = TcpSink::connect(&spec, 0)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Keep the current connection alive, then close the listener so the
+        // age-triggered reconnect is refused.
+        let (s, _) = listener.accept().await?;
+        drop(listener);
+        let hold = tokio::spawn(async move {
+            let _s = s;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        sink.sink_str("first")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        sink.sink_str("second")
+            .await
+            .expect_err("age reconnect must fail without a listener");
+        assert!(
+            sink.recovery.is_down(),
+            "failed reconnect must enter backoff"
+        );
+        assert!(sink.recovery.backoff().is_some());
+        hold.abort();
         Ok(())
     }
 }

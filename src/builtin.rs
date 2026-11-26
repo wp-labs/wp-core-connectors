@@ -194,6 +194,7 @@ pub fn builtin_sink_defs() -> Vec<ConnectorDef> {
                 "port".into(),
                 "framing".into(),
                 "protocol".into(),
+                "max_connection_age_secs".into(),
                 "tls".into(),
                 "compression".into(),
                 "encryption".into(),
@@ -448,6 +449,17 @@ mod tests {
         assert!(
             src.allow_override.iter().any(|k| k == "tls"),
             "tcp_src should allow override of 'tls'"
+        );
+    }
+
+    #[test]
+    fn tcp_sink_allows_max_connection_age_override() {
+        let def = sink_def("tcp_sink").expect("builtin tcp sink def");
+        assert!(
+            def.allow_override
+                .iter()
+                .any(|k| k == "max_connection_age_secs"),
+            "tcp_sink should allow override of 'max_connection_age_secs'"
         );
     }
 }
